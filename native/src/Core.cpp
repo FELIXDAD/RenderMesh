@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -952,7 +953,14 @@ bool ConfigStore::Save(const Config& config, std::wstring& error) {
 
 fs::path FindBlender(const Config& config) {
     std::vector<fs::path> candidates;
-    if (!config.blenderPath.empty()) candidates.push_back(config.blenderPath);
+    if (!config.blenderPath.empty()) {
+        std::wstring filename = config.blenderPath.filename().wstring();
+        std::transform(filename.begin(), filename.end(), filename.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (filename == L"blender-launcher.exe")
+            candidates.push_back(config.blenderPath.parent_path() / L"blender.exe");
+        candidates.push_back(config.blenderPath);
+    }
     candidates.push_back(ExecutableDirectory() / L"Blender" / L"blender.exe");
     wchar_t found[32768]{};
     if (SearchPathW(nullptr, L"blender.exe", nullptr, 32768, found, nullptr) > 0)
