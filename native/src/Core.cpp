@@ -200,6 +200,19 @@ def gather():
                 'path': bpy.path.abspath(path), 'packed': packed,
                 'exists': real_exists(path),
             })
+    known = {os.path.normcase(os.path.normpath(x['path'])) for x in rows}
+    try:
+        # Blender's own path inventory catches external references that do not
+        # live in one of the common datablock collections above. packed=True
+        # means already-packed paths are skipped.
+        for path in bpy.utils.blend_paths(absolute=True, packed=True, local=False):
+            key = os.path.normcase(os.path.normpath(path))
+            if key not in known:
+                rows.append({'kind': 'external', 'owner': '', 'path': path,
+                             'packed': False, 'exists': real_exists(path)})
+                known.add(key)
+    except Exception as exc:
+        warnings.append(f'blend_paths: {exc}')
     return rows
 
 report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
@@ -207,7 +220,7 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'missing': [], 'unpacked': [], 'warnings': warnings}
 try:
     before = gather()
-    report['missing'] = [x for x in before if not x['exists']]
+    report['missing'] = [x for x in before if not x['exists'] and not x['packed']]
     if not report['missing']:
         try:
             bpy.ops.file.pack_all()
@@ -215,7 +228,7 @@ try:
             warnings.append(f'pack_all: {exc}')
         bpy.ops.wm.save_as_mainfile(filepath=prepared, copy=True)
         after = gather()
-        report['missing'] = [x for x in after if not x['exists']]
+        report['missing'] = [x for x in after if not x['exists'] and not x['packed']]
         report['unpacked'] = [x for x in after if x['exists'] and not x['packed']]
         report['pass'] = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
 except Exception:
@@ -337,7 +350,10 @@ double IdleSeconds() {
     LASTINPUTINFO info{};
     info.cbSize = sizeof(info);
     if (!GetLastInputInfo(&info)) return 0;
-    return static_cast<double>(GetTickCount64() - info.dwTime) / 1000.0;
+    // Both values deliberately use the 32-bit tick domain. Unsigned subtraction
+    // remains correct across GetTickCount's 49.7-day rollover.
+    DWORD elapsed = GetTickCount() - info.dwTime;
+    return static_cast<double>(elapsed) / 1000.0;
 }
 
 ConfigStore::ConfigStore(fs::path dataDir)
@@ -445,7 +461,7 @@ PreflightReport PreflightBlend(
     }
     ProcessResult process = RunProcess(
         blender,
-        {L"--background", source.wstring(), L"--python", script.wstring(), L"--",
+        {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
          prepared.wstring(), reportPath.wstring()},
         log);
     if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
@@ -515,7 +531,7 @@ bool CheckWorkerCompatibility(
     }
     ProcessResult process = RunProcess(
         blender,
-        {L"--background", blend.wstring(), L"--python", script.wstring(),
+        {L"--background", L"--disable-autoexec", blend.wstring(), L"--python", script.wstring(),
          L"--", manifest.wstring(), report.wstring()},
         log);
     if (!process.started || process.exitCode != 0 || !fs::exists(report)) {
@@ -551,6 +567,7 @@ bool RenderBlenderFrame(
     const fs::path& outputDir,
     int frame,
     const std::string& outputFormat,
+    bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
     std::wstring& error) {
@@ -562,32 +579,26 @@ bool RenderBlenderFrame(
     fs::create_directories(outputDir);
     fs::path prefix = outputDir / L"frame_######";
     fs::path log = outputDir / (L"frame_" + std::to_wstring(frame) + L".log");
+    std::wstring extension = outputFormat == "PNG" ? L".png"
+        : outputFormat == "JPEG"                    ? L".jpg"
+                                                     : L".exr";
+    std::wstring frameText = std::to_wstring(frame);
+    output = outputDir / (L"frame_" +
+        std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText + extension);
+    std::error_code removeError;
+    fs::remove(output, removeError);
     ProcessResult process = RunProcess(
         blender,
         {L"--background", L"--disable-autoexec", blend.wstring(), L"--render-output",
          prefix.wstring(), L"--render-format", Utf8ToWide(outputFormat), L"--render-frame",
          std::to_wstring(frame)},
-        log, &config, &stopRequested);
+        log, applySharingLimit ? &config : nullptr, &stopRequested);
     if (!process.started || process.exitCode != 0) {
         error = process.error.empty()
             ? L"Blender 渲染失败，退出码 " + std::to_wstring(process.exitCode) + L"。日志：" +
                   log.wstring()
             : process.error;
         return false;
-    }
-    std::wstring extension = outputFormat == "PNG" ? L".png"
-        : outputFormat == "JPEG"                    ? L".jpg"
-                                                     : L".exr";
-    output = outputDir / (L"frame_" + std::wstring(6 - std::min<size_t>(6, std::to_wstring(frame).size()), L'0') +
-                          std::to_wstring(frame) + extension);
-    if (!fs::exists(output)) {
-        for (const auto& entry : fs::directory_iterator(outputDir)) {
-            if (entry.path().filename().wstring().starts_with(L"frame_") &&
-                entry.path().extension() != L".log") {
-                output = entry.path();
-                break;
-            }
-        }
     }
     if (!fs::exists(output)) {
         error = L"Blender 已退出，但没有生成帧文件。日志：" + log.wstring();

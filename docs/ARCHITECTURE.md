@@ -18,9 +18,9 @@ Blender 预检/打包 ──缺素材或无法打包──► 阻止提交
                          单帧结果回传 Origin
 ```
 
-UDP 8390 广播协议版本、节点 ID、名称、HTTP 端口、共享状态、CPU 策略、任务数、空闲时间和集群码 SHA-256 短指纹，不广播真实集群码。Origin 只向在线、指纹一致、已开启共享且当前无任务的节点派发。
+UDP 8390 广播协议版本、节点 ID、名称、HTTP 端口、共享状态、CPU 策略、任务数、空闲时间和集群码 SHA-256 短指纹，不广播真实集群码。Origin 只向在线、指纹一致、已开启共享且当前无任务的节点派发。远端接单后若节点离线，或重新广播为空闲却没有回传结果，Origin 会在 20 秒宽限期后将帧重新排队。
 
-TCP 8391 提供 `/health`、`/v1/task` 和 `/v1/result`。任务文件以 1 MiB 块流式读写到 `.receiving` 临时文件，完成后原子替换；服务端单请求上限为 100 GiB。
+TCP 8391 提供 `/health`、`/v1/task` 和 `/v1/result`。任务文件以 1 MiB 块流式读写到 `.receiving` 临时文件，完成后原子替换；服务端单请求上限为 100 GiB，并在接收前检查剩余磁盘空间。每个 Worker 原子地保留一个执行槽，避免并发请求绕过“单 Blender 进程”限制。
 
 ## 持久化
 
@@ -49,7 +49,7 @@ blender --background --disable-autoexec source.blend
         --render-output frame_###### --render-format PNG --render-frame 42
 ```
 
-Blender 在创建后先保持挂起，加入启用 `KILL_ON_JOB_CLOSE` 的 Windows Job Object，再恢复运行。用户活跃时设置 `HARD_CAP`；空闲到阈值后关闭 CPU rate control，使进程树可使用 100%。Windows 10/11 嵌套 Job 允许它在企业管理软件或受管宿主下正常工作。
+只有别人发来的共享任务会被限速。本机用户自己提交并由本机兜底执行的任务不套用共享限额。共享 Blender 在创建后先保持挂起，加入启用 `KILL_ON_JOB_CLOSE` 的 Windows Job Object，再恢复运行。用户活跃时设置 `HARD_CAP`；空闲到阈值后关闭 CPU rate control，使进程树可使用 100%。Windows 10/11 嵌套 Job 允许它在企业管理软件或受管宿主下正常工作。
 
 ## 生产化后续
 

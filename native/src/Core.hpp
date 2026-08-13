@@ -97,6 +97,7 @@ bool RenderBlenderFrame(
     const fs::path& outputDir,
     int frame,
     const std::string& outputFormat,
+    bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
     std::wstring& error);
@@ -111,6 +112,8 @@ struct FrameTask {
     TaskState state = TaskState::Pending;
     std::string assignedNodeId;
     std::string assignedNodeName;
+    std::chrono::steady_clock::time_point assignedAt{};
+    int dispatchAttempts = 0;
     fs::path output;
     std::string error;
 };
@@ -135,6 +138,7 @@ struct Peer {
     bool trusted = false;
     int cpuPercent = 15;
     int assigned = 0;
+    std::string currentTaskId;
     double idleSeconds = 0;
     std::chrono::steady_clock::time_point lastSeen;
 };
@@ -168,7 +172,8 @@ private:
 
 class NodeApp {
 public:
-    NodeApp(ConfigStore store, Config config, bool mockRenderer = false);
+    NodeApp(ConfigStore store, Config config, bool mockRenderer = false,
+            std::chrono::milliseconds assignmentGrace = std::chrono::seconds(20));
     ~NodeApp();
 
     bool Start(std::wstring& error);
@@ -184,6 +189,7 @@ public:
 
     // In-process transport test seam. Production peers still come from UDP discovery.
     void InjectPeerForTest(Peer peer);
+    void RemovePeerForTest(const std::string& nodeId);
 
     std::string SubmitPrepared(
         std::string name,

@@ -21,7 +21,7 @@ $buildDir = Join-Path $nativeRoot "build\$Configuration"
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 
 $resource = Join-Path $buildDir 'RenderMesh.res.o'
-& $resourceCompiler (Join-Path $nativeRoot 'RenderMesh.rc') -O coff -o $resource
+& $resourceCompiler --codepage=65001 (Join-Path $nativeRoot 'RenderMesh.rc') -O coff -o $resource
 if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
 
 $common = @(
@@ -56,4 +56,3 @@ try {
     Pop-Location
 }
 Get-Item -LiteralPath $output | Select-Object FullName,Length,LastWriteTime
-

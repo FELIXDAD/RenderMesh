@@ -13,6 +13,7 @@ namespace rm {
 namespace {
 
 constexpr auto kPeerTimeout = std::chrono::seconds(8);
+constexpr uint64_t kMaxTransferBytes = 100ull * 1024 * 1024 * 1024;
 
 bool ConstantTimeEqual(const std::string& left, const std::string& right) {
     size_t size = std::max(left.size(), right.size());
@@ -60,7 +61,10 @@ bool StreamRequestToFile(
         error = L"无法创建接收文件";
         return false;
     }
+    uint64_t receivedBytes = 0;
     bool received = reader([&](const char* data, size_t size) {
+        if (size > kMaxTransferBytes - receivedBytes) return false;
+        receivedBytes += size;
         output.write(data, static_cast<std::streamsize>(size));
         return static_cast<bool>(output);
     });
@@ -76,6 +80,24 @@ bool StreamRequestToFile(
         return false;
     }
     return true;
+}
+
+bool HasTransferCapacity(const httplib::Request& request, const fs::path& directory) {
+    std::string value = request.get_header_value("Content-Length");
+    if (value.empty()) return true;  // The streaming hard limit still applies.
+    uint64_t requested = 0;
+    try {
+        requested = std::stoull(value);
+    } catch (...) {
+        return false;
+    }
+    if (!requested || requested > kMaxTransferBytes) return false;
+    std::error_code ignored;
+    fs::create_directories(directory, ignored);
+    ULARGE_INTEGER freeBytes{};
+    if (!GetDiskFreeSpaceExW(directory.c_str(), &freeBytes, nullptr, nullptr)) return false;
+    constexpr uint64_t reserve = 512ull * 1024 * 1024;
+    return freeBytes.QuadPart > requested && freeBytes.QuadPart - requested >= reserve;
 }
 
 httplib::Result PostFile(
@@ -116,10 +138,13 @@ std::string FrameExtension(const std::string& format) {
 }  // namespace
 
 struct NodeApp::Impl {
-    explicit Impl(NodeApp* app) : owner(app) {}
+    explicit Impl(NodeApp* app, std::chrono::milliseconds grace)
+        : owner(app), assignmentGrace(grace) {}
 
     NodeApp* owner;
+    std::chrono::milliseconds assignmentGrace;
     mutable std::mutex stateMutex;
+    std::mutex persistMutex;
     std::map<std::string, Peer> peers;
     std::vector<RenderJob> jobs;
     std::mutex callbackMutex;
@@ -127,10 +152,12 @@ struct NodeApp::Impl {
     std::mutex workMutex;
     std::condition_variable workCv;
     std::queue<WorkItem> work;
+    std::mutex currentTaskMutex;
+    std::string currentTaskId;
     std::atomic<int> workerAssigned{0};
     std::atomic<bool> stopRequested{false};
     httplib::Server server;
-    SOCKET discoverySocket = INVALID_SOCKET;
+    std::atomic<SOCKET> discoverySocket{INVALID_SOCKET};
     std::thread serverThread;
     std::thread discoveryThread;
     std::thread schedulerThread;
@@ -147,7 +174,13 @@ struct NodeApp::Impl {
 
     fs::path JobsPath() const { return owner->DataDir() / L"jobs.json"; }
 
+    std::string CurrentTaskId() {
+        std::scoped_lock lock(currentTaskMutex);
+        return currentTaskId;
+    }
+
     void PersistJobs() {
+        std::scoped_lock persistLock(persistMutex);
         json rows = json::array();
         {
             std::scoped_lock lock(stateMutex);
@@ -160,6 +193,7 @@ struct NodeApp::Impl {
                         {"state", static_cast<int>(frame.state)},
                         {"assigned_node_id", frame.assignedNodeId},
                         {"assigned_node_name", frame.assignedNodeName},
+                        {"dispatch_attempts", frame.dispatchAttempts},
                         {"output", WideToUtf8(frame.output.wstring())},
                         {"error", frame.error},
                     });
@@ -179,8 +213,12 @@ struct NodeApp::Impl {
             std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
             output << rows.dump(2);
         }
-        MoveFileExW(temporary.c_str(), JobsPath().c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (MoveFileExW(temporary.c_str(), JobsPath().c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                return;
+            Sleep(static_cast<DWORD>((attempt + 1) * 20));
+        }
     }
 
     void LoadJobs() {
@@ -207,6 +245,7 @@ struct NodeApp::Impl {
                         frame.state = TaskState::Pending;
                     frame.assignedNodeId = value.value("assigned_node_id", "");
                     frame.assignedNodeName = value.value("assigned_node_name", "");
+                    frame.dispatchAttempts = value.value("dispatch_attempts", 0);
                     frame.output = Utf8ToWide(value.value("output", ""));
                     frame.error = value.value("error", "");
                     job.frames.push_back(std::move(frame));
@@ -250,13 +289,29 @@ struct NodeApp::Impl {
                 std::string format = request.get_header_value("X-RM-Format");
                 std::string version = request.get_header_value("X-RM-Blender");
                 auto addons = HeaderStringList(request, "X-RM-Addons");
-                if (!SafeId(taskId) || !SafeId(jobId) || frame == 0 || originPort < 1024 ||
+                if (!SafeId(taskId) || !SafeId(jobId) || frame < 1 || frame > 1000000 || originPort < 1024 ||
                     originPort > 65535 ||
                     (format != "PNG" && format != "JPEG" && format != "OPEN_EXR")) {
                     response.status = 422;
                     response.set_content("invalid task metadata", "text/plain");
                     return;
                 }
+                if (!HasTransferCapacity(request, owner->DataDir())) {
+                    response.status = 507;
+                    response.set_content("project exceeds transfer limit or available disk space", "text/plain");
+                    return;
+                }
+                int expectedAssigned = 0;
+                if (!workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
+                    response.status = 409;
+                    response.set_content("worker is busy", "text/plain");
+                    return;
+                }
+                struct AssignmentReservation {
+                    std::atomic<int>& count;
+                    bool handedOff = false;
+                    ~AssignmentReservation() { if (!handedOff) --count; }
+                } reservation{workerAssigned};
                 fs::path taskDir = owner->DataDir() / L"incoming" / Utf8ToWide(taskId);
                 fs::path blend = taskDir / L"source.blend";
                 std::wstring receiveError;
@@ -289,8 +344,8 @@ struct NodeApp::Impl {
                 {
                     std::scoped_lock lock(workMutex);
                     work.push(std::move(item));
-                    ++workerAssigned;
                 }
+                reservation.handedOff = true;
                 workCv.notify_one();
                 Notify();
                 response.status = 202;
@@ -339,6 +394,11 @@ struct NodeApp::Impl {
                     response.status = 404;
                     return;
                 }
+                if (status == "completed" && !HasTransferCapacity(request, destination.parent_path())) {
+                    response.status = 507;
+                    response.set_content("result exceeds transfer limit or available disk space", "text/plain");
+                    return;
+                }
                 std::wstring receiveError;
                 bool ok = status == "failed" || StreamRequestToFile(reader, destination, receiveError);
                 {
@@ -359,6 +419,7 @@ struct NodeApp::Impl {
                         target.error = request.get_header_value("X-RM-Error");
                         if (!receiveError.empty()) target.error = WideToUtf8(receiveError);
                     }
+                    target.assignedAt = {};
                 }
                 PersistJobs();
                 Notify();
@@ -369,22 +430,27 @@ struct NodeApp::Impl {
 
     void DiscoveryLoop() {
         Config initial = owner->GetConfig();
-        discoverySocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (discoverySocket == INVALID_SOCKET) return;
+        SOCKET activeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (activeSocket == INVALID_SOCKET) return;
+        discoverySocket.store(activeSocket);
         BOOL enabled = TRUE;
-        setsockopt(discoverySocket, SOL_SOCKET, SO_BROADCAST,
+        setsockopt(activeSocket, SOL_SOCKET, SO_BROADCAST,
                    reinterpret_cast<const char*>(&enabled), sizeof(enabled));
-        setsockopt(discoverySocket, SOL_SOCKET, SO_REUSEADDR,
+        setsockopt(activeSocket, SOL_SOCKET, SO_REUSEADDR,
                    reinterpret_cast<const char*>(&enabled), sizeof(enabled));
         DWORD timeout = 400;
-        setsockopt(discoverySocket, SOL_SOCKET, SO_RCVTIMEO,
+        setsockopt(activeSocket, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         sockaddr_in local{};
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = INADDR_ANY;
         local.sin_port = htons(static_cast<u_short>(initial.discoveryPort));
-        if (bind(discoverySocket, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR)
+        if (bind(activeSocket, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+            SOCKET expected = activeSocket;
+            if (discoverySocket.compare_exchange_strong(expected, INVALID_SOCKET))
+                closesocket(activeSocket);
             return;
+        }
 
         auto nextBroadcast = std::chrono::steady_clock::now();
         while (!stopRequested.load()) {
@@ -395,6 +461,7 @@ struct NodeApp::Impl {
                     {"fingerprint", Sha256Prefix(config.clusterToken)},
                     {"port", config.httpPort}, {"share", config.shareEnabled},
                     {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
+                    {"task_id", CurrentTaskId()},
                     {"idle", static_cast<int>(IdleSeconds())},
                 };
                 std::string payload = message.dump();
@@ -402,14 +469,14 @@ struct NodeApp::Impl {
                 broadcast.sin_family = AF_INET;
                 broadcast.sin_addr.s_addr = INADDR_BROADCAST;
                 broadcast.sin_port = htons(static_cast<u_short>(config.discoveryPort));
-                sendto(discoverySocket, payload.data(), static_cast<int>(payload.size()), 0,
+                sendto(activeSocket, payload.data(), static_cast<int>(payload.size()), 0,
                        reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
                 nextBroadcast = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             }
             char buffer[8192];
             sockaddr_in remote{};
             int remoteSize = sizeof(remote);
-            int received = recvfrom(discoverySocket, buffer, sizeof(buffer), 0,
+            int received = recvfrom(activeSocket, buffer, sizeof(buffer), 0,
                                     reinterpret_cast<sockaddr*>(&remote), &remoteSize);
             if (received <= 0) continue;
             try {
@@ -426,6 +493,7 @@ struct NodeApp::Impl {
                 peer.shareEnabled = message.value("share", false);
                 peer.cpuPercent = message.value("cpu", 15);
                 peer.assigned = message.value("assigned", 0);
+                peer.currentTaskId = message.value("task_id", "");
                 peer.idleSeconds = message.value("idle", 0.0);
                 peer.trusted = message.value("fingerprint", "") ==
                     Sha256Prefix(config.clusterToken);
@@ -438,6 +506,9 @@ struct NodeApp::Impl {
             } catch (...) {
             }
         }
+        SOCKET expected = activeSocket;
+        if (discoverySocket.compare_exchange_strong(expected, INVALID_SOCKET))
+            closesocket(activeSocket);
     }
 
     std::optional<Peer> AvailablePeer() {
@@ -474,8 +545,39 @@ struct NodeApp::Impl {
         return true;
     }
 
+    bool RecoverLostAssignments() {
+        bool recovered = false;
+        auto nowSteady = std::chrono::steady_clock::now();
+        std::scoped_lock lock(stateMutex);
+        for (auto& job : jobs) {
+            for (auto& frame : job.frames) {
+                if (frame.state != TaskState::Assigned ||
+                    frame.assignedAt == std::chrono::steady_clock::time_point{} ||
+                    nowSteady - frame.assignedAt < assignmentGrace)
+                    continue;
+                auto peer = peers.find(frame.assignedNodeId);
+                bool peerGone = peer == peers.end() || nowSteady - peer->second.lastSeen > kPeerTimeout;
+                bool peerNoLongerWorking = !peerGone &&
+                    peer->second.currentTaskId != frame.taskId;
+                if (!peerGone && !peerNoLongerWorking) continue;
+                frame.state = TaskState::Pending;
+                frame.error = peerGone ? "worker went offline; frame requeued"
+                                       : "worker stopped without returning a result; frame requeued";
+                frame.assignedNodeId.clear();
+                frame.assignedNodeName.clear();
+                frame.assignedAt = {};
+                recovered = true;
+            }
+        }
+        return recovered;
+    }
+
     void SchedulerLoop() {
         while (!stopRequested.load()) {
+            if (RecoverLostAssignments()) {
+                PersistJobs();
+                Notify();
+            }
             size_t jobIndex = 0, frameIndex = 0;
             RenderJob jobCopy;
             FrameTask frameCopy;
@@ -514,6 +616,10 @@ struct NodeApp::Impl {
                             frame.state = TaskState::Assigned;
                         frame.assignedNodeId = peer->nodeId;
                         frame.assignedNodeName = peer->name;
+                        if (frame.state == TaskState::Assigned) {
+                            frame.assignedAt = std::chrono::steady_clock::now();
+                            ++frame.dispatchAttempts;
+                        }
                         if (frame.state != TaskState::Failed) frame.error.clear();
                     }
                     handled = true;
@@ -523,7 +629,8 @@ struct NodeApp::Impl {
                         jobs[jobIndex].frames[frameIndex].error = dispatchError;
                 }
             }
-            if (!handled && workerAssigned.load() == 0) {
+            int expectedAssigned = 0;
+            if (!handled && workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
                 WorkItem item;
                 item.taskId = frameCopy.taskId;
                 item.jobId = jobCopy.id;
@@ -536,7 +643,6 @@ struct NodeApp::Impl {
                 {
                     std::scoped_lock workLock(workMutex);
                     work.push(item);
-                    ++workerAssigned;
                 }
                 {
                     std::scoped_lock lock(stateMutex);
@@ -545,14 +651,17 @@ struct NodeApp::Impl {
                     Config config = owner->GetConfig();
                     frame.assignedNodeId = config.nodeId;
                     frame.assignedNodeName = config.nodeName;
+                    frame.assignedAt = {};
                 }
                 workCv.notify_one();
                 handled = true;
             }
             if (!handled) {
-                std::scoped_lock lock(stateMutex);
-                if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size())
-                    jobs[jobIndex].frames[frameIndex].state = TaskState::Pending;
+                {
+                    std::scoped_lock lock(stateMutex);
+                    if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size())
+                        jobs[jobIndex].frames[frameIndex].state = TaskState::Pending;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
             PersistJobs();
@@ -596,6 +705,10 @@ struct NodeApp::Impl {
                 item = std::move(work.front());
                 work.pop();
             }
+            {
+                std::scoped_lock lock(currentTaskMutex);
+                currentTaskId = item.taskId;
+            }
             fs::path output;
             std::wstring renderError;
             bool success = false;
@@ -608,11 +721,15 @@ struct NodeApp::Impl {
                 success = static_cast<bool>(mock);
             } else {
                 success = RenderBlenderFrame(owner->GetConfig(), item.blend, item.outputDir,
-                                             item.frame, item.outputFormat, stopRequested,
+                                             item.frame, item.outputFormat, item.remote, stopRequested,
                                              output, renderError);
             }
             if (item.remote) {
-                SendRemoteResult(item, success, output, renderError);
+                bool delivered = SendRemoteResult(item, success, output, renderError);
+                if (delivered) {
+                    std::error_code ignored;
+                    fs::remove_all(item.blend.parent_path(), ignored);
+                }
             } else {
                 std::scoped_lock lock(stateMutex);
                 for (auto& job : jobs) {
@@ -627,6 +744,10 @@ struct NodeApp::Impl {
                     break;
                 }
             }
+            {
+                std::scoped_lock lock(currentTaskMutex);
+                currentTaskId.clear();
+            }
             --workerAssigned;
             PersistJobs();
             Notify();
@@ -634,8 +755,9 @@ struct NodeApp::Impl {
     }
 };
 
-NodeApp::NodeApp(ConfigStore store, Config config, bool mockRenderer)
-    : impl_(std::make_unique<Impl>(this)), store_(std::move(store)),
+NodeApp::NodeApp(ConfigStore store, Config config, bool mockRenderer,
+                 std::chrono::milliseconds assignmentGrace)
+    : impl_(std::make_unique<Impl>(this, assignmentGrace)), store_(std::move(store)),
       config_(std::move(config)), mockRenderer_(mockRenderer) {
     impl_->LoadJobs();
 }
@@ -670,10 +792,8 @@ void NodeApp::Stop() {
     if (!running_.exchange(false)) return;
     impl_->stopRequested = true;
     impl_->server.stop();
-    if (impl_->discoverySocket != INVALID_SOCKET) {
-        closesocket(impl_->discoverySocket);
-        impl_->discoverySocket = INVALID_SOCKET;
-    }
+    SOCKET discovery = impl_->discoverySocket.exchange(INVALID_SOCKET);
+    if (discovery != INVALID_SOCKET) closesocket(discovery);
     impl_->workCv.notify_all();
     if (impl_->serverThread.joinable()) impl_->serverThread.join();
     if (impl_->discoveryThread.joinable()) impl_->discoveryThread.join();
@@ -737,6 +857,11 @@ void NodeApp::InjectPeerForTest(Peer peer) {
     impl_->peers[peer.nodeId] = std::move(peer);
 }
 
+void NodeApp::RemovePeerForTest(const std::string& nodeId) {
+    std::scoped_lock lock(impl_->stateMutex);
+    impl_->peers.erase(nodeId);
+}
+
 std::string NodeApp::SubmitPrepared(
     std::string name,
     const PreflightReport& report,
@@ -749,7 +874,8 @@ std::string NodeApp::SubmitPrepared(
         error = L"工程未通过预检";
         return {};
     }
-    if (name.empty() || frameEnd < frameStart || frameStep < 1 ||
+    if (name.empty() || frameStart < 1 || frameEnd < frameStart || frameEnd > 1000000 ||
+        frameStep < 1 ||
         (outputFormat != "PNG" && outputFormat != "JPEG" && outputFormat != "OPEN_EXR")) {
         error = L"任务参数无效";
         return {};
@@ -871,7 +997,8 @@ bool RunSelfTest(std::wstring& report) {
             workerConfig.discoveryPort = 18533;
             workerConfig.shareEnabled = true;
 
-            NodeApp origin(std::move(originStore), originConfig, true);
+            NodeApp origin(std::move(originStore), originConfig, true,
+                           std::chrono::milliseconds(600));
             NodeApp worker(std::move(workerStore), workerConfig, true);
             std::wstring startError;
             bool started = worker.Start(startError) && origin.Start(startError);
@@ -920,6 +1047,73 @@ bool RunSelfTest(std::wstring& report) {
                         clusterOk = clusterOk && frame.state == TaskState::Completed &&
                             fs::exists(frame.output);
                 }
+                if (clusterOk) {
+                    worker.Stop();
+                    origin.RemovePeerForTest(workerConfig.nodeId);
+                    httplib::Server lostServer;
+                    lostServer.Post("/v1/task", [](const httplib::Request&,
+                                                    httplib::Response& response) {
+                        response.status = 202;
+                        response.set_content("accepted then lost", "text/plain");
+                    });
+                    int lostPort = lostServer.bind_to_any_port("127.0.0.1");
+                    std::thread lostThread;
+                    if (lostPort > 0)
+                        lostThread = std::thread([&] { lostServer.listen_after_bind(); });
+                    Peer lostPeer;
+                    lostPeer.nodeId = "selftest-lost-worker";
+                    lostPeer.name = "SELFTEST-LOST-WORKER";
+                    lostPeer.address = "127.0.0.1";
+                    lostPeer.httpPort = lostPort;
+                    lostPeer.shareEnabled = true;
+                    lostPeer.trusted = true;
+                    origin.InjectPeerForTest(std::move(lostPeer));
+                    std::string recoveryJob = origin.SubmitPrepared(
+                        "lost-worker-self-test", preflight, 4, 4, 1, "PNG", submitError);
+                    bool reachedAssigned = false;
+                    auto assignDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+                    while (!recoveryJob.empty() &&
+                           std::chrono::steady_clock::now() < assignDeadline) {
+                        auto current = origin.Jobs();
+                        if (!current.empty() && current.back().id == recoveryJob &&
+                            current.back().frames.front().state == TaskState::Assigned) {
+                            reachedAssigned = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    Peer switchedPeer;
+                    switchedPeer.nodeId = "selftest-lost-worker";
+                    switchedPeer.name = "SELFTEST-LOST-WORKER";
+                    switchedPeer.address = "127.0.0.1";
+                    switchedPeer.httpPort = lostPort;
+                    switchedPeer.shareEnabled = true;
+                    switchedPeer.trusted = true;
+                    switchedPeer.assigned = 1;
+                    switchedPeer.currentTaskId = "unrelated-task";
+                    origin.InjectPeerForTest(std::move(switchedPeer));
+                    lostServer.stop();
+                    if (lostThread.joinable()) lostThread.join();
+                    bool recoveredLocally = false;
+                    auto recoveryDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(4);
+                    while (reachedAssigned &&
+                           std::chrono::steady_clock::now() < recoveryDeadline) {
+                        auto current = origin.Jobs();
+                        if (!current.empty() && current.back().id == recoveryJob) {
+                            const auto& frame = current.back().frames.front();
+                            if (frame.state == TaskState::Completed && fs::exists(frame.output) &&
+                                frame.assignedNodeId == originConfig.nodeId &&
+                                frame.dispatchAttempts >= 1) {
+                                recoveredLocally = true;
+                                break;
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    clusterOk = reachedAssigned && recoveredLocally;
+                }
                 if (!clusterOk) error = L"two-node HTTP dispatch/result test failed";
                 limited = limited && clusterOk;
             } else {
@@ -935,7 +1129,7 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Windows CPU Job Object 测试失败：" + error;
             return false;
         }
-        report = L"SELF_TEST_OK：配置、2 MiB 流式传输、CPU 15%→100% Job Object 均通过";
+        report = L"SELF_TEST_OK：配置、2 MiB 流式传输、CPU 15%→100%、双节点分发和掉线重派均通过";
         return true;
     } catch (const std::exception& exception) {
         report = L"自检异常：" + Utf8ToWide(exception.what());

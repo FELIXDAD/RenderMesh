@@ -52,8 +52,9 @@ HWND Item(int id) { return GetDlgItem(gWindow, id); }
 
 std::wstring Text(HWND control) {
     int length = GetWindowTextLengthW(control);
-    std::wstring value(static_cast<size_t>(length), L'\0');
+    std::wstring value(static_cast<size_t>(length) + 1, L'\0');
     GetWindowTextW(control, value.data(), length + 1);
+    value.resize(static_cast<size_t>(length));
     return value;
 }
 
@@ -514,7 +515,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         fs::path output;
         std::wstring renderError;
         bool ok = RenderBlenderFrame(renderConfig, renderSource, renderOutputDir, renderFrame,
-                                     renderFormat, stopRequested, output, renderError);
+                                     renderFormat, false, stopRequested, output, renderError);
         PrintToParentConsole(ok ? L"渲染成功：" + output.wstring() : renderError);
         return ok ? 0 : 4;
     }

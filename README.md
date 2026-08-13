@@ -47,13 +47,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\native\build.ps1 -Conf
 Start-Process .\native\build\Release\RenderMesh.exe -ArgumentList '--self-test','--no-dialog' -Wait
 ```
 
-内置自检覆盖配置持久化、2 MiB 流式传输、CPU 15%→100% Job Object 策略，以及两个真实 HTTP 节点之间三帧任务的分发与结果回传（渲染器使用测试桩）。真实 Blender 预检与渲染验证步骤见 [验证记录](docs/VERIFICATION.md)。
+内置自检覆盖配置持久化、2 MiB 流式传输、CPU 15%→100% Job Object 策略、两个真实 HTTP 节点之间三帧任务的分发/回传，以及远端节点接单后掉线时自动重派到本机（渲染器使用测试桩）。真实 Blender 预检与渲染验证步骤见 [验证记录](docs/VERIFICATION.md)。
 
 ## 当前边界
 
 - 只支持动画按帧拆分，不拆分同一帧的 Cycles samples。
 - 每台 Worker 同时运行一个 Blender 进程。
-- 已打包工程目前会逐帧上传，尚无内容哈希缓存；大型工程会重复占用局域网带宽。
+- 已打包工程目前会逐帧上传，尚无内容哈希缓存；大型工程会重复占用局域网带宽。Worker 成功回传后会删除该帧临时工程，失败回传则保留以便诊断。
 - HTTP 数据面没有 TLS，集群码也不是企业身份系统；只应部署在可信公司 LAN/VLAN，不能暴露到互联网。
 - CPU 可以硬限额；Windows 没有跨 NVIDIA/AMD/Intel 的通用 GPU 百分比硬配额。GPU 场景在活跃状态下仍可能明显占用显卡。
 - EXE 当前未做商业代码签名，Windows SmartScreen 可能显示未知发布者；发布到全公司前建议由 IT 使用公司证书签名。
