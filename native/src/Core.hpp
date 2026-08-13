@@ -160,6 +160,7 @@ struct Peer {
     std::string currentTaskId;
     bool currentTaskKnown = true;
     bool manualRoute = false;
+    std::chrono::steady_clock::time_point manualValidatedAt{};
     double idleSeconds = 0;
     std::chrono::steady_clock::time_point lastSeen;
 };

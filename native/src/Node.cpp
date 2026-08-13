@@ -733,6 +733,7 @@ struct NodeApp::Impl {
         peer.currentTaskKnown = health.contains("task_id");
         peer.currentTaskId = health.value("task_id", "");
         peer.manualRoute = true;
+        peer.manualValidatedAt = std::chrono::steady_clock::now();
         peer.idleSeconds = health.value("idle", 0.0);
         peer.lastSeen = std::chrono::steady_clock::now();
         result = L"已连接 " + Utf8ToWide(peer.name) + L"（" + Utf8ToWide(address) + L":" +
@@ -874,10 +875,20 @@ struct NodeApp::Impl {
                 {
                     std::scoped_lock lock(stateMutex);
                     auto existing = peers.find(peer.nodeId);
-                    if (existing != peers.end() && existing->second.manualRoute) {
+                    std::string configuredEndpoint = config.manualPeerEndpoint;
+                    std::string existingEndpoint = existing == peers.end() ? "" :
+                        existing->second.address + ":" +
+                        std::to_string(existing->second.httpPort);
+                    bool manualRouteStillValid = existing != peers.end() &&
+                        existing->second.manualRoute &&
+                        configuredEndpoint == existingEndpoint &&
+                        std::chrono::steady_clock::now() -
+                            existing->second.manualValidatedAt <= kPeerTimeout;
+                    if (manualRouteStillValid) {
                         peer.address = existing->second.address;
                         peer.httpPort = existing->second.httpPort;
                         peer.manualRoute = true;
+                        peer.manualValidatedAt = existing->second.manualValidatedAt;
                     }
                     peers[peer.nodeId] = std::move(peer);
                 }
