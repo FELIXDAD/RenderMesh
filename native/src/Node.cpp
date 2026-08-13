@@ -131,13 +131,6 @@ std::string DiscoverySignature(const Config& config, const json& message) {
     return HmacSha256(config.clusterToken, signedValue);
 }
 
-std::string PairingBeaconProof(const std::string& inviteCode, const json& message) {
-    return HmacSha256(inviteCode,
-        "pairing-beacon|" + message.value("node_id", "") + "|" +
-        message.value("nonce", "") + "|" + std::to_string(message.value("port", 0)) + "|" +
-        json(message.value("addresses", std::vector<std::string>{})).dump());
-}
-
 struct LocalIPv4Interface {
     std::string address;
     std::optional<std::string> broadcast;
@@ -456,7 +449,7 @@ struct NodeApp::Impl {
             pending.inviteCode,
             "pair-response|" + serverNodeId + "|" + pending.nodeId + "|" + nonce + "|" +
                 credential);
-        if (body.is_discarded() || responseNode != serverNodeId || credential.size() < 32 ||
+        if (body.is_discarded() || responseNode != serverNodeId || credential.size() < 16 ||
             !ConstantTimeEqual(body.value("proof", ""), expected)) {
             result = L"配对响应无效";
             return false;
@@ -503,7 +496,7 @@ struct NodeApp::Impl {
             std::string clientNodeId = request.get_header_value("X-RM-Node");
             std::string nonce = request.get_header_value("X-RM-Nonce");
             std::string claimed = request.get_header_value("X-RM-Proof");
-            if (config.pairingPending || config.clusterToken.size() < 32 ||
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
                 !SafeId(clientNodeId) || !SafeId(nonce) || nonce.size() < 16) {
                 response.status = 409;
                 return;
@@ -534,7 +527,7 @@ struct NodeApp::Impl {
                 return;
             }
             Config config = owner->GetConfig();
-            if (config.pairingPending || config.clusterToken.size() < 32) {
+            if (config.pairingPending || config.clusterToken.size() < 16) {
                 response.status = 409;
                 return;
             }
@@ -549,7 +542,7 @@ struct NodeApp::Impl {
             [&](const httplib::Request& request, httplib::Response& response,
                 const httplib::ContentReader& reader) {
                 Config config = owner->GetConfig();
-                if (config.pairingPending || config.clusterToken.size() < 32 ||
+                if (config.pairingPending || config.clusterToken.size() < 16 ||
                     !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
                                        config.clusterToken)) {
                     response.status = 401;
@@ -567,7 +560,7 @@ struct NodeApp::Impl {
                 int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
                 std::string format = request.get_header_value("X-RM-Format");
                 std::string extension = request.get_header_value("X-RM-Extension");
-                if (extension.empty()) extension = FrameExtension(format);
+                if (!request.has_header("X-RM-Extension")) extension = FrameExtension(format);
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string renderEngine = request.get_header_value("X-RM-Engine");
                 bool cpuSafeWhileActive = request.get_header_value("X-RM-CPU-Safe") == "1";
@@ -690,7 +683,7 @@ struct NodeApp::Impl {
             [&](const httplib::Request& request, httplib::Response& response,
                 const httplib::ContentReader& reader) {
                 Config config = owner->GetConfig();
-                if (config.pairingPending || config.clusterToken.size() < 32 ||
+                if (config.pairingPending || config.clusterToken.size() < 16 ||
                     !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
                                        config.clusterToken)) {
                     response.status = 401;
@@ -946,8 +939,8 @@ struct NodeApp::Impl {
                 for (const auto& network : networks)
                     localAddresses.push_back(network.address);
                 std::vector<std::string> payloads;
-                if (!config.pairingPending && config.clusterToken.size() >= 32) {
-                    json message = {
+                if (!config.pairingPending && config.clusterToken.size() >= 16) {
+                    json messageV2 = {
                         {"protocol", 2}, {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
@@ -956,15 +949,20 @@ struct NodeApp::Impl {
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    message["signature"] = DiscoverySignature(config, message);
-                    payloads.push_back(message.dump());
-                    json pairing = {
-                        {"protocol", 2}, {"kind", "pairing"}, {"node_id", config.nodeId},
-                        {"name", config.nodeName}, {"nonce", NewRandomHex(8)},
-                        {"addresses", localAddresses}, {"port", config.httpPort},
+                    messageV2["signature"] = DiscoverySignature(config, messageV2);
+                    payloads.push_back(messageV2.dump());
+                    // Keep a v1 beacon during the protocol-v2 rollout so an older
+                    // installed node can still discover this endpoint.
+                    json messageV1 = {
+                        {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
+                        {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
+                        {"port", config.httpPort}, {"share", config.shareEnabled},
+                        {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
+                        {"task_id", CurrentTaskId()},
+                        {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    pairing["proof"] = PairingBeaconProof(config.inviteCode, pairing);
-                    payloads.push_back(pairing.dump());
+                    messageV1["signature"] = DiscoverySignature(config, messageV1);
+                    payloads.push_back(messageV1.dump());
                 }
                 for (const auto& network : BroadcastCapableInterfaces(networks)) {
                     SOCKET sendSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1003,25 +1001,6 @@ struct NodeApp::Impl {
                 if (protocol != 1 && protocol != 2) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
-                if (protocol == 2 && message.value("kind", "") == "pairing") {
-                    Config pending = owner->GetConfig();
-                    std::string serverNodeId = message.value("node_id", "");
-                    int serverPort = message.value("port", 0);
-                    auto addresses = message.value("addresses", std::vector<std::string>{});
-                    bool valid = pending.pairingPending && SafeId(serverNodeId) &&
-                        serverNodeId != pending.nodeId && serverPort >= 1024 && serverPort <= 65535 &&
-                        std::find(addresses.begin(), addresses.end(), std::string(remoteAddress)) !=
-                            addresses.end() &&
-                        ConstantTimeEqual(message.value("proof", ""),
-                                          PairingBeaconProof(pending.inviteCode, message));
-                    if (valid) {
-                        std::wstring pairingStatus;
-                        if (TryPair(remoteAddress, serverPort, serverNodeId, pairingStatus))
-                            SetManualStatus(std::move(pairingStatus));
-                        Notify();
-                    }
-                    continue;
-                }
                 Peer peer;
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
@@ -1501,7 +1480,7 @@ bool NodeApp::UpdateConfig(Config config, std::wstring& error) {
         config.manualPeerEndpoint.clear();
     }
     if (config.nodeName.empty() || !IsInviteCode(config.inviteCode) ||
-        (!config.pairingPending && config.clusterToken.size() < 32) ||
+        (!config.pairingPending && config.clusterToken.size() < 16) ||
         config.activeCpuPercent < 1 || config.activeCpuPercent > 100 ||
         config.idleAfterSeconds < 1 || config.idleAfterSeconds > 86400) {
         error = L"设置值无效";
@@ -1645,7 +1624,7 @@ bool RunSelfTest(std::wstring& report) {
         fs::create_directories(root);
         ConfigStore store(root);
         Config config = store.Load();
-        if (!IsInviteCode(config.inviteCode) || config.clusterToken.size() < 32) {
+        if (!IsInviteCode(config.inviteCode) || config.clusterToken.size() < 16) {
             report = L"Default invite-code or internal credential generation failed";
             return false;
         }
@@ -1653,6 +1632,7 @@ bool RunSelfTest(std::wstring& report) {
         config.activeCpuPercent = 17;
         config.idleAfterSeconds = 7;
         config.inviteCode = "042731";
+        config.clusterToken = "legacy-token-123";
         config.manualPeerEndpoint = "192.168.28.28:8391";
         std::wstring error;
         Config persisted;
@@ -1660,14 +1640,16 @@ bool RunSelfTest(std::wstring& report) {
             (persisted = store.Load()).activeCpuPercent != 17 ||
             persisted.idleAfterSeconds != 7 ||
             persisted.inviteCode != "042731" ||
-            persisted.clusterToken != config.clusterToken ||
+            persisted.clusterToken != "legacy-token-123" ||
             persisted.manualPeerEndpoint != config.manualPeerEndpoint) {
             report = L"配置持久化失败：" + error;
             return false;
         }
         if (!IsInviteCode("000000") || !IsInviteCode("999999") ||
             IsInviteCode("12345") || IsInviteCode("1234567") ||
-            IsInviteCode("12A456")) {
+            IsInviteCode("12A456") || !IsSafeOutputExtension("") ||
+            !IsSafeOutputExtension(".png") || IsSafeOutputExtension("png") ||
+            IsSafeOutputExtension(".bad/path")) {
             report = L"Six-digit invite-code validation failed";
             return false;
         }

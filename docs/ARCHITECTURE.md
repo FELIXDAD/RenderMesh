@@ -18,9 +18,9 @@ Blender 预检/打包 ──缺素材或无法打包──► 阻止提交
                          单帧结果回传 Origin
 ```
 
-UDP 8390 广播协议版本、随机 nonce、节点 ID、节点自身 IPv4 地址列表、名称、HTTP 端口、共享状态、CPU 策略、任务数和空闲时间。程序枚举所有已启用的 IPv4 网卡，根据前缀分别计算定向广播地址；`/31`、`/32` 等无广播网卡会跳过。整条关键发现信息使用集群码作 HMAC-SHA256 签名，不广播真实集群码。接收端要求 UDP 实际来源 IP 位于签名地址列表中，无效包不会覆盖已认证节点。广播不可用时，用户可保存一个手动 `IPv4:端口`；程序周期性请求 `/health` 并完成 `/v1/prove` 挑战，验证通过后进入同一个调度池。Origin 只向在线、验证有效、已开启共享且当前无任务的节点派发。远端接单后若节点离线，或重新报告为空闲却没有回传结果，Origin 会在 20 秒宽限期后将帧重新排队。
+UDP 8390 广播协议版本、随机 nonce、节点 ID、节点自身 IPv4 地址列表、名称、HTTP 端口、共享状态、CPU/GPU 型号、CPU 策略、任务数和空闲时间。协议 v2 把硬件字段纳入 HMAC-SHA256 签名；升级过渡期同时发送不含硬件字段的 v1 兼容信标，使尚未升级的节点仍能发现新版节点。程序枚举所有已启用的 IPv4 网卡，根据前缀分别计算定向广播地址；`/31`、`/32` 等无广播网卡会跳过。发现签名始终使用内部随机集群凭证，不使用或广播六位邀请码。接收端要求 UDP 实际来源 IP 位于签名地址列表中，无效包不会覆盖已认证节点。广播不可用时，用户可保存一个手动 `IPv4:端口`；程序周期性请求 `/health` 并完成 `/v1/prove` 挑战，验证通过后进入同一个调度池。Origin 只向在线、验证有效、已开启共享且当前无任务的节点派发。远端接单后若节点离线，或重新报告为空闲却没有回传结果，Origin 会在 20 秒宽限期后将帧重新排队。
 
-TCP 8391 提供 `/health`、`/v1/prove`、`/v1/task` 和 `/v1/result`。任务文件以 1 MiB 块流式读写到 `.receiving` 临时文件，完成后原子替换；服务端单请求上限为 100 GiB，并在接收前检查剩余磁盘空间。上传使用可中止的数据提供器与 5 秒阻塞超时，退出不会被失联节点长期卡住。每个 Worker 原子地保留一个执行槽，避免并发请求绕过“单 Blender 进程”限制。每次派发都有新的随机 attempt token；只接受当前租约的结果，掉线重派后的旧 Worker 无法覆盖新结果。
+TCP 8391 提供 `/health`、`/v1/prove`、`/v1/task`、`/v1/result` 和 `/v2/pair`。六位邀请码只是人工输入的配对码：新节点进入待配对状态后，用户必须明确填写一台已加入集群的可信局域网 `IPv4:端口`；服务端按来源 IP 限制尝试次数，验证成功才把内部随机集群凭证交给新节点。邀请码不会出现在发现广播中。任务文件以 1 MiB 块流式读写到 `.receiving` 临时文件，完成后原子替换；服务端单请求上限为 100 GiB，并在接收前检查剩余磁盘空间。上传使用可中止的数据提供器与 5 秒阻塞超时，退出不会被失联节点长期卡住。每个 Worker 原子地保留一个执行槽，避免并发请求绕过“单 Blender 进程”限制。每次派发都有新的随机 attempt token；只接受当前租约的结果，掉线重派后的旧 Worker 无法覆盖新结果。
 
 ## 持久化
 
@@ -30,6 +30,7 @@ TCP 8391 提供 `/health`、`/v1/prove`、`/v1/task` 和 `/v1/result`。任务�
 %LOCALAPPDATA%\RenderMesh\
   config.json
   jobs.json
+  logs\RenderMesh-YYYY-MM-DD.log
   tools\preflight.py
   tools\compatibility.py
   jobs\<job-id>\source.blend
@@ -47,8 +48,10 @@ Worker 通过参数数组启动 Blender，不经过 shell。正式渲染使用�
 
 ```text
 blender --background --disable-autoexec source.blend
-        --render-output frame_###### --render-format PNG --render-frame 42
+        --render-output frame_###### --render-frame 42
 ```
+
+输出格式与是否附加扩展名由 `.blend` 工程设置决定，RenderMesh 不再传入 `--render-format` 覆盖工程。预检记录格式、扩展名和 `use_file_extension`；关闭自动扩展名的工程会按无扩展名文件接收。
 
 只有别人发来的共享任务会被限制。本机用户自己提交并由本机兜底执行的任务不套用共享限额。主路径 Eevee / Cycles GPU 仅在空闲状态接单，检测到键鼠恢复后终止该次进程并向 Origin 请求重派；Cycles GPU 还要求 Worker 检测到已启用的非 CPU Cycles 设备。Cycles CPU 共享 Blender 在创建后先保持挂起，加入启用 `KILL_ON_JOB_CLOSE` 的 Windows Job Object，再恢复运行；用户活跃时设置 `HARD_CAP`，空闲到阈值后关闭 CPU rate control，使进程树可使用 100%。Windows 10/11 嵌套 Job 允许它在企业管理软件或受管宿主下正常工作。
 

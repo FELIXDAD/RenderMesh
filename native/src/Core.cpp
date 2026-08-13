@@ -386,6 +386,7 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'render_engine': engine,
           'render_format': bpy.context.scene.render.image_settings.file_format,
           'file_extension': bpy.context.scene.render.file_extension,
+          'use_file_extension': bpy.context.scene.render.use_file_extension,
           'cpu_safe_while_active': (engine == 'CYCLES' and cycles_device == 'CPU' and
                                     not uses_optix_denoiser and not uses_compositor),
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
@@ -578,10 +579,10 @@ bool IsInviteCode(const std::string& value) {
 }
 
 bool IsSafeOutputExtension(const std::string& value) {
-    return value.size() >= 2 && value.size() <= 16 && value.front() == '.' &&
+    return value.empty() || (value.size() >= 2 && value.size() <= 16 && value.front() == '.' &&
         std::all_of(value.begin() + 1, value.end(), [](unsigned char ch) {
             return std::isalnum(ch) != 0 || ch == '_';
-        });
+        }));
 }
 
 std::string Sha256Prefix(const std::string& value, size_t chars) {
@@ -738,7 +739,7 @@ Config ConfigStore::Load() {
         if (!IsInviteCode(config.inviteCode))
             config.inviteCode = InviteCodeFromToken(config.clusterToken);
         config.pairingPending = data.value("pairing_pending", false);
-        if (!config.pairingPending && config.clusterToken.size() < 32)
+        if (!config.pairingPending && config.clusterToken.size() < 16)
             config.clusterToken = NewRandomHex(16);
         config.shareEnabled = data.value("share_enabled", false);
         config.activeCpuPercent = std::clamp(data.value("active_cpu_percent", 15), 1, 100);
@@ -847,7 +848,8 @@ PreflightReport PreflightBlend(
         report.blenderVersion = data.value("version", std::string{});
         report.renderEngine = data.value("render_engine", std::string{});
         report.outputFormat = data.value("render_format", std::string{});
-        report.outputExtension = data.value("file_extension", std::string{});
+        report.outputExtension = data.value("use_file_extension", true)
+            ? data.value("file_extension", std::string{}) : std::string{};
         if (report.outputFormat.empty() || !IsSafeOutputExtension(report.outputExtension)) {
             report.passed = false;
             report.warnings.push_back("The project output format has no safe file extension");

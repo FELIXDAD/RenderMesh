@@ -176,7 +176,7 @@ bool SaveSettings() {
     Config saved = gApp->GetConfig();
     MessageBoxW(gWindow,
                 saved.pairingPending
-                    ? L"邀请码已保存，正在局域网中寻找使用该邀请码的电脑进行配对。"
+                    ? L"邀请码已保存。请在“手动连接”中填写一台已加入该集群的电脑 IP 完成配对。"
                     : L"设置已保存。共享开关和空闲策略立即生效。",
                 L"RenderMesh", MB_ICONINFORMATION);
     return true;
