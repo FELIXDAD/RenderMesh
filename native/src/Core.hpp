@@ -38,7 +38,7 @@ bool IsSafeOutputExtension(const std::string& value);
 std::vector<std::vector<int>> BuildFramePackages(
     const std::vector<int>& frames, size_t packageSize = 5);
 std::string Sha256Prefix(const std::string& value, size_t chars = 16);
-std::string Sha256File(const fs::path& path);
+std::string Sha256File(const fs::path& path, std::atomic<bool>* stopRequested = nullptr);
 std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
 fs::path DefaultDataDirectory();
@@ -124,6 +124,13 @@ struct PreflightReport {
 };
 
 fs::path FindBlender(const Config& config);
+bool GeneratePreviewImage(
+    const Config& config,
+    const fs::path& dataDir,
+    const fs::path& source,
+    const fs::path& destination,
+    std::atomic<bool>& stopRequested,
+    std::wstring& error);
 PreflightReport PreflightBlend(
     const Config& config,
     const fs::path& dataDir,
@@ -238,6 +245,7 @@ struct Peer {
     bool supportsProjectCache = false;
     bool supportsFramePackages = false;
     bool supportsResultBundles = false;
+    bool supportsPackageCancellation = false;
     std::string nodeId;
     std::string name;
     std::string address;

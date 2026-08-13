@@ -121,7 +121,8 @@ bool HeaderOutputTargets(
 bool StreamRequestToFile(
     const httplib::ContentReader& reader,
     const fs::path& destination,
-    std::wstring& error) {
+    std::wstring& error,
+    std::atomic<bool>* stopRequested = nullptr) {
     fs::create_directories(destination.parent_path());
     fs::path temporary = destination;
     temporary += L".receiving";
@@ -132,6 +133,7 @@ bool StreamRequestToFile(
     }
     uint64_t receivedBytes = 0;
     bool received = reader([&](const char* data, size_t size) {
+        if (stopRequested && stopRequested->load()) return false;
         if (size > kMaxTransferBytes - receivedBytes) return false;
         receivedBytes += size;
         output.write(data, static_cast<std::streamsize>(size));
@@ -139,7 +141,8 @@ bool StreamRequestToFile(
     });
     output.close();
     if (!received || !output) {
-        error = L"文件接收中断";
+        error = stopRequested && stopRequested->load() ? L"文件接收已取消"
+                                                       : L"文件接收中断";
         DeleteFileW(temporary.c_str());
         return false;
     }
@@ -149,6 +152,61 @@ bool StreamRequestToFile(
         return false;
     }
     return true;
+}
+
+bool WriteDurableFileAtomic(
+    const fs::path& destination, const std::string& contents, std::wstring& error) {
+    std::error_code ignored;
+    fs::create_directories(destination.parent_path(), ignored);
+    fs::path temporary = destination;
+    temporary += L".tmp";
+    HANDLE file = CreateFileW(
+        temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = L"无法创建状态临时文件：" + LastErrorMessage();
+        return false;
+    }
+    bool ok = true;
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        DWORD wanted = static_cast<DWORD>(std::min<size_t>(
+            contents.size() - offset, static_cast<size_t>(32 * 1024 * 1024)));
+        DWORD written = 0;
+        if (!WriteFile(file, contents.data() + offset, wanted, &written, nullptr) ||
+            written != wanted) {
+            error = L"状态文件写入不完整：" + LastErrorMessage();
+            ok = false;
+            break;
+        }
+        offset += written;
+    }
+    if (ok && !FlushFileBuffers(file)) {
+        error = L"状态文件无法刷新到磁盘：" + LastErrorMessage();
+        ok = false;
+    }
+    if (!CloseHandle(file) && ok) {
+        error = L"状态文件无法关闭：" + LastErrorMessage();
+        ok = false;
+    }
+    if (!ok) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = L"无法发布状态文件：" + LastErrorMessage();
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool CancellationRequested(
+    const std::atomic<bool>* stopRequested,
+    const std::atomic<bool>* operationCancelled = nullptr) {
+    return (stopRequested && stopRequested->load()) ||
+           (operationCancelled && operationCancelled->load());
 }
 
 bool HasTransferCapacity(
@@ -232,6 +290,8 @@ std::string DiscoverySignature(const Config& config, const json& message) {
         signedValue += "|" + std::string(message.value("frame_packages", false) ? "1" : "0");
     if (message.value("protocol", 1) >= 5)
         signedValue += "|" + std::string(message.value("result_bundles", false) ? "1" : "0");
+    if (message.value("protocol", 1) >= 6)
+        signedValue += "|" + std::string(message.value("package_cancel", false) ? "1" : "0");
     return HmacSha256(config.clusterToken, signedValue);
 }
 
@@ -325,6 +385,7 @@ void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     candidate.supportsProjectCache = existing.supportsProjectCache;
     candidate.supportsFramePackages = existing.supportsFramePackages;
     candidate.supportsResultBundles = existing.supportsResultBundles;
+    candidate.supportsPackageCancellation = existing.supportsPackageCancellation;
     candidate.name = existing.name;
     candidate.cpuPercent = existing.cpuPercent;
     candidate.idleSeconds = existing.idleSeconds;
@@ -565,7 +626,8 @@ httplib::Result PostFile(
     const httplib::Headers& headers,
     const fs::path& file,
     std::atomic<bool>* stopRequested = nullptr,
-    time_t responseTimeoutSeconds = 5) {
+    time_t responseTimeoutSeconds = 5,
+    std::atomic<bool>* operationCancelled = nullptr) {
     std::error_code ec;
     size_t total = static_cast<size_t>(fs::file_size(file, ec));
     httplib::Client client(host, port);
@@ -574,15 +636,16 @@ httplib::Result PostFile(
     // accepts a connection and then stalls indefinitely.
     client.set_read_timeout(responseTimeoutSeconds, 0);
     client.set_write_timeout(5, 0);
-    auto provider = [file, stopRequested](size_t offset, size_t length, httplib::DataSink& sink) {
-        if (stopRequested && stopRequested->load()) return false;
+    auto provider = [file, stopRequested, operationCancelled](
+                        size_t offset, size_t length, httplib::DataSink& sink) {
+        if (CancellationRequested(stopRequested, operationCancelled)) return false;
         std::ifstream input(file, std::ios::binary);
         if (!input) return false;
         input.seekg(static_cast<std::streamoff>(offset));
         std::vector<char> buffer(std::min<size_t>(length, 1024 * 1024));
         size_t remaining = length;
         while (remaining > 0 && input) {
-            if (stopRequested && stopRequested->load()) return false;
+            if (CancellationRequested(stopRequested, operationCancelled)) return false;
             size_t wanted = std::min(buffer.size(), remaining);
             input.read(buffer.data(), static_cast<std::streamsize>(wanted));
             size_t read = static_cast<size_t>(input.gcount());
@@ -596,10 +659,10 @@ httplib::Result PostFile(
     std::condition_variable cancellationChanged;
     bool finished = false;
     std::thread cancellationThread;
-    if (stopRequested) {
+    if (stopRequested || operationCancelled) {
         cancellationThread = std::thread([&] {
             std::unique_lock lock(cancellationMutex);
-            while (!finished && !stopRequested->load())
+            while (!finished && !CancellationRequested(stopRequested, operationCancelled))
                 cancellationChanged.wait_for(lock, std::chrono::milliseconds(100));
             if (!finished) client.stop();
         });
@@ -619,7 +682,8 @@ httplib::Result PostEmpty(
     int port,
     const std::string& route,
     const httplib::Headers& headers,
-    std::atomic<bool>* stopRequested = nullptr) {
+    std::atomic<bool>* stopRequested = nullptr,
+    std::atomic<bool>* operationCancelled = nullptr) {
     httplib::Client client(host, port);
     client.set_connection_timeout(3, 0);
     client.set_read_timeout(5, 0);
@@ -628,10 +692,10 @@ httplib::Result PostEmpty(
     std::condition_variable cancellationChanged;
     bool finished = false;
     std::thread cancellationThread;
-    if (stopRequested) {
+    if (stopRequested || operationCancelled) {
         cancellationThread = std::thread([&] {
             std::unique_lock lock(cancellationMutex);
-            while (!finished && !stopRequested->load())
+            while (!finished && !CancellationRequested(stopRequested, operationCancelled))
                 cancellationChanged.wait_for(lock, std::chrono::milliseconds(100));
             if (!finished) client.stop();
         });
@@ -680,6 +744,8 @@ struct NodeApp::Impl {
     mutable std::mutex manualStatusMutex;
     std::wstring manualStatus;
     std::mutex workMutex;
+    std::map<std::string, std::chrono::steady_clock::time_point> cancelledPackages;
+    std::mutex cancellationMutex;
     std::mutex cacheMutex;
     std::mutex pairingMutex;
     std::map<std::string, std::deque<std::chrono::steady_clock::time_point>> pairingAttempts;
@@ -689,6 +755,7 @@ struct NodeApp::Impl {
     std::string currentTaskId;
     std::atomic<int> workerAssigned{0};
     std::atomic<bool> stopRequested{false};
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>> jobCancellations;
     httplib::Server server;
     std::atomic<SOCKET> discoverySocket{INVALID_SOCKET};
     std::thread serverThread;
@@ -709,6 +776,34 @@ struct NodeApp::Impl {
 
     fs::path JobsPath() const { return owner->DataDir() / L"jobs.json"; }
     fs::path ContributionsPath() const { return owner->DataDir() / L"contributions.json"; }
+
+    std::shared_ptr<std::atomic<bool>> JobCancellation(const std::string& jobId) {
+        std::scoped_lock lock(cancellationMutex);
+        auto& signal = jobCancellations[jobId];
+        if (!signal) signal = std::make_shared<std::atomic<bool>>(false);
+        return signal;
+    }
+
+    bool PackageCancelled(const std::string& packageId) {
+        std::scoped_lock lock(workMutex);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = cancelledPackages.begin(); it != cancelledPackages.end();) {
+            if (now - it->second > std::chrono::hours(1)) it = cancelledPackages.erase(it);
+            else ++it;
+        }
+        return cancelledPackages.contains(packageId);
+    }
+
+    void CancelPackage(const std::string& packageId) {
+        std::scoped_lock lock(workMutex);
+        if (cancelledPackages.size() >= 4096) cancelledPackages.erase(cancelledPackages.begin());
+        cancelledPackages[packageId] = std::chrono::steady_clock::now();
+    }
+
+    void ForgetCancelledPackage(const std::string& packageId) {
+        std::scoped_lock lock(workMutex);
+        cancelledPackages.erase(packageId);
+    }
 
     std::string CurrentTaskId() {
         std::scoped_lock lock(currentTaskMutex);
@@ -780,19 +875,9 @@ struct NodeApp::Impl {
                 });
             }
         }
-        fs::create_directories(owner->DataDir());
-        fs::path temporary = JobsPath();
-        temporary += L".tmp";
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            output << rows.dump(2);
-        }
-        for (int attempt = 0; attempt < 5; ++attempt) {
-            if (MoveFileExW(temporary.c_str(), JobsPath().c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                return;
-            Sleep(static_cast<DWORD>((attempt + 1) * 20));
-        }
+        std::wstring error;
+        if (!WriteDurableFileAtomic(JobsPath(), rows.dump(2), error))
+            LogError("jobs state was not replaced; " + WideToUtf8(error));
     }
 
     void LoadJobs() {
@@ -878,19 +963,9 @@ struct NodeApp::Impl {
                 });
             }
         }
-        fs::create_directories(owner->DataDir());
-        fs::path temporary = ContributionsPath();
-        temporary += L".tmp";
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            output << rows.dump(2);
-        }
-        for (int attempt = 0; attempt < 5; ++attempt) {
-            if (MoveFileExW(temporary.c_str(), ContributionsPath().c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                return;
-            Sleep(static_cast<DWORD>((attempt + 1) * 20));
-        }
+        std::wstring error;
+        if (!WriteDurableFileAtomic(ContributionsPath(), rows.dump(2), error))
+            LogError("contribution history was not replaced; " + WideToUtf8(error));
     }
 
     void LoadContributions() {
@@ -990,11 +1065,14 @@ struct NodeApp::Impl {
 
     void ConfigureServer() {
         server.set_payload_max_length(100ull * 1024 * 1024 * 1024);
+        server.set_read_timeout(5, 0);
+        server.set_write_timeout(5, 0);
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             Config config = owner->GetConfig();
             response.set_content(
-                json{{"status", "ok"}, {"protocol", 5}, {"project_cache", true},
+                json{{"status", "ok"}, {"protocol", 6}, {"project_cache", true},
                      {"frame_packages", true}, {"result_bundles", true},
+                     {"package_cancel", true},
                      {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
@@ -1036,6 +1114,31 @@ struct NodeApp::Impl {
                         "|" + config.clusterToken)},
             }.dump(), "application/json");
             LogInfo("approved LAN pairing for node " + clientNodeId);
+        });
+        server.Post("/v3/cancel", [&](const httplib::Request& request,
+                                        httplib::Response& response) {
+            Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
+                !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                   config.clusterToken)) {
+                response.status = 401;
+                return;
+            }
+            std::string packageId = request.get_header_value("X-RM-Package");
+            if (!SafeId(packageId)) {
+                response.status = 422;
+                return;
+            }
+            CancelPackage(packageId);
+            fs::path marker = owner->DataDir() / L"incoming" / Utf8ToWide(packageId) /
+                              L"outputs" / L"stop-after-current";
+            std::error_code ignored;
+            fs::create_directories(marker.parent_path(), ignored);
+            std::ofstream(marker, std::ios::binary | std::ios::trunc) << "stop";
+            workCv.notify_all();
+            response.status = 202;
+            response.set_content("cancellation recorded", "text/plain");
+            LogInfo("remote package cancellation recorded; package=" + packageId);
         });
         server.Get("/v2/cache/status", [&](const httplib::Request& request,
                                              httplib::Response& response) {
@@ -1121,12 +1224,20 @@ struct NodeApp::Impl {
                 fs::path directory = ProjectCacheDirectory(owner->DataDir(), hash);
                 fs::path blend = directory / L"source.blend";
                 std::wstring receiveError;
-                if (!StreamRequestToFile(reader, blend, receiveError)) {
+                if (!StreamRequestToFile(reader, blend, receiveError, &stopRequested)) {
                     response.status = 500;
                     response.set_content(WideToUtf8(receiveError), "text/plain");
                     return;
                 }
-                if (Sha256File(blend) != hash) {
+                std::string receivedHash = Sha256File(blend, &stopRequested);
+                if (stopRequested.load()) {
+                    std::error_code ignored;
+                    fs::remove_all(directory, ignored);
+                    response.status = 503;
+                    response.set_content("node is stopping", "text/plain");
+                    return;
+                }
+                if (receivedHash != hash) {
                     std::error_code ignored;
                     fs::remove_all(directory, ignored);
                     response.status = 422;
@@ -1223,6 +1334,11 @@ struct NodeApp::Impl {
                 !SafeId(attemptToken) || format.empty() ||
                 !IsSafeOutputExtension(extension)) {
                 response.status = 422;
+                return;
+            }
+            if (PackageCancelled(taskId)) {
+                response.status = 409;
+                response.set_content("task was cancelled before acceptance", "text/plain");
                 return;
             }
             if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
@@ -1344,6 +1460,11 @@ struct NodeApp::Impl {
                 originPort < 1024 || originPort > 65535 || format.empty() ||
                 version.empty() || engine.empty() || !IsSafeOutputExtension(extension)) {
                 response.status = 422;
+                return;
+            }
+            if (PackageCancelled(packageId)) {
+                response.status = 409;
+                response.set_content("package was cancelled before acceptance", "text/plain");
                 return;
             }
             if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
@@ -1493,9 +1614,16 @@ struct NodeApp::Impl {
                 fs::path taskDir = owner->DataDir() / L"incoming" / Utf8ToWide(taskId);
                 fs::path blend = taskDir / L"source.blend";
                 std::wstring receiveError;
-                if (!StreamRequestToFile(reader, blend, receiveError)) {
+                if (!StreamRequestToFile(reader, blend, receiveError, &stopRequested)) {
                     response.status = 500;
                     response.set_content(WideToUtf8(receiveError), "text/plain");
+                    return;
+                }
+                if (PackageCancelled(taskId)) {
+                    response.status = 409;
+                    response.set_content("task was cancelled during upload", "text/plain");
+                    std::error_code ignored;
+                    fs::remove_all(taskDir, ignored);
                     return;
                 }
                 if (!cpuSafeWhileActive && IdleSeconds() < config.idleAfterSeconds) {
@@ -1596,6 +1724,7 @@ struct NodeApp::Impl {
                 }
                 bool resultBundle = request.get_header_value("X-RM-Result-Bundle") == "1";
                 fs::path stagingRoot;
+                std::string targetJobId;
                 size_t targetJob = 0;
                 size_t targetFrame = 0;
                 bool found = false;
@@ -1617,6 +1746,7 @@ struct NodeApp::Impl {
                             return;
                         }
                         found = true;
+                        targetJobId = job.id;
                         stagingRoot = owner->DataDir() / L"jobs" / Utf8ToWide(job.id) /
                             L"receiving" / Utf8ToWide(taskId + "-" + attemptToken);
                         break;
@@ -1626,6 +1756,7 @@ struct NodeApp::Impl {
                     response.status = 404;
                     return;
                 }
+                auto jobCancelled = JobCancellation(targetJobId);
                 if (status == "completed" && !HasTransferCapacity(
                         request, stagingRoot, resultBundle ? 2 : 1)) {
                     response.status = 507;
@@ -1639,7 +1770,7 @@ struct NodeApp::Impl {
                 }
                 std::wstring receiveError;
                 bool ok = status != "completed" ||
-                    StreamRequestToFile(reader, stagedResult, receiveError);
+                    StreamRequestToFile(reader, stagedResult, receiveError, &stopRequested);
                 std::map<std::string, fs::path> receivedArtifacts;
                 if (status == "completed" && ok) {
                     if (resultBundle) {
@@ -1649,6 +1780,13 @@ struct NodeApp::Impl {
                     } else {
                         receivedArtifacts["primary"] = stagedResult;
                     }
+                }
+                if (stopRequested.load()) {
+                    std::error_code ignored;
+                    if (!stagingRoot.empty()) fs::remove_all(stagingRoot, ignored);
+                    response.status = 503;
+                    response.set_content("node is stopping", "text/plain");
+                    return;
                 }
                 {
                     std::scoped_lock lock(stateMutex);
@@ -1673,7 +1811,14 @@ struct NodeApp::Impl {
                         ok = PublishResultArtifacts(
                             owner->DataDir(), jobs[targetJob], target.frame,
                             receivedArtifacts, attemptToken, publishedPrimary, receiveError,
-                            &stopRequested);
+                            jobCancelled.get());
+                    if (stopRequested.load() && !ok) {
+                        std::error_code ignored;
+                        if (!stagingRoot.empty()) fs::remove_all(stagingRoot, ignored);
+                        response.status = 503;
+                        response.set_content("node is stopping", "text/plain");
+                        return;
+                    }
                     if (status == "completed" && ok) {
                         target.state = TaskState::Completed;
                         target.output = publishedPrimary;
@@ -1772,6 +1917,7 @@ struct NodeApp::Impl {
         peer.supportsProjectCache = health.value("project_cache", false);
         peer.supportsFramePackages = health.value("frame_packages", false);
         peer.supportsResultBundles = health.value("result_bundles", false);
+        peer.supportsPackageCancellation = health.value("package_cancel", false);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -1858,9 +2004,9 @@ struct NodeApp::Impl {
                     localAddresses.push_back(network.address);
                 std::vector<std::string> payloads;
                 if (!config.pairingPending && config.clusterToken.size() >= 16) {
-                    json messageV5 = {
-                        {"protocol", 5}, {"project_cache", true}, {"frame_packages", true},
-                        {"result_bundles", true},
+                    json messageV6 = {
+                        {"protocol", 6}, {"project_cache", true}, {"frame_packages", true},
+                        {"result_bundles", true}, {"package_cancel", true},
                         {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
@@ -1869,9 +2015,9 @@ struct NodeApp::Impl {
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    messageV5["signature"] = DiscoverySignature(config, messageV5);
-                    payloads.push_back(messageV5.dump());
-                    // Keep a v1 beacon during the protocol-v5 rollout so an older
+                    messageV6["signature"] = DiscoverySignature(config, messageV6);
+                    payloads.push_back(messageV6.dump());
+                    // Keep a v1 beacon during the protocol-v6 rollout so an older
                     // installed node can still discover this endpoint.
                     json messageV1 = {
                         {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
@@ -1918,7 +2064,7 @@ struct NodeApp::Impl {
             try {
                 json message = json::parse(std::string(buffer, received));
                 int protocol = message.value("protocol", 0);
-                if (protocol < 1 || protocol > 5) continue;
+                if (protocol < 1 || protocol > 6) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
@@ -1926,6 +2072,7 @@ struct NodeApp::Impl {
                 peer.supportsProjectCache = message.value("project_cache", false);
                 peer.supportsFramePackages = message.value("frame_packages", false);
                 peer.supportsResultBundles = message.value("result_bundles", false);
+                peer.supportsPackageCancellation = message.value("package_cancel", false);
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -2020,8 +2167,13 @@ struct NodeApp::Impl {
     }
 
     bool EnsureRemoteProjectCache(
-        const Peer& peer, const Config& config, const RenderJob& job, std::string& error) {
+        const Peer& peer, const Config& config, const RenderJob& job, std::string& error,
+        std::atomic<bool>* jobCancelled) {
         if (!peer.supportsProjectCache || !SafeSha256(job.projectHash)) return true;
+        if (CancellationRequested(&stopRequested, jobCancelled)) {
+            error = "job was stopped";
+            return false;
+        }
         httplib::Client cacheClient(peer.address, peer.httpPort);
         cacheClient.set_connection_timeout(3, 0);
         cacheClient.set_read_timeout(5, 0);
@@ -2035,6 +2187,10 @@ struct NodeApp::Impl {
         };
         auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
                                       statusHeaders);
+        if (CancellationRequested(&stopRequested, jobCancelled)) {
+            error = "job was stopped";
+            return false;
+        }
         if (!status) {
             error = "retry: project cache query failed: " +
                 httplib::to_string(status.error());
@@ -2055,7 +2211,7 @@ struct NodeApp::Impl {
             {"X-RM-Addons", json(job.requiredAddons).dump()},
         };
         auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", uploadHeaders,
-                               job.preparedBlend, &stopRequested, 3600);
+                               job.preparedBlend, &stopRequested, 3600, jobCancelled);
         if (!upload || (upload->status != 200 && upload->status != 201)) {
             error = upload && !upload->body.empty() ? upload->body
                 : "project cache upload failed";
@@ -2065,8 +2221,8 @@ struct NodeApp::Impl {
     }
 
     bool DispatchRemote(const Peer& peer, const RenderJob& job, const FrameTask& frame,
-                        const std::string& attemptToken,
-        std::string& error) {
+                         const std::string& attemptToken,
+        std::string& error, std::atomic<bool>* jobCancelled) {
         // Legacy single-frame transport returns only the primary image. Never
         // silently mark a compositor job complete without its File Output files.
         if (!job.compositorOutputs.empty()) {
@@ -2074,6 +2230,10 @@ struct NodeApp::Impl {
             return false;
         }
         Config config = owner->GetConfig();
+        if (CancellationRequested(&stopRequested, jobCancelled)) {
+            error = "job was stopped";
+            return false;
+        }
         if (!VerifyRemotePeer(peer, config, error)) return false;
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
@@ -2092,15 +2252,12 @@ struct NodeApp::Impl {
         };
         httplib::Result result;
         if (peer.supportsProjectCache && SafeSha256(job.projectHash)) {
-            httplib::Client cacheClient(peer.address, peer.httpPort);
-            cacheClient.set_connection_timeout(3, 0);
-            cacheClient.set_read_timeout(5, 0);
-            cacheClient.set_write_timeout(5, 0);
-            if (!EnsureRemoteProjectCache(peer, config, job, error)) return false;
-            result = cacheClient.Post("/v2/task", headers, "", "application/octet-stream");
+            if (!EnsureRemoteProjectCache(peer, config, job, error, jobCancelled)) return false;
+            result = PostEmpty(peer.address, peer.httpPort, "/v2/task", headers,
+                               &stopRequested, jobCancelled);
         } else {
             result = PostFile(peer.address, peer.httpPort, "/v1/task", headers,
-                              job.preparedBlend, &stopRequested);
+                              job.preparedBlend, &stopRequested, 3600, jobCancelled);
         }
         if (!result) {
             error = "network error: " + httplib::to_string(result.error());
@@ -2118,7 +2275,7 @@ struct NodeApp::Impl {
     bool DispatchRemotePackage(
         const Peer& peer, const RenderJob& job, const std::vector<FrameTask>& frames,
         const std::vector<std::string>& attemptTokens, const std::string& packageId,
-        std::string& error) {
+        std::string& error, std::atomic<bool>* jobCancelled) {
         if (!peer.supportsFramePackages || !peer.supportsProjectCache || frames.empty() ||
             frames.size() > 5 || frames.size() != attemptTokens.size()) {
             error = "worker does not support frame packages";
@@ -2129,8 +2286,12 @@ struct NodeApp::Impl {
             return false;
         }
         Config config = owner->GetConfig();
+        if (CancellationRequested(&stopRequested, jobCancelled)) {
+            error = "job was stopped";
+            return false;
+        }
         if (!VerifyRemotePeer(peer, config, error) ||
-            !EnsureRemoteProjectCache(peer, config, job, error))
+            !EnsureRemoteProjectCache(peer, config, job, error, jobCancelled))
             return false;
         json frameMetadata = json::array();
         json compositorMetadata = json::array();
@@ -2157,7 +2318,7 @@ struct NodeApp::Impl {
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
         auto result = PostEmpty(peer.address, peer.httpPort, "/v3/package", headers,
-                                &stopRequested);
+                                &stopRequested, jobCancelled);
         if (!result) {
             error = "retry: package dispatch network error: " +
                 httplib::to_string(result.error());
@@ -2213,7 +2374,12 @@ struct NodeApp::Impl {
                 Notify();
             }
             auto peer = AvailablePeer();
-            const size_t wantedFrames = !peer || peer->supportsFramePackages ? 5 : 1;
+            // An older package-capable worker cannot be told to stop. Give it one
+            // frame per package so stopping a job never leaves four extra frames
+            // running in a mixed-version cluster.
+            const size_t wantedFrames = !peer ||
+                    (peer->supportsFramePackages && peer->supportsPackageCancellation)
+                ? 5 : 1;
             size_t jobIndex = 0;
             std::vector<size_t> frameIndices;
             RenderJob jobCopy;
@@ -2246,6 +2412,7 @@ struct NodeApp::Impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
+            auto jobCancelled = JobCancellation(jobCopy.id);
             bool handled = false;
             bool deferredRemote = false;
             if (peer) {
@@ -2258,7 +2425,7 @@ struct NodeApp::Impl {
                 bool assignmentReserved = true;
                 {
                     std::scoped_lock lock(stateMutex);
-                    assignmentReserved = jobIndex < jobs.size();
+                    assignmentReserved = jobIndex < jobs.size() && !jobCancelled->load();
                     for (size_t index = 0; assignmentReserved && index < frameIndices.size(); ++index)
                         assignmentReserved = frameIndices[index] < jobs[jobIndex].frames.size() &&
                             jobs[jobIndex].frames[frameIndices[index]].state == TaskState::Dispatching;
@@ -2282,9 +2449,10 @@ struct NodeApp::Impl {
                 }
                 bool dispatched = assignmentReserved && (peer->supportsFramePackages
                     ? DispatchRemotePackage(*peer, jobCopy, frameCopies, attemptTokens,
-                                            packageId, dispatchError)
+                                            packageId, dispatchError, jobCancelled.get())
                     : DispatchRemote(*peer, jobCopy, frameCopies.front(),
-                                     attemptTokens.front(), dispatchError));
+                                     attemptTokens.front(), dispatchError,
+                                     jobCancelled.get()));
                 if (dispatched) {
                     std::scoped_lock lock(stateMutex);
                     for (size_t index = 0; index < frameIndices.size(); ++index) {
@@ -2333,7 +2501,8 @@ struct NodeApp::Impl {
                 }
             }
             int expectedAssigned = 0;
-            if (!handled && workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
+            if (!handled && !jobCancelled->load() &&
+                workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
                 WorkItem item;
                 item.taskId = frameCopies.front().taskId;
                 item.jobId = jobCopy.id;
@@ -2352,10 +2521,12 @@ struct NodeApp::Impl {
                 item.requiresGpu = jobCopy.requiresGpu;
                 item.requiredAddons = jobCopy.requiredAddons;
                 item.compositorOutputs = jobCopy.compositorOutputs;
+                std::error_code markerError;
+                fs::remove(item.outputDir / L"stop-after-current", markerError);
                 bool localReserved = true;
                 {
                     std::scoped_lock lock(stateMutex);
-                    localReserved = jobIndex < jobs.size();
+                    localReserved = jobIndex < jobs.size() && !jobCancelled->load();
                     for (size_t frameIndex : frameIndices)
                         localReserved = localReserved && frameIndex < jobs[jobIndex].frames.size() &&
                             jobs[jobIndex].frames[frameIndex].state == TaskState::Dispatching;
@@ -2429,12 +2600,15 @@ struct NodeApp::Impl {
             httplib::Result result;
             if (success && !retry) {
                 result = PostFile(item.originAddress, item.originPort, "/v1/result", headers,
-                                  output, &stopRequested);
+                                  output, &stopRequested, 3600);
             } else {
                 result = PostEmpty(item.originAddress, item.originPort, "/v1/result",
                                    headers, &stopRequested);
             }
             if (result && result->status == 200) return true;
+            // Authentication, lease fencing, and stopped-job responses are
+            // terminal for this attempt. Retrying them only delays cleanup.
+            if (result && result->status >= 400 && result->status < 500) return false;
         }
         return false;
     }
@@ -2486,19 +2660,29 @@ struct NodeApp::Impl {
             LogInfo("render package started; package=" +
                     (item.packageId.empty() ? item.taskId : item.packageId) + "; frames=" +
                     std::to_string(item.frames.size()));
+            const std::string cancellationId = item.packageId.empty() ? item.taskId : item.packageId;
             const auto packageStartedAt = std::chrono::system_clock::now();
             std::vector<int> deliveredFrames;
             std::map<int, std::vector<RenderArtifact>> outputs;
             std::wstring renderError;
             bool retryAfterIdle = false;
             Config renderConfig = owner->GetConfig();
-            if (item.remote && !item.cpuSafeWhileActive &&
+            if (item.remote && PackageCancelled(cancellationId)) {
+                renderError = L"任务包已由提交方停止";
+                retryAfterIdle = true;
+            } else if (item.remote && !item.cpuSafeWhileActive &&
                 IdleSeconds() < renderConfig.idleAfterSeconds) {
                 renderError = L"本任务可能使用 GPU；电脑恢复使用后已停止，将在空闲时重新分配";
                 retryAfterIdle = true;
             } else if (owner->mockRenderer_) {
                 fs::create_directories(item.outputDir);
                 for (const auto& frame : item.frames) {
+                    if (item.remote && PackageCancelled(cancellationId)) {
+                        retryAfterIdle = true;
+                        renderError = L"任务包已由提交方停止";
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
                     fs::path output = item.outputDir /
                         (L"frame_" + std::to_wstring(frame.frame) +
                          Utf8ToWide(item.outputExtension));
@@ -2606,7 +2790,9 @@ struct NodeApp::Impl {
                                                 static_cast<ptrdiff_t>(contributions.size() - 5000));
                 }
                 PersistContributions();
+                ForgetCancelledPackage(cancellationId);
             } else {
+                auto jobCancelled = JobCancellation(item.jobId);
                 std::scoped_lock lock(stateMutex);
                 for (auto& job : jobs) {
                     if (job.id != item.jobId) continue;
@@ -2627,7 +2813,7 @@ struct NodeApp::Impl {
                             frameSuccess = PublishResultArtifacts(
                                 owner->DataDir(), job, packagedFrame.frame, artifacts,
                                 item.packageId, publishedPrimary, publishError,
-                                &stopRequested);
+                                jobCancelled.get());
                         }
                         if (frame->state == TaskState::Stopped) continue;
                         frame->state = frameSuccess ? TaskState::Completed : TaskState::Failed;
@@ -2807,9 +2993,20 @@ bool NodeApp::StopJob(const std::string& jobId, std::wstring& error) {
         return false;
     }
     std::vector<fs::path> stopMarkers;
+    struct RemoteCancellation {
+        std::string address;
+        int port = 0;
+        std::string packageId;
+    };
+    std::vector<RemoteCancellation> remoteCancellations;
+    std::set<std::string> remoteKeys;
     bool found = false;
     auto now = std::chrono::system_clock::now();
     std::string localNodeId = GetConfig().nodeId;
+    // Publish/copy operations may hold stateMutex to fence a lease. Signal them
+    // first through the independent cancellation map so StopJob never waits for
+    // a multi-gigabyte result copy to finish.
+    impl_->JobCancellation(jobId)->store(true);
     {
         std::scoped_lock lock(impl_->stateMutex);
         for (auto& job : impl_->jobs) {
@@ -2824,6 +3021,19 @@ bool NodeApp::StopJob(const std::string& jobId, std::wstring& error) {
                     stopMarkers.push_back(DataDir() / L"jobs" / Utf8ToWide(job.id) / L"packages" /
                                           Utf8ToWide(frame.assignedPackageId) /
                                           L"stop-after-current");
+                if (!frame.assignedPackageId.empty() &&
+                    !frame.assignedNodeId.empty() && frame.assignedNodeId != localNodeId) {
+                    auto peer = impl_->peers.find(frame.assignedNodeId);
+                    if (peer != impl_->peers.end()) {
+                        std::string key = peer->second.address + ":" +
+                            std::to_string(peer->second.httpPort) + "/" +
+                            frame.assignedPackageId;
+                        if (peer->second.supportsPackageCancellation &&
+                            remoteKeys.insert(key).second)
+                            remoteCancellations.push_back({peer->second.address,
+                                peer->second.httpPort, frame.assignedPackageId});
+                    }
+                }
                 frame.state = TaskState::Stopped;
                 frame.endedAt = now;
                 frame.assignedAt = {};
@@ -2841,6 +3051,18 @@ bool NodeApp::StopJob(const std::string& jobId, std::wstring& error) {
         std::error_code ignored;
         fs::create_directories(marker.parent_path(), ignored);
         std::ofstream(marker, std::ios::binary | std::ios::trunc) << "stop";
+    }
+    Config config = GetConfig();
+    for (const auto& cancellation : remoteCancellations) {
+        httplib::Headers headers = {
+            {"X-RM-Token", config.clusterToken},
+            {"X-RM-Package", cancellation.packageId},
+        };
+        auto result = PostEmpty(cancellation.address, cancellation.port, "/v3/cancel",
+                                headers, &impl_->stopRequested);
+        if (!result || result->status != 202)
+            LogWarning("worker cancellation was not acknowledged; package=" +
+                       cancellation.packageId);
     }
     impl_->PersistJobs();
     impl_->Notify();
@@ -3123,11 +3345,23 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Protocol-v5 result-bundle capability was not authenticated";
             return false;
         }
+        json discoveryV6 = discoveryV5;
+        discoveryV6["protocol"] = 6;
+        discoveryV6["result_bundles"] = true;
+        discoveryV6["package_cancel"] = true;
+        std::string discoveryV6Proof = DiscoverySignature(signatureConfig, discoveryV6);
+        discoveryV6["package_cancel"] = false;
+        if (ConstantTimeEqual(discoveryV6Proof,
+                              DiscoverySignature(signatureConfig, discoveryV6))) {
+            report = L"Protocol-v6 cancellation capability was not authenticated";
+            return false;
+        }
         Peer authenticatedPeer;
-        authenticatedPeer.protocolVersion = 5;
+        authenticatedPeer.protocolVersion = 6;
         authenticatedPeer.supportsProjectCache = true;
         authenticatedPeer.supportsFramePackages = true;
         authenticatedPeer.supportsResultBundles = true;
+        authenticatedPeer.supportsPackageCancellation = true;
         authenticatedPeer.name = "SIGNED-NAME";
         authenticatedPeer.cpuPercent = 17;
         authenticatedPeer.idleSeconds = 181;
@@ -3139,8 +3373,9 @@ bool RunSelfTest(std::wstring& report) {
         legacyUpdate.cpuPercent = 99;
         legacyUpdate.idleSeconds = 999;
         PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
-        if (legacyUpdate.protocolVersion != 5 || !legacyUpdate.supportsProjectCache ||
+        if (legacyUpdate.protocolVersion != 6 || !legacyUpdate.supportsProjectCache ||
             !legacyUpdate.supportsFramePackages || !legacyUpdate.supportsResultBundles ||
+            !legacyUpdate.supportsPackageCancellation ||
             legacyUpdate.name != "SIGNED-NAME" ||
             legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
             legacyUpdate.cpuModel != "SIGNED-CPU" ||
@@ -3185,11 +3420,21 @@ bool RunSelfTest(std::wstring& report) {
         }
         httplib::Server server;
         fs::path received = root / L"received.bin";
+        fs::path cancelledReceive = root / L"cancelled.bin";
+        std::atomic<bool> cancelInbound = true;
         server.Post("/stream", [&](const httplib::Request&, httplib::Response& response,
                                    const httplib::ContentReader& reader) {
             std::wstring streamError;
             bool ok = StreamRequestToFile(reader, received, streamError);
             response.status = ok ? 200 : 500;
+        });
+        server.Post("/cancelled-stream", [&](const httplib::Request&,
+                                              httplib::Response& response,
+                                              const httplib::ContentReader& reader) {
+            std::wstring streamError;
+            bool ok = StreamRequestToFile(
+                reader, cancelledReceive, streamError, &cancelInbound);
+            response.status = ok ? 200 : 499;
         });
         int port = server.bind_to_any_port("127.0.0.1");
         if (port <= 0) {
@@ -3203,9 +3448,12 @@ bool RunSelfTest(std::wstring& report) {
             output << std::string(2 * 1024 * 1024, 'R');
         }
         auto result = PostFile("127.0.0.1", port, "/stream", {}, source);
+        auto cancelledResult = PostFile(
+            "127.0.0.1", port, "/cancelled-stream", {}, source);
         server.stop();
         thread.join();
-        if (!result || result->status != 200 || fs::file_size(received) != fs::file_size(source)) {
+        if (!result || result->status != 200 || fs::file_size(received) != fs::file_size(source) ||
+            (cancelledResult && cancelledResult->status == 200) || fs::exists(cancelledReceive)) {
             report = L"流式任务传输失败";
             return false;
         }
@@ -3237,18 +3485,28 @@ bool RunSelfTest(std::wstring& report) {
             Config originConfig = originStore.Load();
             Config workerConfig = workerStore.Load();
             std::string sharedToken = NewRandomHex(16);
+            httplib::Server originPortProbe;
+            httplib::Server workerPortProbe;
+            int originPort = originPortProbe.bind_to_any_port("127.0.0.1");
+            int workerPort = workerPortProbe.bind_to_any_port("127.0.0.1");
+            originPortProbe.stop();
+            workerPortProbe.stop();
+            if (originPort <= 0 || workerPort <= 0 || originPort == workerPort) {
+                report = L"自检无法分配本机动态端口";
+                return false;
+            }
             originConfig.nodeName = "SELFTEST-ORIGIN";
             originConfig.nodeId = "selftest-origin";
             originConfig.inviteCode = "123456";
             originConfig.clusterToken = NewRandomHex(16);
-            originConfig.httpPort = 18531;
-            originConfig.discoveryPort = 18530;
+            originConfig.httpPort = originPort;
+            originConfig.discoveryPort = 0;
             workerConfig.nodeName = "SELFTEST-WORKER";
             workerConfig.nodeId = "selftest-worker";
             workerConfig.inviteCode = "654321";
             workerConfig.clusterToken = sharedToken;
-            workerConfig.httpPort = 18532;
-            workerConfig.discoveryPort = 18533;
+            workerConfig.httpPort = workerPort;
+            workerConfig.discoveryPort = 0;
             workerConfig.shareEnabled = true;
 
             NodeApp origin(std::move(originStore), originConfig, true,
@@ -3391,6 +3649,65 @@ bool RunSelfTest(std::wstring& report) {
                     if (!historyRecorded) error = L"worker contribution history self-test failed";
                 }
                 if (clusterOk) {
+                    std::string cancelledJob = origin.SubmitPrepared(
+                        "remote-cancel-self-test", preflight, 30, 34, 1, submitError);
+                    bool remotelyAssigned = false;
+                    auto assignmentDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+                    while (!cancelledJob.empty() &&
+                           std::chrono::steady_clock::now() < assignmentDeadline) {
+                        auto current = origin.Jobs();
+                        if (!current.empty() && current.back().id == cancelledJob &&
+                            current.back().frames.front().state == TaskState::Assigned &&
+                            current.back().frames.front().assignedNodeId == workerConfig.nodeId) {
+                            remotelyAssigned = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    bool stopAccepted = remotelyAssigned && origin.StopJob(cancelledJob, submitError);
+                    bool workerStoppedPackage = false;
+                    std::wstring workerCancellationState;
+                    auto stopDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+                    while (stopAccepted && std::chrono::steady_clock::now() < stopDeadline) {
+                        for (const auto& record : worker.Contributions()) {
+                            if (record.jobId == cancelledJob) {
+                                workerCancellationState = Utf8ToWide(record.state) + L":" +
+                                    std::to_wstring(record.completedFrames.size());
+                                if (record.state == "stopped" &&
+                                    record.completedFrames.size() <= 1) {
+                                    workerStoppedPackage = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (workerStoppedPackage) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                    // If cancellation wins the dispatch race, the worker rejects
+                    // the package before queueing it and therefore has no history
+                    // row. That is also a successful stop fence.
+                    if (stopAccepted && workerCancellationState.empty() &&
+                        worker.AssignedCount() == 0)
+                        workerStoppedPackage = true;
+                    bool originStayedStopped = false;
+                    for (const auto& current : origin.Jobs()) {
+                        if (current.id != cancelledJob) continue;
+                        originStayedStopped = !current.frames.empty();
+                        for (const auto& frame : current.frames)
+                            originStayedStopped = originStayedStopped &&
+                                frame.state == TaskState::Stopped;
+                    }
+                    clusterOk = stopAccepted && workerStoppedPackage && originStayedStopped;
+                    if (!clusterOk) error = L"remote package cancellation self-test failed; assigned=" +
+                        std::to_wstring(remotelyAssigned) + L"; accepted=" +
+                        std::to_wstring(stopAccepted) + L"; worker_stopped=" +
+                        std::to_wstring(workerStoppedPackage) + L"; origin_stopped=" +
+                        std::to_wstring(originStayedStopped) + L"; worker_state=" +
+                        workerCancellationState;
+                }
+                if (clusterOk) {
                     worker.Stop();
                     NodeApp reloadedWorker(ConfigStore(workerRoot), workerConfig, true);
                     bool historyReloaded = false;
@@ -3503,7 +3820,7 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Windows CPU Job Object 测试失败：" + error;
             return false;
         }
-        report = L"SELF_TEST_OK：配置、2 MiB 流式传输、CPU 15%→100%、双节点分发和掉线重派均通过";
+        report = L"SELF_TEST_OK：配置、可取消流式传输、CPU 15%→100%、双节点五帧分发、停止栅栏和掉线重派均通过";
         return true;
     } catch (const std::exception& exception) {
         report = L"自检异常：" + Utf8ToWide(exception.what());

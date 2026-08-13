@@ -544,6 +544,18 @@ with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 )PY";
 
+const char* kPreviewScript = R"PY(import bpy, os, sys
+
+args = sys.argv[sys.argv.index('--') + 1:]
+source, destination = args
+image = bpy.data.images.load(source, check_existing=False)
+scene = bpy.context.scene
+scene.render.image_settings.file_format = 'PNG'
+scene.render.image_settings.color_mode = 'RGBA'
+os.makedirs(os.path.dirname(destination), exist_ok=True)
+image.save_render(destination, scene=scene)
+)PY";
+
 const char* kBatchRenderScript = R"PY(import bpy, json, os, shutil, sys, traceback
 args = sys.argv[sys.argv.index('--') + 1:]
 output_dir, manifest_path, stop_path, frames_json, targets_json = args[:5]
@@ -746,7 +758,7 @@ std::string Sha256Prefix(const std::string& value, size_t chars) {
     return output.str().substr(0, chars);
 }
 
-std::string Sha256File(const fs::path& path) {
+std::string Sha256File(const fs::path& path, std::atomic<bool>* stopRequested) {
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
     BCRYPT_ALG_HANDLE algorithm = nullptr;
@@ -763,6 +775,10 @@ std::string Sha256File(const fs::path& path) {
     // buffer on the heap so hashing a project cannot exhaust that stack.
     std::vector<char> buffer(256 * 1024);
     while (ok && input) {
+        if (stopRequested && stopRequested->load()) {
+            ok = false;
+            break;
+        }
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         std::streamsize count = input.gcount();
         if (count > 0)
@@ -984,6 +1000,52 @@ fs::path FindBlender(const Config& config) {
     for (const auto& candidate : candidates)
         if (fs::is_regular_file(candidate, ec)) return fs::absolute(candidate, ec);
     return {};
+}
+
+bool GeneratePreviewImage(
+    const Config& config,
+    const fs::path& dataDir,
+    const fs::path& source,
+    const fs::path& destination,
+    std::atomic<bool>& stopRequested,
+    std::wstring& error) {
+    if (!fs::is_regular_file(source)) {
+        error = L"预览源文件不存在";
+        return false;
+    }
+    fs::path blender = FindBlender(config);
+    if (blender.empty()) {
+        error = L"未找到 Blender，无法生成该格式的预览";
+        return false;
+    }
+    std::error_code ignored;
+    fs::create_directories(destination.parent_path(), ignored);
+    fs::remove(destination, ignored);
+    fs::path work = dataDir / L"previews";
+    fs::create_directories(work, ignored);
+    fs::path script = work / L"generate-preview.py";
+    {
+        std::ofstream output(script, std::ios::binary | std::ios::trunc);
+        output << kPreviewScript;
+        if (!output) {
+            error = L"无法写入预览转换脚本";
+            return false;
+        }
+    }
+    ProcessResult process = RunProcess(
+        blender,
+        {L"--background", L"--factory-startup", L"--disable-autoexec", L"--python",
+         script.wstring(), L"--", source.wstring(), destination.wstring()},
+        work / L"generate-preview.log", nullptr, &stopRequested);
+    if (stopRequested.load()) {
+        error = L"预览生成已取消";
+        return false;
+    }
+    if (!process.started || process.exitCode != 0 || !fs::is_regular_file(destination)) {
+        error = process.error.empty() ? L"Blender 无法生成该图片格式的预览" : process.error;
+        return false;
+    }
+    return true;
 }
 
 PreflightReport PreflightBlend(
@@ -1254,7 +1316,6 @@ bool RenderBlenderPackage(
     }
     std::error_code ignored;
     fs::remove(manifest, ignored);
-    fs::remove(stopMarker, ignored);
     for (int frame : frames) {
         std::wstring frameText = std::to_wstring(frame);
         fs::path expected = outputDir / (L"frame_" +
@@ -1266,6 +1327,10 @@ bool RenderBlenderPackage(
     std::atomic<bool> processFinished = false;
     std::thread stopMarkerThread([&] {
         while (!processFinished.load() && !stopRequested.load()) {
+            if (fs::is_regular_file(stopMarker)) {
+                finishCurrentThenStop = true;
+                return;
+            }
             if (stopAfterCurrentOnActivity &&
                 IdleSeconds() < config.idleAfterSeconds) {
                 finishCurrentThenStop = true;

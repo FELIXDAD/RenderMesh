@@ -11,6 +11,7 @@
 - 2 MiB 文件通过真实本机 HTTP 服务流式上传；
 - Windows Job Object 在同一进程树上切换 15% 与 100%；
 - 手动 `IPv4:端口` 先经过 `/health` 与 HMAC 挑战验证并持久化，再由两个独立 NodeApp 实例通过不同 TCP 端口将七帧分为 5+2 任务包，经工程缓存回传主输出与合成器 EXR；
+- 停止远端五帧包时，取消信号与派发竞态均被栅栏拦截；若 Worker 已开始，只允许当前帧收尾，后续帧不再启动；
 - Worker 任务包贡献历史会记录分配的五帧、已完成的五帧与开始/结束时间，重建 NodeApp 后仍可读取；
 - `RMBNDL1` 多文件包的安全路径、`../` 穿越拒绝、取消时临时文件清理和输出盘发布回滚；
 - 错误类型的节点 JSON 会被拒绝而不会终止后台线程；旧版 Worker 不报告任务 ID 时，`assigned=1` 的长帧不会被误判为掉线，恢复空闲后仍可触发重派；
@@ -35,6 +36,8 @@
 10. 提交前在发起端对提交范围内每一帧执行低分辨率真实渲染，并检查材质、世界、灯光、合成器和节点组；测试工程返回 `validation_render=true` 和准确的 `validation_frames`。无相机或插件/节点/引擎执行异常时预检返回 3，不创建任务。
 11. 用户提供的 `D:\05_Documents\Desktop\测试.blend` 在 Blender 5.2 便携版预检通过：Eevee、PNG、11 个当前启用插件环境条目、`missing=0`、`unpacked=0`，第 1 帧工程主输出映射为 `D:\05_Documents\Desktop\tmp\0001.png`。该工程没有 File Output 节点。
 12. 另建 Blender 5.2 合成器工程，一次 Blender 启动同时生成主 PNG 和 File Output OpenEXR；清单准确记录 `primary` 与 `compositor/output-0/rgba_.exr`，并保留原节点输出目录。
+13. 将上述真实 OpenEXR 交给桌面端预览转换路径，Blender 5.2 成功生成可由 WIC 显示的 PNG 缩略图。
+14. GUI 运行时度量验证任务 ListView 的 `LVM_GETCOUNTPERPAGE=10`，主共享开关文字在 150% DPI 的可用区域内完整显示。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

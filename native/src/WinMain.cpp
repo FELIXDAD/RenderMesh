@@ -17,6 +17,7 @@ using namespace rm;
 
 constexpr UINT WM_RM_REFRESH = WM_APP + 1;
 constexpr UINT WM_RM_PREFLIGHT = WM_APP + 2;
+constexpr UINT WM_RM_PREVIEW_READY = WM_APP + 3;
 
 enum ControlId {
     ID_SHARE = 100,
@@ -71,9 +72,16 @@ std::atomic<bool> gPreflightStop = false;
 HWND gDetailWindow = nullptr;
 std::string gDetailJobId;
 HBITMAP gPreviewBitmap = nullptr;
+std::thread gPreviewThread;
+std::atomic<bool> gPreviewStop = false;
+std::atomic<uint64_t> gPreviewGeneration = 0;
+fs::path gPreviewSource;
+std::string gPreviewTaskId;
+bool gRefreshingJobDetail = false;
 int gCurrentPage = 0;
 int gInitialPage = 0;
 bool gOpenInitialDetail = false;
+fs::path gUiMetricsReport;
 bool gDarkTheme = false;
 HBRUSH gBackgroundBrush = nullptr;
 HBRUSH gSurfaceBrush = nullptr;
@@ -239,6 +247,19 @@ void AddColumn(HWND list, int index, int width, const wchar_t* title) {
     ListView_InsertColumn(list, index, &column);
 }
 
+void SizeListForVisibleRows(HWND list, int rows) {
+    RECT bounds{};
+    GetWindowRect(list, &bounds);
+    int height = bounds.bottom - bounds.top;
+    for (int attempt = 0; attempt < 256; ++attempt) {
+        int visible = ListView_GetCountPerPage(list);
+        if (visible == rows) break;
+        height += visible > rows ? -1 : 1;
+        SetWindowPos(list, nullptr, 0, 0, bounds.right - bounds.left, height,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 void SetCell(HWND list, int row, int column, const std::wstring& value) {
     if (column == 0) {
         LVITEMW item{};
@@ -304,6 +325,41 @@ HBITMAP LoadPreviewBitmap(const fs::path& path, UINT maxWidth, UINT maxHeight) {
     return bitmap;
 }
 
+void ReplacePreviewBitmap(HBITMAP next) {
+    HWND preview = gDetailWindow ? GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW) : nullptr;
+    if (!preview) {
+        if (next) DeleteObject(next);
+        if (gPreviewBitmap) DeleteObject(gPreviewBitmap);
+        gPreviewBitmap = nullptr;
+        return;
+    }
+    HBITMAP tracked = gPreviewBitmap;
+    HBITMAP old = reinterpret_cast<HBITMAP>(
+        SendMessageW(preview, STM_SETIMAGE, IMAGE_BITMAP, reinterpret_cast<LPARAM>(next)));
+    gPreviewBitmap = next;
+    if (old && old != next) DeleteObject(old);
+    if (tracked && tracked != old && tracked != next) DeleteObject(tracked);
+}
+
+struct PreviewResult {
+    uint64_t generation = 0;
+    fs::path source;
+    fs::path preview;
+    bool ok = false;
+    std::wstring error;
+};
+
+void StopPreviewGeneration() {
+    ++gPreviewGeneration;
+    gPreviewStop = true;
+    if (gPreviewThread.joinable()) gPreviewThread.join();
+    MSG stale{};
+    while (gDetailWindow && PeekMessageW(
+               &stale, gDetailWindow, WM_RM_PREVIEW_READY, WM_RM_PREVIEW_READY, PM_REMOVE))
+        delete reinterpret_cast<PreviewResult*>(stale.lParam);
+    gPreviewStop = false;
+}
+
 void ShowInExplorer(const fs::path& path) {
     if (path.empty()) return;
     fs::path target = fs::is_directory(path) ? path : path.parent_path();
@@ -316,6 +372,8 @@ void ShowInExplorer(const fs::path& path) {
     }
 }
 
+void UpdateFramePreview();
+
 void RefreshJobDetail(bool preserveSelection = true) {
     if (!gDetailWindow) return;
     auto jobValue = FindJob(gDetailJobId);
@@ -324,6 +382,7 @@ void RefreshJobDetail(bool preserveSelection = true) {
         return;
     }
     const auto& job = *jobValue;
+    gRefreshingJobDetail = true;
     HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
     int selectedFrame = -1;
     if (preserveSelection) {
@@ -362,6 +421,8 @@ void RefreshJobDetail(bool preserveSelection = true) {
         std::to_wstring(failed) + L"    已停止 " + std::to_wstring(stopped) +
         L"    提交时间 " + FormatTime(job.createdAt);
     SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_SUMMARY), summary.c_str());
+    gRefreshingJobDetail = false;
+    UpdateFramePreview();
 }
 
 void UpdateFramePreview() {
@@ -370,27 +431,72 @@ void UpdateFramePreview() {
     if (!job) return;
     HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
     int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
-    HWND preview = GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW);
-    if (gPreviewBitmap) {
-        DeleteObject(gPreviewBitmap);
-        gPreviewBitmap = nullptr;
-    }
     if (selected < 0 || selected >= static_cast<int>(job->frames.size())) {
+        StopPreviewGeneration();
+        gPreviewSource.clear();
+        gPreviewTaskId.clear();
+        ReplacePreviewBitmap(nullptr);
         SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
                        L"选择一帧查看预览");
-        SendMessageW(preview, STM_SETIMAGE, IMAGE_BITMAP, 0);
         return;
     }
     const auto& frame = job->frames[static_cast<size_t>(selected)];
-    if (!frame.output.empty() && fs::is_regular_file(frame.output))
-        gPreviewBitmap = LoadPreviewBitmap(frame.output, 330, 220);
-    SendMessageW(preview, STM_SETIMAGE, IMAGE_BITMAP,
-                 reinterpret_cast<LPARAM>(gPreviewBitmap));
-    std::wstring previewStatus = gPreviewBitmap ? (L"帧 " + std::to_wstring(frame.frame))
-        : fs::is_regular_file(frame.output)
-            ? L"该格式暂无系统预览解码器" : L"该帧尚未生成图像";
+    if (frame.taskId == gPreviewTaskId && frame.output == gPreviewSource) return;
+    StopPreviewGeneration();
+    gPreviewSource.clear();
+    gPreviewTaskId = frame.taskId;
+    ReplacePreviewBitmap(nullptr);
+    if (frame.output.empty() || !fs::is_regular_file(frame.output)) {
+        SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
+                       L"该帧尚未生成图像");
+        return;
+    }
+    gPreviewSource = frame.output;
+    if (HBITMAP bitmap = LoadPreviewBitmap(frame.output, 330, 220)) {
+        ReplacePreviewBitmap(bitmap);
+        SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
+                       (L"帧 " + std::to_wstring(frame.frame)).c_str());
+        return;
+    }
+    std::error_code ignored;
+    uint64_t fileSize = fs::file_size(frame.output, ignored);
+    auto modified = fs::last_write_time(frame.output, ignored).time_since_epoch().count();
+    std::string cacheKey = HmacSha256(
+        "RenderMesh-preview-cache-v1",
+        WideToUtf8(frame.output.wstring()) + "|" + std::to_string(fileSize) + "|" +
+            std::to_string(static_cast<long long>(modified)));
+    fs::path previewPath = gApp->DataDir() / L"previews" / Utf8ToWide(cacheKey + ".png");
+    if (fs::is_regular_file(previewPath)) {
+        if (HBITMAP bitmap = LoadPreviewBitmap(previewPath, 330, 220)) {
+            ReplacePreviewBitmap(bitmap);
+            SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
+                           (L"帧 " + std::to_wstring(frame.frame) + L" · Blender 预览").c_str());
+            return;
+        }
+        fs::remove(previewPath, ignored);
+    }
     SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
-                   previewStatus.c_str());
+                   L"正在用 Blender 生成预览……");
+    const uint64_t generation = ++gPreviewGeneration;
+    const fs::path source = frame.output;
+    const Config config = gApp->GetConfig();
+    const fs::path dataDir = gApp->DataDir();
+    const HWND detail = gDetailWindow;
+    gPreviewThread = std::thread([=] {
+        auto* result = new PreviewResult;
+        result->generation = generation;
+        result->source = source;
+        result->preview = previewPath;
+        result->ok = GeneratePreviewImage(
+            config, dataDir, source, previewPath, gPreviewStop, result->error);
+        if (gPreviewStop.load() || generation != gPreviewGeneration.load()) {
+            delete result;
+            return;
+        }
+        if (!PostMessageW(detail, WM_RM_PREVIEW_READY, 0,
+                          reinterpret_cast<LPARAM>(result)))
+            delete result;
+    });
 }
 
 std::wstring ChooseFile(const wchar_t* filter, const wchar_t* title) {
@@ -631,8 +737,8 @@ void BuildUi() {
     for (auto& page : gPageControls) page.clear();
     Label(L"RenderMesh", 24, 20, 180, 32, 0, gTitleFont);
     Label(L"Blender 渲染网格", 26, 54, 170, 22);
-    AddControl(L"BUTTON", L"允许其他电脑\n使用本机算力", BS_OWNERDRAW,
-               18, 88, 184, 72, ID_SHARE);
+    AddControl(L"BUTTON", L"共享本机算力", BS_OWNERDRAW,
+               12, 88, 196, 76, ID_SHARE);
     AddControl(L"BUTTON", L"服务器", BS_OWNERDRAW, 18, 196, 184, 42, ID_NAV_DASHBOARD);
     AddControl(L"BUTTON", L"渲染任务", BS_OWNERDRAW, 18, 244, 184, 42, ID_NAV_TASKS);
     AddControl(L"BUTTON", L"本机贡献", BS_OWNERDRAW, 18, 292, 184, 42, ID_NAV_CONTRIBUTIONS);
@@ -695,10 +801,15 @@ void BuildUi() {
     AddColumn(jobs, 2, 75, L"总帧数"); AddColumn(jobs, 3, 95, L"完成");
     AddColumn(jobs, 4, 100, L"渲染时长"); AddColumn(jobs, 5, 155, L"开始时间");
     AddColumn(jobs, 6, 155, L"结束时间");
+    SizeListForVisibleRows(jobs, 10);
+    RECT jobBounds{};
+    GetWindowRect(jobs, &jobBounds);
+    MapWindowPoints(HWND_DESKTOP, gWindow, reinterpret_cast<POINT*>(&jobBounds), 2);
+    int jobActionY = jobBounds.bottom + 18;
     PageControl(1, AddControl(L"BUTTON", L"打开任务详情", BS_PUSHBUTTON,
-                              892, 672, 160, 32, ID_JOB_DETAILS));
+                              892, jobActionY, 160, 32, ID_JOB_DETAILS));
     PageControl(1, AddControl(L"BUTTON", L"打开数据目录", BS_PUSHBUTTON,
-                              1062, 672, 164, 32, ID_OPEN_DATA));
+                              1062, jobActionY, 164, 32, ID_OPEN_DATA));
 
     // 本机贡献页
     PageControl(2, Label(L"本机贡献", 248, 24, 300, 36, 0, gTitleFont));
@@ -785,9 +896,11 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
         RECT label = rect;
         label.left += 14;
         label.right -= 72;
-        DrawTextW(item.hDC, L"允许其他电脑\n使用本机算力", -1, &label,
+        std::wstring shareText = config.shareEnabled ? L"共享本机算力\n已开启"
+                                                     : L"共享本机算力\n已关闭";
+        DrawTextW(item.hDC, shareText.c_str(), -1, &label,
                   DT_LEFT | DT_VCENTER | DT_WORDBREAK);
-        RECT track{rect.right - 62, rect.top + 22, rect.right - 14, rect.top + 48};
+        RECT track{rect.right - 62, rect.top + 25, rect.right - 14, rect.top + 51};
         HBRUSH trackBrush = CreateSolidBrush(config.shareEnabled ? kAccent
             : gDarkTheme ? RGB(91, 91, 103) : RGB(186, 188, 198));
         HGDIOBJ old = SelectObject(item.hDC, trackBrush);
@@ -811,9 +924,44 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     DrawTextW(item.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+void WriteUiMetricsReport() {
+    if (gUiMetricsReport.empty()) return;
+    HWND jobs = Item(ID_JOBS);
+    HWND share = Item(ID_SHARE);
+    RECT shareRect{};
+    GetClientRect(share, &shareRect);
+    RECT label = shareRect;
+    label.left += 14;
+    label.right -= 72;
+    Config config = gApp->GetConfig();
+    std::wstring shareText = config.shareEnabled ? L"共享本机算力\n已开启"
+                                                 : L"共享本机算力\n已关闭";
+    HDC dc = GetDC(share);
+    HGDIOBJ oldFont = SelectObject(dc, gFont);
+    RECT measured{0, 0, label.right - label.left, 0};
+    DrawTextW(dc, shareText.c_str(), -1, &measured,
+              DT_LEFT | DT_WORDBREAK | DT_CALCRECT);
+    SelectObject(dc, oldFont);
+    ReleaseDC(share, dc);
+    json metrics = {
+        {"jobs_visible_rows", ListView_GetCountPerPage(jobs)},
+        {"share_text_width", measured.right - measured.left},
+        {"share_text_height", measured.bottom - measured.top},
+        {"share_label_width", label.right - label.left},
+        {"share_label_height", label.bottom - label.top},
+        {"share_text_fits", measured.right - measured.left <= label.right - label.left &&
+                            measured.bottom - measured.top <= label.bottom - label.top},
+    };
+    std::error_code ignored;
+    fs::create_directories(gUiMetricsReport.parent_path(), ignored);
+    std::ofstream output(gUiMetricsReport, std::ios::binary | std::ios::trunc);
+    output << metrics.dump(2);
+}
+
 LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
+            gDetailWindow = window;
             HWND summary = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 22, 18, 1130, 28, window,
                 reinterpret_cast<HMENU>(ID_DETAIL_SUMMARY), GetModuleHandleW(nullptr), nullptr);
@@ -862,8 +1010,24 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             return 0;
         case WM_NOTIFY: {
             auto* header = reinterpret_cast<NMHDR*>(lParam);
-            if (header->idFrom == ID_DETAIL_FRAMES && header->code == LVN_ITEMCHANGED)
+            if (!gRefreshingJobDetail && header->idFrom == ID_DETAIL_FRAMES &&
+                header->code == LVN_ITEMCHANGED)
                 UpdateFramePreview();
+            return 0;
+        }
+        case WM_RM_PREVIEW_READY: {
+            std::unique_ptr<PreviewResult> result(
+                reinterpret_cast<PreviewResult*>(lParam));
+            if (gPreviewThread.joinable()) gPreviewThread.join();
+            if (!result || result->generation != gPreviewGeneration.load() ||
+                result->source != gPreviewSource)
+                return 0;
+            HBITMAP bitmap = result->ok
+                ? LoadPreviewBitmap(result->preview, 330, 220) : nullptr;
+            ReplacePreviewBitmap(bitmap);
+            std::wstring status = bitmap ? L"Blender 预览"
+                : result->error.empty() ? L"无法生成该图片格式的预览" : result->error;
+            SetWindowTextW(GetDlgItem(window, ID_DETAIL_PREVIEW_STATUS), status.c_str());
             return 0;
         }
         case WM_COMMAND:
@@ -889,10 +1053,10 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             return 0;
         case WM_DESTROY:
             KillTimer(window, 2);
-            if (gPreviewBitmap) {
-                DeleteObject(gPreviewBitmap);
-                gPreviewBitmap = nullptr;
-            }
+            StopPreviewGeneration();
+            gPreviewSource.clear();
+            gPreviewTaskId.clear();
+            ReplacePreviewBitmap(nullptr);
             gDetailWindow = nullptr;
             gDetailJobId.clear();
             return 0;
@@ -947,6 +1111,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             ApplyTheme();
             SetTimer(window, 1, 1000, nullptr);
             RefreshLists();
+            if (!gUiMetricsReport.empty()) {
+                WriteUiMetricsReport();
+                PostMessageW(window, WM_CLOSE, 0, 0);
+            }
             if (gOpenInitialDetail && ListView_GetItemCount(Item(ID_JOBS)) > 0) {
                 ListView_SetItemState(Item(ID_JOBS), 0, LVIS_SELECTED | LVIS_FOCUSED,
                                       LVIS_SELECTED | LVIS_FOCUSED);
@@ -1041,6 +1209,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 if (gPreflight.joinable()) gPreflight.join();
                 EnableWindow(window, TRUE);
             }
+            if (gDetailWindow) DestroyWindow(gDetailWindow);
             DestroyWindow(window);
             return 0;
         case WM_SETTINGCHANGE:
@@ -1103,6 +1272,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     bool selfTest = false, mock = false, headless = false, noDialog = false;
     fs::path preflightSource, preflightPrepared, preflightReport, blenderOverride;
     fs::path renderSource, renderOutputDir, compatibilitySource;
+    fs::path previewSource, previewOutput;
     int renderFrame = 1;
     std::string renderFormat = "PNG";
     int overridePort = 0, runSeconds = 0;
@@ -1122,11 +1292,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--frame" && i + 1 < argumentCount) renderFrame = _wtoi(arguments[++i]);
         else if (arg == L"--format" && i + 1 < argumentCount) renderFormat = WideToUtf8(arguments[++i]);
         else if (arg == L"--compatibility" && i + 1 < argumentCount) compatibilitySource = arguments[++i];
+        else if (arg == L"--preview" && i + 1 < argumentCount) previewSource = arguments[++i];
+        else if (arg == L"--preview-output" && i + 1 < argumentCount) previewOutput = arguments[++i];
         else if (arg == L"--port" && i + 1 < argumentCount) overridePort = _wtoi(arguments[++i]);
         else if (arg == L"--run-seconds" && i + 1 < argumentCount) runSeconds = _wtoi(arguments[++i]);
         else if (arg == L"--page" && i + 1 < argumentCount)
             gInitialPage = std::clamp(_wtoi(arguments[++i]), 0, 3);
         else if (arg == L"--detail") gOpenInitialDetail = true;
+        else if (arg == L"--ui-metrics-report" && i + 1 < argumentCount)
+            gUiMetricsReport = arguments[++i];
     }
     LocalFree(arguments);
     InitializeLogging(dataDir);
@@ -1145,6 +1319,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                         ok ? L"RenderMesh 自检通过" : L"RenderMesh 自检失败",
                         ok ? MB_ICONINFORMATION : MB_ICONERROR);
         return ok ? 0 : 1;
+    }
+
+    if (!previewSource.empty()) {
+        ConfigStore previewStore(dataDir);
+        Config previewConfig = previewStore.Load();
+        if (!blenderOverride.empty()) previewConfig.blenderPath = blenderOverride;
+        if (previewOutput.empty()) previewOutput = dataDir / L"verification" / L"preview.png";
+        std::atomic<bool> previewStop = false;
+        std::wstring previewError;
+        bool ok = GeneratePreviewImage(previewConfig, dataDir, previewSource, previewOutput,
+                                       previewStop, previewError);
+        PrintToParentConsole(ok ? L"预览生成成功：" + previewOutput.wstring() : previewError);
+        return ok ? 0 : 6;
     }
 
     if (!preflightSource.empty()) {
@@ -1306,6 +1493,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&message);
     }
     gApp->SetChangedCallback({});
+    StopPreviewGeneration();
     gApp->Stop();
     if (gPreflight.joinable()) gPreflight.join();
     DeleteObject(gFont);
