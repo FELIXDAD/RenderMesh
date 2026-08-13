@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+tools/
+native/build/
+*.egg-info/
+runtime-cache/
+.rendermesh/
+.rendermesh-test/
