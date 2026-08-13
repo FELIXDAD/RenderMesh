@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <set>
 #include <sstream>
 
 namespace rm {
@@ -254,6 +256,18 @@ def is_runtime_resource(path):
                 return True
         except ValueError:
             pass
+    # A .blend can remember the absolute install path of Blender's Essentials
+    # asset library. Another worker with the same major.minor version may have
+    # Blender installed elsewhere, so accept it only when the same path suffix
+    # exists in this runtime's own datafiles/assets tree.
+    marker = os.sep + 'datafiles' + os.sep + 'assets' + os.sep
+    marker_index = key.lower().find(marker.lower())
+    if marker_index >= 0:
+        suffix = key[marker_index + len(marker):]
+        for root in runtime_roots:
+            equivalent = os.path.join(root, 'datafiles', 'assets', suffix)
+            if os.path.isfile(equivalent):
+                return True
     return False
 
 def expected_paths(path, item=None):
@@ -382,6 +396,20 @@ uses_optix_denoiser = (engine == 'CYCLES' and
                        bool(getattr(bpy.context.scene.cycles, 'use_denoising', False)) and
                        getattr(bpy.context.scene.cycles, 'denoiser', '') == 'OPTIX')
 uses_compositor = getattr(bpy.context.scene, 'compositing_node_group', None) is not None
+original_scene = bpy.context.scene
+primary_outputs = {str(frame): bpy.path.abspath(original_scene.render.frame_path(frame=frame))
+                   for frame in range(validation_start, validation_end + 1, validation_step)}
+compositor_outputs = []
+compositor_tree = getattr(original_scene, 'compositing_node_group', None)
+if compositor_tree:
+    output_nodes = [node for node in compositor_tree.nodes if node.type == 'OUTPUT_FILE']
+    for index, node in enumerate(output_nodes):
+        base_directory = (getattr(node, 'base_path', None) or
+                          getattr(node, 'directory', None) or '//')
+        compositor_outputs.append({
+            'id': f'output-{index}', 'name': node.name,
+            'directory': bpy.path.abspath(base_directory),
+        })
 report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
           'render_engine': engine,
           'render_format': bpy.context.scene.render.image_settings.file_format,
@@ -391,6 +419,8 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
                                     not uses_optix_denoiser and not uses_compositor),
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
           'addons': sorted(enabled_addons),
+          'primary_outputs': primary_outputs,
+          'compositor_outputs': compositor_outputs,
           'missing': [], 'unpacked': [], 'warnings': warnings,
           'validation_render': False, 'validation_frames': 0, 'validation_error': ''}
 try:
@@ -398,6 +428,10 @@ try:
     report['missing'] = [dict(x, path=missing) for x in before
                          for missing in x.get('missing_paths', [])]
     if not report['missing']:
+        try:
+            bpy.ops.file.pack_libraries()
+        except Exception as exc:
+            warnings.append(f'pack_libraries: {exc}')
         try:
             bpy.ops.file.pack_all()
         except Exception as exc:
@@ -509,17 +543,52 @@ with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 )PY";
 
-const char* kBatchRenderScript = R"PY(import bpy, json, os, sys, traceback
+const char* kBatchRenderScript = R"PY(import bpy, json, os, shutil, sys, traceback
 args = sys.argv[sys.argv.index('--') + 1:]
-output_dir, manifest_path, stop_path, frames_json = args[:4]
+output_dir, manifest_path, stop_path, frames_json, targets_json = args[:5]
 frames = json.loads(frames_json)
+targets = json.loads(targets_json)
 scene = bpy.context.scene
 completed = []
+artifacts = {}
 error = ''
+primary_dir = os.path.join(output_dir, 'primary')
+compositor_root = os.path.join(output_dir, 'compositor')
+os.makedirs(primary_dir, exist_ok=True)
+tree = getattr(scene, 'compositing_node_group', None)
+nodes = [node for node in tree.nodes if node.type == 'OUTPUT_FILE'] if tree else []
+if len(nodes) != len(targets):
+    raise RuntimeError(f'Compositor output count changed: expected {len(targets)}, have {len(nodes)}')
+for node, target in zip(nodes, targets):
+    identifier = target.get('id', '')
+    if not identifier or '/' in identifier or '\\' in identifier or identifier in {'.', '..'}:
+        raise RuntimeError('Invalid compositor output identifier')
+    sandbox_directory = os.path.join(compositor_root, identifier)
+    if hasattr(node, 'base_path'):
+        node.base_path = sandbox_directory
+    elif hasattr(node, 'directory'):
+        node.directory = sandbox_directory
+    else:
+        raise RuntimeError(f'File Output node {node.name} has no writable directory')
+
+def file_state(root):
+    result = {}
+    if not os.path.isdir(root):
+        return result
+    for current, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(current, name)
+            try:
+                stat = os.stat(path)
+                result[path] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                pass
+    return result
+
 def persist():
     temporary = manifest_path + '.tmp'
     with open(temporary, 'w', encoding='utf-8') as handle:
-        json.dump({'completed': completed, 'error': error}, handle,
+        json.dump({'completed': completed, 'artifacts': artifacts, 'error': error}, handle,
                   ensure_ascii=False, indent=2)
     os.replace(temporary, manifest_path)
 try:
@@ -527,10 +596,35 @@ try:
         if index and os.path.exists(stop_path):
             break
         scene.frame_set(int(frame))
-        scene.render.filepath = os.path.join(output_dir, f'frame_{int(frame):06d}')
+        before = file_state(primary_dir)
+        before.update(file_state(compositor_root))
+        scene.render.filepath = os.path.join(primary_dir, f'frame_{int(frame):06d}')
         result = bpy.ops.render.render(write_still=True)
         if 'FINISHED' not in result:
             raise RuntimeError(f'Render frame {frame} returned {result}')
+        after = file_state(primary_dir)
+        after.update(file_state(compositor_root))
+        changed = sorted(path for path, state in after.items() if before.get(path) != state)
+        frame_artifacts = []
+        capture_dir = os.path.join(output_dir, 'captured', str(int(frame)))
+        os.makedirs(capture_dir, exist_ok=True)
+        for artifact_index, path in enumerate(changed):
+            if os.path.commonpath([os.path.abspath(path), os.path.abspath(primary_dir)]) == \
+                    os.path.abspath(primary_dir):
+                logical = 'primary'
+            else:
+                relative = os.path.relpath(path, compositor_root).replace(os.sep, '/')
+                logical = 'compositor/' + relative
+            extension = os.path.splitext(path)[1]
+            captured = os.path.join(capture_dir, f'{artifact_index:04d}{extension}')
+            shutil.copy2(path, captured)
+            frame_artifacts.append({
+                'logical': logical,
+                'source': os.path.relpath(captured, output_dir).replace(os.sep, '/'),
+            })
+        if not any(value['logical'] == 'primary' for value in frame_artifacts):
+            raise RuntimeError(f'Primary render output missing for frame {frame}')
+        artifacts[str(int(frame))] = frame_artifacts
         completed.append(int(frame))
         persist()
 except Exception:
@@ -934,6 +1028,24 @@ PreflightReport PreflightBlend(
         report.cpuSafeWhileActive = data.value("cpu_safe_while_active", false);
         report.requiresGpu = data.value("requires_gpu", false);
         report.addons = data.value("addons", std::vector<std::string>{});
+        json primaryOutputRows = data.value("primary_outputs", json::object());
+        for (const auto& [frameText, pathValue] : primaryOutputRows.items()) {
+            try {
+                int frame = std::stoi(frameText);
+                fs::path path = Utf8ToWide(pathValue.get<std::string>());
+                if (frame >= 1 && frame <= 1000000 && path.is_absolute())
+                    report.primaryOutputs[frame] = std::move(path);
+            } catch (...) {
+            }
+        }
+        for (const auto& target : data.value("compositor_outputs", json::array())) {
+            OutputTarget outputTarget;
+            outputTarget.id = target.value("id", "");
+            outputTarget.name = target.value("name", "");
+            outputTarget.directory = Utf8ToWide(target.value("directory", ""));
+            if (!outputTarget.id.empty() && outputTarget.directory.is_absolute())
+                report.compositorOutputs.push_back(std::move(outputTarget));
+        }
         report.warnings = data.value("warnings", std::vector<std::string>{});
         std::string validationError = data.value("validation_error", std::string{});
         auto parseDependencies = [](const json& values) {
@@ -1100,7 +1212,8 @@ bool RenderBlenderPackage(
     bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
-    std::map<int, fs::path>& completed,
+    const std::vector<OutputTarget>& compositorOutputs,
+    std::map<int, std::vector<RenderArtifact>>& completed,
     std::wstring& error) {
     completed.clear();
     if (frames.empty() || frames.size() > 5 || outputFormat.empty() ||
@@ -1152,11 +1265,15 @@ bool RenderBlenderPackage(
             Sleep(50);
         }
     });
+    json outputTargets = json::array();
+    for (const auto& target : compositorOutputs)
+        outputTargets.push_back({{"id", target.id}, {"name", target.name}});
     ProcessResult process = RunProcess(
         blender,
         {L"--background", L"--disable-autoexec", blend.wstring(), L"--python",
          script.wstring(), L"--", outputDir.wstring(), manifest.wstring(),
-         stopMarker.wstring(), Utf8ToWide(json(frames).dump())},
+         stopMarker.wstring(), Utf8ToWide(json(frames).dump()),
+         Utf8ToWide(outputTargets.dump())},
         log, applySharingLimit ? &config : nullptr, &stopRequested);
     processFinished = true;
     if (stopMarkerThread.joinable()) stopMarkerThread.join();
@@ -1164,13 +1281,24 @@ bool RenderBlenderPackage(
     try {
         if (fs::is_regular_file(manifest)) {
             json progress = json::parse(ReadText(manifest));
+            json artifactRows = progress.value("artifacts", json::object());
             for (int frame : progress.value("completed", std::vector<int>{})) {
                 if (std::find(frames.begin(), frames.end(), frame) == frames.end()) continue;
-                std::wstring frameText = std::to_wstring(frame);
-                fs::path expected = outputDir / (L"frame_" +
-                    std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText +
-                    Utf8ToWide(outputExtension));
-                if (fs::is_regular_file(expected)) completed[frame] = expected;
+                std::vector<RenderArtifact> values;
+                for (const auto& artifact : artifactRows.value(
+                         std::to_string(frame), json::array())) {
+                    std::string logical = artifact.value("logical", "");
+                    fs::path relative = Utf8ToWide(artifact.value("source", ""));
+                    fs::path source = outputDir / relative;
+                    bool safeRelative = relative.is_relative() && !relative.has_root_name() &&
+                        !relative.has_root_directory();
+                    for (const auto& component : relative)
+                        safeRelative = safeRelative && component != L".." && component != L".";
+                    if (!logical.empty() && safeRelative &&
+                        fs::is_regular_file(source))
+                        values.push_back({logical, source});
+                }
+                if (!values.empty()) completed[frame] = std::move(values);
             }
             std::string scriptError = progress.value("error", "");
             if (!scriptError.empty()) error = Utf8ToWide(scriptError);
@@ -1185,6 +1313,151 @@ bool RenderBlenderPackage(
                       L"。日志：" + log.wstring()
                 : process.error;
         }
+        return false;
+    }
+    return true;
+}
+
+bool WriteResultBundle(
+    const fs::path& destination,
+    const std::vector<RenderArtifact>& artifacts,
+    std::wstring& error) {
+    if (artifacts.empty() || artifacts.size() > 4096) {
+        error = L"结果文件包条目数量无效";
+        return false;
+    }
+    fs::create_directories(destination.parent_path());
+    fs::path temporary = destination;
+    temporary += L".tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = L"无法创建结果文件包";
+        return false;
+    }
+    const char magic[8] = {'R', 'M', 'B', 'N', 'D', 'L', '1', '\0'};
+    output.write(magic, sizeof(magic));
+    uint32_t count = static_cast<uint32_t>(artifacts.size());
+    output.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    std::set<std::string> logicalPaths;
+    std::vector<char> buffer(1024 * 1024);
+    for (const auto& artifact : artifacts) {
+        std::error_code ec;
+        uint64_t size = fs::file_size(artifact.source, ec);
+        if (ec || artifact.logicalPath.empty() || artifact.logicalPath.size() > 4096 ||
+            artifact.logicalPath.find('\0') != std::string::npos ||
+            !logicalPaths.insert(artifact.logicalPath).second) {
+            error = L"结果文件包包含无效或重复条目";
+            output.close();
+            fs::remove(temporary, ec);
+            return false;
+        }
+        uint32_t pathSize = static_cast<uint32_t>(artifact.logicalPath.size());
+        output.write(reinterpret_cast<const char*>(&pathSize), sizeof(pathSize));
+        output.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        output.write(artifact.logicalPath.data(), pathSize);
+        std::ifstream input(artifact.source, std::ios::binary);
+        uint64_t remaining = size;
+        while (input && remaining) {
+            size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
+            input.read(buffer.data(), static_cast<std::streamsize>(wanted));
+            size_t read = static_cast<size_t>(input.gcount());
+            if (!read) break;
+            output.write(buffer.data(), static_cast<std::streamsize>(read));
+            remaining -= read;
+        }
+        if (remaining || !output) {
+            error = L"结果文件包写入不完整";
+            output.close();
+            fs::remove(temporary, ec);
+            return false;
+        }
+    }
+    output.flush();
+    output.close();
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = LastErrorMessage();
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool ExtractResultBundle(
+    const fs::path& bundle,
+    const fs::path& stagingDirectory,
+    std::map<std::string, fs::path>& artifacts,
+    std::wstring& error) {
+    artifacts.clear();
+    std::ifstream input(bundle, std::ios::binary);
+    char magic[8]{};
+    uint32_t count = 0;
+    input.read(magic, sizeof(magic));
+    input.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!input || std::memcmp(magic, "RMBNDL1\0", 8) != 0 || !count || count > 4096) {
+        error = L"结果文件包头无效";
+        return false;
+    }
+    std::error_code ec;
+    fs::remove_all(stagingDirectory, ec);
+    fs::create_directories(stagingDirectory, ec);
+    if (ec) {
+        error = L"无法创建结果暂存目录";
+        return false;
+    }
+    uint64_t total = 0;
+    std::vector<char> buffer(1024 * 1024);
+    for (uint32_t index = 0; index < count; ++index) {
+        uint32_t pathSize = 0;
+        uint64_t fileSize = 0;
+        input.read(reinterpret_cast<char*>(&pathSize), sizeof(pathSize));
+        input.read(reinterpret_cast<char*>(&fileSize), sizeof(fileSize));
+        if (!input || !pathSize || pathSize > 4096 ||
+            fileSize > 100ull * 1024 * 1024 * 1024 ||
+            total > 100ull * 1024 * 1024 * 1024 - fileSize) {
+            error = L"结果文件包条目大小无效";
+            fs::remove_all(stagingDirectory, ec);
+            return false;
+        }
+        std::string logical(pathSize, '\0');
+        input.read(logical.data(), static_cast<std::streamsize>(pathSize));
+        fs::path relative = Utf8ToWide(logical);
+        bool safe = !logical.empty() && logical.find('\0') == std::string::npos &&
+            logical.find('\\') == std::string::npos && relative.is_relative() &&
+            !relative.has_root_name() && !relative.has_root_directory();
+        for (const auto& component : relative)
+            safe = safe && component != L".." && component != L".";
+        if (!input || !safe || artifacts.contains(logical)) {
+            error = L"结果文件包包含不安全路径";
+            fs::remove_all(stagingDirectory, ec);
+            return false;
+        }
+        fs::path destination = stagingDirectory / relative;
+        fs::create_directories(destination.parent_path(), ec);
+        std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+        uint64_t remaining = fileSize;
+        while (input && output && remaining) {
+            size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
+            input.read(buffer.data(), static_cast<std::streamsize>(wanted));
+            size_t read = static_cast<size_t>(input.gcount());
+            if (!read) break;
+            output.write(buffer.data(), static_cast<std::streamsize>(read));
+            remaining -= read;
+        }
+        if (remaining || !output) {
+            error = L"结果文件包内容不完整";
+            output.close();
+            fs::remove_all(stagingDirectory, ec);
+            return false;
+        }
+        total += fileSize;
+        artifacts.emplace(std::move(logical), std::move(destination));
+    }
+    char trailing = 0;
+    if (input.read(&trailing, 1)) {
+        error = L"结果文件包含有多余数据";
+        fs::remove_all(stagingDirectory, ec);
+        artifacts.clear();
         return false;
     }
     return true;

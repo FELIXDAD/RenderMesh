@@ -92,6 +92,17 @@ struct DependencyItem {
     std::string path;
 };
 
+struct OutputTarget {
+    std::string id;
+    std::string name;
+    fs::path directory;
+};
+
+struct RenderArtifact {
+    std::string logicalPath;
+    fs::path source;
+};
+
 struct PreflightReport {
     bool passed = false;
     std::string blenderVersion;
@@ -104,6 +115,8 @@ struct PreflightReport {
     std::vector<DependencyItem> missing;
     std::vector<DependencyItem> unpacked;
     std::vector<std::string> warnings;
+    std::map<int, fs::path> primaryOutputs;
+    std::vector<OutputTarget> compositorOutputs;
     fs::path preparedBlend;
     std::wstring summary;
 };
@@ -150,7 +163,17 @@ bool RenderBlenderPackage(
     bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
-    std::map<int, fs::path>& completed,
+    const std::vector<OutputTarget>& compositorOutputs,
+    std::map<int, std::vector<RenderArtifact>>& completed,
+    std::wstring& error);
+bool WriteResultBundle(
+    const fs::path& destination,
+    const std::vector<RenderArtifact>& artifacts,
+    std::wstring& error);
+bool ExtractResultBundle(
+    const fs::path& bundle,
+    const fs::path& stagingDirectory,
+    std::map<std::string, fs::path>& artifacts,
     std::wstring& error);
 
 enum class TaskState { Pending, Dispatching, Assigned, Rendering, Completed, Failed };
@@ -183,6 +206,8 @@ struct RenderJob {
     bool cpuSafeWhileActive = false;
     bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
+    std::map<int, fs::path> primaryOutputs;
+    std::vector<OutputTarget> compositorOutputs;
     std::vector<FrameTask> frames;
     std::chrono::system_clock::time_point createdAt;
 };
@@ -191,6 +216,7 @@ struct Peer {
     int protocolVersion = 1;
     bool supportsProjectCache = false;
     bool supportsFramePackages = false;
+    bool supportsResultBundles = false;
     std::string nodeId;
     std::string name;
     std::string address;
@@ -232,7 +258,9 @@ struct WorkItem {
     bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
     std::string attemptToken;
+    std::vector<OutputTarget> compositorOutputs;
     bool remote = false;
+    bool resultBundles = false;
     std::string originAddress;
     int originPort = 8391;
 };

@@ -6,6 +6,7 @@
 #include "../third_party/httplib.h"
 
 #include <algorithm>
+#include <cwctype>
 #include <deque>
 #include <fstream>
 #include <regex>
@@ -70,6 +71,31 @@ std::vector<std::string> HeaderStringList(const httplib::Request& request, const
         return json::parse(request.get_header_value(name)).get<std::vector<std::string>>();
     } catch (...) {
         return {};
+    }
+}
+
+bool HeaderOutputTargets(
+    const httplib::Request& request, const char* name,
+    std::vector<OutputTarget>& targets) {
+    targets.clear();
+    std::string value = request.get_header_value(name);
+    if (value.empty()) return true;
+    try {
+        json rows = json::parse(value);
+        if (!rows.is_array() || rows.size() > 128) return false;
+        std::set<std::string> ids;
+        for (const auto& row : rows) {
+            OutputTarget target;
+            target.id = row.value("id", "");
+            target.name = row.value("name", "");
+            if (!SafeId(target.id) || target.name.size() > 512 ||
+                !ids.insert(target.id).second)
+                return false;
+            targets.push_back(std::move(target));
+        }
+        return true;
+    } catch (...) {
+        return false;
     }
 }
 
@@ -146,6 +172,8 @@ std::string DiscoverySignature(const Config& config, const json& message) {
         signedValue += "|" + std::string(message.value("project_cache", false) ? "1" : "0");
     if (message.value("protocol", 1) >= 4)
         signedValue += "|" + std::string(message.value("frame_packages", false) ? "1" : "0");
+    if (message.value("protocol", 1) >= 5)
+        signedValue += "|" + std::string(message.value("result_bundles", false) ? "1" : "0");
     return HmacSha256(config.clusterToken, signedValue);
 }
 
@@ -238,6 +266,7 @@ void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     candidate.protocolVersion = existing.protocolVersion;
     candidate.supportsProjectCache = existing.supportsProjectCache;
     candidate.supportsFramePackages = existing.supportsFramePackages;
+    candidate.supportsResultBundles = existing.supportsResultBundles;
     candidate.name = existing.name;
     candidate.cpuPercent = existing.cpuPercent;
     candidate.idleSeconds = existing.idleSeconds;
@@ -339,6 +368,126 @@ size_t CleanupExpiredProjectCaches(
         ec.clear();
     }
     return removed;
+}
+
+std::optional<fs::path> ResultDestination(
+    const fs::path& dataDir, const RenderJob& job, int frame,
+    const std::string& logicalPath) {
+    if (logicalPath == "primary") {
+        auto configured = job.primaryOutputs.find(frame);
+        if (configured != job.primaryOutputs.end() && configured->second.is_absolute())
+            return configured->second;
+        std::wstring frameText = std::to_wstring(frame);
+        return dataDir / L"jobs" / Utf8ToWide(job.id) / L"outputs" /
+            (L"frame_" + std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') +
+             frameText + Utf8ToWide(job.outputExtension));
+    }
+    constexpr std::string_view prefix = "compositor/";
+    if (!logicalPath.starts_with(prefix)) return std::nullopt;
+    std::string remainder = logicalPath.substr(prefix.size());
+    size_t slash = remainder.find('/');
+    if (slash == std::string::npos) return std::nullopt;
+    std::string id = remainder.substr(0, slash);
+    std::string relativeText = remainder.substr(slash + 1);
+    auto target = std::find_if(job.compositorOutputs.begin(), job.compositorOutputs.end(),
+                               [&](const OutputTarget& value) { return value.id == id; });
+    fs::path relative = Utf8ToWide(relativeText);
+    bool safe = target != job.compositorOutputs.end() && target->directory.is_absolute() &&
+        !relativeText.empty() && relativeText.find('\\') == std::string::npos &&
+        relative.is_relative() && !relative.has_root_name() && !relative.has_root_directory();
+    for (const auto& component : relative)
+        safe = safe && component != L".." && component != L".";
+    if (!safe) return std::nullopt;
+    return target->directory / relative;
+}
+
+bool PublishResultArtifacts(
+    const fs::path& dataDir, const RenderJob& job, int frame,
+    const std::map<std::string, fs::path>& artifacts,
+    const std::string& attemptToken, fs::path& primary, std::wstring& error) {
+    struct Publication {
+        fs::path destination;
+        fs::path temporary;
+        fs::path backup;
+        bool hadBackup = false;
+        bool published = false;
+    };
+    error.clear();
+    primary.clear();
+    if (artifacts.empty() || !artifacts.contains("primary") || !SafeId(attemptToken)) {
+        error = L"结果文件清单无效";
+        return false;
+    }
+    std::vector<Publication> publications;
+    std::set<std::wstring> destinations;
+    std::error_code ec;
+    for (const auto& [logical, source] : artifacts) {
+        auto destination = ResultDestination(dataDir, job, frame, logical);
+        std::wstring destinationKey = destination
+            ? fs::absolute(*destination, ec).lexically_normal().wstring() : std::wstring{};
+        std::transform(destinationKey.begin(), destinationKey.end(), destinationKey.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (!destination || ec || !fs::is_regular_file(source, ec) ||
+            !destinations.insert(std::move(destinationKey)).second) {
+            error = L"结果文件目标与工程输出设置不匹配";
+            return false;
+        }
+        fs::create_directories(destination->parent_path(), ec);
+        if (ec) {
+            error = L"无法创建工程输出目录：" + destination->parent_path().wstring();
+            return false;
+        }
+        Publication publication;
+        publication.destination = *destination;
+        publication.temporary = *destination;
+        publication.temporary += Utf8ToWide(".rendermesh-" + attemptToken + ".tmp");
+        publication.backup = *destination;
+        publication.backup += Utf8ToWide(".rendermesh-" + attemptToken + ".bak");
+        fs::remove(publication.temporary, ec);
+        fs::remove(publication.backup, ec);
+        fs::copy_file(source, publication.temporary,
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            error = L"无法暂存结果到工程输出目录：" + destination->wstring();
+            for (const auto& staged : publications) fs::remove(staged.temporary, ec);
+            return false;
+        }
+        publications.push_back(std::move(publication));
+    }
+    for (auto& publication : publications) {
+        if (fs::exists(publication.destination, ec)) {
+            if (!MoveFileExW(publication.destination.c_str(), publication.backup.c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                error = L"无法备份已有输出：" + LastErrorMessage();
+                break;
+            }
+            publication.hadBackup = true;
+        }
+        if (!MoveFileExW(publication.temporary.c_str(), publication.destination.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            error = L"无法发布渲染结果：" + LastErrorMessage();
+            break;
+        }
+        publication.published = true;
+    }
+    if (!error.empty()) {
+        for (auto it = publications.rbegin(); it != publications.rend(); ++it) {
+            if (it->published) fs::remove(it->destination, ec);
+            if (it->hadBackup)
+                MoveFileExW(it->backup.c_str(), it->destination.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            fs::remove(it->temporary, ec);
+        }
+        return false;
+    }
+    for (auto& publication : publications) fs::remove(publication.backup, ec);
+    auto primaryDestination = ResultDestination(dataDir, job, frame, "primary");
+    if (!primaryDestination) {
+        error = L"结果文件包缺少主输出";
+        return false;
+    }
+    primary = *primaryDestination;
+    return true;
 }
 
 httplib::Result PostFile(
@@ -520,6 +669,14 @@ struct NodeApp::Impl {
             std::scoped_lock lock(stateMutex);
             for (const auto& job : jobs) {
                 json frames = json::array();
+                json primaryOutputs = json::object();
+                json compositorOutputs = json::array();
+                for (const auto& [frame, path] : job.primaryOutputs)
+                    primaryOutputs[std::to_string(frame)] = WideToUtf8(path.wstring());
+                for (const auto& target : job.compositorOutputs)
+                    compositorOutputs.push_back({{"id", target.id}, {"name", target.name},
+                                                 {"directory", WideToUtf8(
+                                                     target.directory.wstring())}});
                 for (const auto& frame : job.frames) {
                     frames.push_back({
                         {"task_id", frame.taskId},
@@ -543,6 +700,8 @@ struct NodeApp::Impl {
                     {"render_engine", job.renderEngine},
                     {"cpu_safe_while_active", job.cpuSafeWhileActive},
                     {"requires_gpu", job.requiresGpu},
+                    {"primary_outputs", primaryOutputs},
+                    {"compositor_outputs", compositorOutputs},
                     {"addons", job.requiredAddons}, {"frames", frames},
                 });
             }
@@ -583,6 +742,21 @@ struct NodeApp::Impl {
                 job.cpuSafeWhileActive = row.value("cpu_safe_while_active", false);
                 job.requiresGpu = row.value("requires_gpu", false);
                 job.requiredAddons = row.value("addons", std::vector<std::string>{});
+                json primaryOutputRows = row.value("primary_outputs", json::object());
+                for (const auto& [frameText, pathValue] : primaryOutputRows.items()) {
+                    try {
+                        job.primaryOutputs[std::stoi(frameText)] =
+                            Utf8ToWide(pathValue.get<std::string>());
+                    } catch (...) {
+                    }
+                }
+                for (const auto& value : row.value("compositor_outputs", json::array())) {
+                    OutputTarget target;
+                    target.id = value.value("id", "");
+                    target.name = value.value("name", "");
+                    target.directory = Utf8ToWide(value.value("directory", ""));
+                    if (!target.id.empty()) job.compositorOutputs.push_back(std::move(target));
+                }
                 for (const auto& value : row.value("frames", json::array())) {
                     FrameTask frame;
                     frame.taskId = value.value("task_id", "");
@@ -674,8 +848,8 @@ struct NodeApp::Impl {
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             Config config = owner->GetConfig();
             response.set_content(
-                json{{"status", "ok"}, {"protocol", 4}, {"project_cache", true},
-                     {"frame_packages", true},
+                json{{"status", "ok"}, {"protocol", 5}, {"project_cache", true},
+                     {"frame_packages", true}, {"result_bundles", true},
                      {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
@@ -985,6 +1159,11 @@ struct NodeApp::Impl {
             bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
             auto addons = HeaderStringList(request, "X-RM-Addons");
+            std::vector<OutputTarget> compositorOutputs;
+            if (!HeaderOutputTargets(request, "X-RM-Compositor", compositorOutputs)) {
+                response.status = 422;
+                return;
+            }
             std::vector<WorkItem::Frame> packageFrames;
             try {
                 json values = json::parse(request.get_header_value("X-RM-Frames"));
@@ -1060,7 +1239,9 @@ struct NodeApp::Impl {
             item.cpuSafeWhileActive = cpuSafe;
             item.requiresGpu = requiresGpu;
             item.requiredAddons = std::move(addons);
+            item.compositorOutputs = std::move(compositorOutputs);
             item.remote = true;
+            item.resultBundles = request.get_header_value("X-RM-Result-Bundles") == "1";
             item.originAddress = request.remote_addr;
             item.originPort = originPort;
             {
@@ -1256,7 +1437,8 @@ struct NodeApp::Impl {
                     response.status = 422;
                     return;
                 }
-                fs::path destination;
+                bool resultBundle = request.get_header_value("X-RM-Result-Bundle") == "1";
+                fs::path stagingRoot;
                 size_t targetJob = 0;
                 size_t targetFrame = 0;
                 bool found = false;
@@ -1278,10 +1460,8 @@ struct NodeApp::Impl {
                             return;
                         }
                         found = true;
-                        destination = owner->DataDir() / L"jobs" / Utf8ToWide(job.id) /
-                            L"outputs" /
-                            (L"frame_" + std::to_wstring(it->frame) +
-                             Utf8ToWide(job.outputExtension));
+                        stagingRoot = owner->DataDir() / L"jobs" / Utf8ToWide(job.id) /
+                            L"receiving" / Utf8ToWide(taskId + "-" + attemptToken);
                         break;
                     }
                 }
@@ -1289,25 +1469,34 @@ struct NodeApp::Impl {
                     response.status = 404;
                     return;
                 }
-                if (status == "completed" && !HasTransferCapacity(request, destination.parent_path())) {
+                if (status == "completed" && !HasTransferCapacity(request, stagingRoot)) {
                     response.status = 507;
                     response.set_content("result exceeds transfer limit or available disk space", "text/plain");
                     return;
                 }
                 fs::path stagedResult;
                 if (status == "completed") {
-                    stagedResult = destination;
-                    stagedResult += Utf8ToWide("." + attemptToken + ".result");
+                    stagedResult = stagingRoot /
+                        (resultBundle ? L"result.rmbundle" : L"primary.result");
                 }
                 std::wstring receiveError;
                 bool ok = status != "completed" ||
                     StreamRequestToFile(reader, stagedResult, receiveError);
+                std::map<std::string, fs::path> receivedArtifacts;
+                if (status == "completed" && ok) {
+                    if (resultBundle) {
+                        ok = ExtractResultBundle(stagedResult, stagingRoot / L"extracted",
+                                                 receivedArtifacts, receiveError);
+                    } else {
+                        receivedArtifacts["primary"] = stagedResult;
+                    }
+                }
                 {
                     std::scoped_lock lock(stateMutex);
                     if (targetJob >= jobs.size() || targetFrame >= jobs[targetJob].frames.size() ||
                         jobs[targetJob].frames[targetFrame].taskId != taskId) {
                         std::error_code ignored;
-                        if (!stagedResult.empty()) fs::remove(stagedResult, ignored);
+                        if (!stagingRoot.empty()) fs::remove_all(stagingRoot, ignored);
                         response.status = 409;
                         response.set_content("task changed while receiving result", "text/plain");
                         return;
@@ -1315,22 +1504,19 @@ struct NodeApp::Impl {
                     auto& target = jobs[targetJob].frames[targetFrame];
                     if (target.attemptToken != attemptToken || target.state != TaskState::Assigned) {
                         std::error_code ignored;
-                        if (!stagedResult.empty()) fs::remove(stagedResult, ignored);
+                        if (!stagingRoot.empty()) fs::remove_all(stagingRoot, ignored);
                         response.status = 409;
                         response.set_content("assignment changed while receiving result", "text/plain");
                         return;
                     }
-                    if (status == "completed" && ok &&
-                        !MoveFileExW(stagedResult.c_str(), destination.c_str(),
-                                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-                        ok = false;
-                        receiveError = LastErrorMessage();
-                        std::error_code ignored;
-                        fs::remove(stagedResult, ignored);
-                    }
+                    fs::path publishedPrimary;
+                    if (status == "completed" && ok)
+                        ok = PublishResultArtifacts(
+                            owner->DataDir(), jobs[targetJob], target.frame,
+                            receivedArtifacts, attemptToken, publishedPrimary, receiveError);
                     if (status == "completed" && ok) {
                         target.state = TaskState::Completed;
-                        target.output = destination;
+                        target.output = publishedPrimary;
                         target.error.clear();
                     } else if (status == "retry" && ok) {
                         target.state = TaskState::Pending;
@@ -1345,6 +1531,10 @@ struct NodeApp::Impl {
                     }
                     target.assignedAt = {};
                     target.assignedPackageId.clear();
+                }
+                {
+                    std::error_code ignored;
+                    if (!stagingRoot.empty()) fs::remove_all(stagingRoot, ignored);
                 }
                 PersistJobs();
                 Notify();
@@ -1417,6 +1607,7 @@ struct NodeApp::Impl {
         peer.protocolVersion = health.value("protocol", 1);
         peer.supportsProjectCache = health.value("project_cache", false);
         peer.supportsFramePackages = health.value("frame_packages", false);
+        peer.supportsResultBundles = health.value("result_bundles", false);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -1503,8 +1694,9 @@ struct NodeApp::Impl {
                     localAddresses.push_back(network.address);
                 std::vector<std::string> payloads;
                 if (!config.pairingPending && config.clusterToken.size() >= 16) {
-                    json messageV4 = {
-                        {"protocol", 4}, {"project_cache", true}, {"frame_packages", true},
+                    json messageV5 = {
+                        {"protocol", 5}, {"project_cache", true}, {"frame_packages", true},
+                        {"result_bundles", true},
                         {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
@@ -1513,9 +1705,9 @@ struct NodeApp::Impl {
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    messageV4["signature"] = DiscoverySignature(config, messageV4);
-                    payloads.push_back(messageV4.dump());
-                    // Keep a v1 beacon during the protocol-v4 rollout so an older
+                    messageV5["signature"] = DiscoverySignature(config, messageV5);
+                    payloads.push_back(messageV5.dump());
+                    // Keep a v1 beacon during the protocol-v5 rollout so an older
                     // installed node can still discover this endpoint.
                     json messageV1 = {
                         {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
@@ -1562,13 +1754,14 @@ struct NodeApp::Impl {
             try {
                 json message = json::parse(std::string(buffer, received));
                 int protocol = message.value("protocol", 0);
-                if (protocol < 1 || protocol > 4) continue;
+                if (protocol < 1 || protocol > 5) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
                 peer.protocolVersion = protocol;
                 peer.supportsProjectCache = message.value("project_cache", false);
                 peer.supportsFramePackages = message.value("frame_packages", false);
+                peer.supportsResultBundles = message.value("result_bundles", false);
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -1627,8 +1820,15 @@ struct NodeApp::Impl {
         std::scoped_lock lock(stateMutex);
         auto now = std::chrono::steady_clock::now();
         for (const auto& [id, peer] : peers) {
+            bool locallyLeased = std::any_of(jobs.begin(), jobs.end(), [&](const RenderJob& job) {
+                return std::any_of(job.frames.begin(), job.frames.end(),
+                    [&](const FrameTask& frame) {
+                        return frame.state == TaskState::Assigned &&
+                            frame.assignedNodeId == peer.nodeId;
+                    });
+            });
             if (now - peer.lastSeen <= kPeerTimeout && peer.trusted && peer.shareEnabled &&
-                peer.assigned == 0)
+                peer.assigned == 0 && !locallyLeased)
                 return peer;
         }
         return std::nullopt;
@@ -1752,19 +1952,28 @@ struct NodeApp::Impl {
             error = "worker does not support frame packages";
             return false;
         }
+        if (!job.compositorOutputs.empty() && !peer.supportsResultBundles) {
+            error = "worker does not support compositor result bundles";
+            return false;
+        }
         Config config = owner->GetConfig();
         if (!VerifyRemotePeer(peer, config, error) ||
             !EnsureRemoteProjectCache(peer, config, job, error))
             return false;
         json frameMetadata = json::array();
+        json compositorMetadata = json::array();
         for (size_t index = 0; index < frames.size(); ++index) {
             frameMetadata.push_back({{"task", frames[index].taskId},
                                      {"frame", frames[index].frame},
                                      {"attempt", attemptTokens[index]}});
         }
+        for (const auto& target : job.compositorOutputs)
+            compositorMetadata.push_back({{"id", target.id}, {"name", target.name}});
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Package", packageId},
             {"X-RM-Job", job.id}, {"X-RM-Frames", frameMetadata.dump()},
+            {"X-RM-Compositor", compositorMetadata.dump()},
+            {"X-RM-Result-Bundles", peer.supportsResultBundles ? "1" : "0"},
             {"X-RM-Project", job.projectHash}, {"X-RM-Format", job.outputFormat},
             {"X-RM-Extension", job.outputExtension},
             {"X-RM-Blender", job.blenderVersion}, {"X-RM-Engine", job.renderEngine},
@@ -1947,7 +2156,7 @@ struct NodeApp::Impl {
                     item.frames.push_back({frame.taskId, frame.frame, {}});
                 item.blend = jobCopy.preparedBlend;
                 item.outputDir = owner->DataDir() / L"jobs" / Utf8ToWide(jobCopy.id) /
-                    L"outputs";
+                    L"packages" / Utf8ToWide(item.packageId);
                 item.outputFormat = jobCopy.outputFormat;
                 item.outputExtension = jobCopy.outputExtension;
                 item.blenderVersion = jobCopy.blenderVersion;
@@ -1955,6 +2164,7 @@ struct NodeApp::Impl {
                 item.cpuSafeWhileActive = jobCopy.cpuSafeWhileActive;
                 item.requiresGpu = jobCopy.requiresGpu;
                 item.requiredAddons = jobCopy.requiredAddons;
+                item.compositorOutputs = jobCopy.compositorOutputs;
                 {
                     std::scoped_lock workLock(workMutex);
                     work.push(item);
@@ -2008,6 +2218,8 @@ struct NodeApp::Impl {
             {"X-RM-Status", retry ? "retry" : success ? "completed" : "failed"},
             {"X-RM-Error", WideToUtf8(renderError)},
         };
+        if (success && item.resultBundles)
+            headers.emplace("X-RM-Result-Bundle", "1");
         for (int attempt = 0; attempt < 4 && !stopRequested.load(); ++attempt) {
             if (attempt) {
                 for (int step = 0; step < attempt * 20 && !stopRequested.load(); ++step)
@@ -2049,7 +2261,7 @@ struct NodeApp::Impl {
             LogInfo("render package started; package=" +
                     (item.packageId.empty() ? item.taskId : item.packageId) + "; frames=" +
                     std::to_string(item.frames.size()));
-            std::map<int, fs::path> outputs;
+            std::map<int, std::vector<RenderArtifact>> outputs;
             std::wstring renderError;
             bool retryAfterIdle = false;
             Config renderConfig = owner->GetConfig();
@@ -2065,7 +2277,20 @@ struct NodeApp::Impl {
                          Utf8ToWide(item.outputExtension));
                     std::ofstream mock(output, std::ios::binary);
                     mock << "RenderMesh mock frame " << frame.frame;
-                    if (mock) outputs[frame.frame] = output;
+                    if (mock) outputs[frame.frame].push_back({"primary", output});
+                    for (const auto& target : item.compositorOutputs) {
+                        fs::path pass = item.outputDir / L"mock-compositor" /
+                            Utf8ToWide(target.id) /
+                            (L"pass_" + std::to_wstring(frame.frame) + L".exr");
+                        fs::create_directories(pass.parent_path());
+                        std::ofstream mockPass(pass, std::ios::binary);
+                        mockPass << "RenderMesh mock pass " << frame.frame;
+                        if (mockPass)
+                            outputs[frame.frame].push_back({
+                                "compositor/" + target.id + "/ViewLayer/pass_" +
+                                    std::to_string(frame.frame) + ".exr",
+                                pass});
+                    }
                 }
             } else {
                 std::atomic<bool> finishCurrentThenStop = false;
@@ -2075,7 +2300,7 @@ struct NodeApp::Impl {
                     renderConfig, item.blend, item.outputDir, frameNumbers,
                     item.outputFormat, item.outputExtension, item.remote,
                     item.remote && !item.cpuSafeWhileActive, stopRequested,
-                    finishCurrentThenStop, outputs, renderError);
+                    finishCurrentThenStop, item.compositorOutputs, outputs, renderError);
                 retryAfterIdle = finishCurrentThenStop.load();
             }
             if (item.remote) {
@@ -2083,9 +2308,28 @@ struct NodeApp::Impl {
                     auto output = outputs.find(frame.frame);
                     bool frameSuccess = output != outputs.end();
                     bool frameRetry = !frameSuccess && retryAfterIdle;
+                    fs::path transferFile;
+                    std::wstring bundleError;
+                    if (frameSuccess && item.resultBundles) {
+                        transferFile = item.outputDir /
+                            (L"result-" + std::to_wstring(frame.frame) + L".rmbundle");
+                        frameSuccess = WriteResultBundle(transferFile, output->second,
+                                                         bundleError);
+                        if (!frameSuccess) renderError = std::move(bundleError);
+                    } else if (frameSuccess) {
+                        auto primary = std::find_if(
+                            output->second.begin(), output->second.end(),
+                            [](const RenderArtifact& artifact) {
+                                return artifact.logicalPath == "primary";
+                            });
+                        frameSuccess = primary != output->second.end();
+                        if (frameSuccess) transferFile = primary->source;
+                        else renderError = L"渲染完成但缺少主输出文件";
+                    }
+                    frameRetry = !frameSuccess && retryAfterIdle;
                     bool delivered = SendRemoteResult(
                         item, frame, frameSuccess, frameRetry,
-                        frameSuccess ? output->second : fs::path{}, renderError);
+                        frameSuccess ? transferFile : fs::path{}, renderError);
                     if (!delivered) {
                         std::error_code ignored;
                         fs::path failures = owner->DataDir() / L"failed-results";
@@ -2123,13 +2367,26 @@ struct NodeApp::Impl {
                         if (frame == job.frames.end()) continue;
                         auto output = outputs.find(packagedFrame.frame);
                         bool frameSuccess = output != outputs.end();
+                        fs::path publishedPrimary;
+                        std::wstring publishError;
+                        if (frameSuccess) {
+                            std::map<std::string, fs::path> artifacts;
+                            for (const auto& artifact : output->second)
+                                artifacts[artifact.logicalPath] = artifact.source;
+                            frameSuccess = PublishResultArtifacts(
+                                owner->DataDir(), job, packagedFrame.frame, artifacts,
+                                item.packageId, publishedPrimary, publishError);
+                        }
                         frame->state = frameSuccess ? TaskState::Completed : TaskState::Failed;
                         frame->assignedPackageId.clear();
-                        if (frameSuccess) frame->output = output->second;
-                        frame->error = frameSuccess ? "" : WideToUtf8(renderError);
+                        if (frameSuccess) frame->output = publishedPrimary;
+                        frame->error = frameSuccess ? "" : WideToUtf8(
+                            publishError.empty() ? renderError : publishError);
                     }
                     break;
                 }
+                std::error_code ignored;
+                fs::remove_all(item.outputDir, ignored);
             }
             {
                 std::scoped_lock lock(currentTaskMutex);
@@ -2343,6 +2600,8 @@ std::string NodeApp::SubmitPrepared(
     job.cpuSafeWhileActive = report.cpuSafeWhileActive;
     job.requiresGpu = report.requiresGpu;
     job.requiredAddons = report.addons;
+    job.primaryOutputs = report.primaryOutputs;
+    job.compositorOutputs = report.compositorOutputs;
     job.createdAt = std::chrono::system_clock::now();
     for (int frame = frameStart; frame <= frameEnd; frame += frameStep) {
         FrameTask task;
@@ -2455,6 +2714,43 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Streaming file SHA-256 self-test failed";
             return false;
         }
+        fs::path bundlePrimary = root / L"bundle-primary.bin";
+        fs::path bundlePass = root / L"bundle-pass.exr";
+        std::ofstream(bundlePrimary, std::ios::binary) << "primary";
+        std::ofstream(bundlePass, std::ios::binary) << "pass";
+        fs::path bundle = root / L"result.rmbundle";
+        std::map<std::string, fs::path> extracted;
+        if (!WriteResultBundle(
+                bundle,
+                {{"primary", bundlePrimary},
+                 {"compositor/output-0/ViewLayer/Depth0001.exr", bundlePass}},
+                error) ||
+            !ExtractResultBundle(bundle, root / L"bundle-extracted", extracted, error) ||
+            extracted.size() != 2 || !extracted.contains("primary") ||
+            !extracted.contains("compositor/output-0/ViewLayer/Depth0001.exr")) {
+            report = L"Multi-output result bundle self-test failed: " + error;
+            return false;
+        }
+        fs::path unsafeBundle = root / L"unsafe.rmbundle";
+        {
+            std::ofstream unsafe(unsafeBundle, std::ios::binary | std::ios::trunc);
+            const char magic[8] = {'R', 'M', 'B', 'N', 'D', 'L', '1', '\0'};
+            uint32_t count = 1, pathSize = 8;
+            uint64_t fileSize = 1;
+            unsafe.write(magic, sizeof(magic));
+            unsafe.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            unsafe.write(reinterpret_cast<const char*>(&pathSize), sizeof(pathSize));
+            unsafe.write(reinterpret_cast<const char*>(&fileSize), sizeof(fileSize));
+            unsafe.write("../x.exr", pathSize);
+            unsafe.put('x');
+        }
+        extracted.clear();
+        std::wstring unsafeError;
+        if (ExtractResultBundle(unsafeBundle, root / L"unsafe-extracted", extracted,
+                                unsafeError) || fs::exists(root / L"x.exr")) {
+            report = L"Unsafe result bundle path was accepted";
+            return false;
+        }
         const std::string staleHash(64, 'a');
         fs::path staleCache = ProjectCacheDirectory(root, staleHash);
         fs::create_directories(staleCache);
@@ -2488,21 +2784,23 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Protocol-v2 discovery state was not authenticated";
             return false;
         }
-        json discoveryV4 = discoveryV2;
-        discoveryV4["protocol"] = 4;
-        discoveryV4["project_cache"] = true;
-        discoveryV4["frame_packages"] = true;
-        std::string discoveryV4Proof = DiscoverySignature(signatureConfig, discoveryV4);
-        discoveryV4["frame_packages"] = false;
-        if (ConstantTimeEqual(discoveryV4Proof,
-                              DiscoverySignature(signatureConfig, discoveryV4))) {
-            report = L"Protocol-v4 package capability was not authenticated";
+        json discoveryV5 = discoveryV2;
+        discoveryV5["protocol"] = 5;
+        discoveryV5["project_cache"] = true;
+        discoveryV5["frame_packages"] = true;
+        discoveryV5["result_bundles"] = true;
+        std::string discoveryV5Proof = DiscoverySignature(signatureConfig, discoveryV5);
+        discoveryV5["result_bundles"] = false;
+        if (ConstantTimeEqual(discoveryV5Proof,
+                              DiscoverySignature(signatureConfig, discoveryV5))) {
+            report = L"Protocol-v5 result-bundle capability was not authenticated";
             return false;
         }
         Peer authenticatedPeer;
-        authenticatedPeer.protocolVersion = 4;
+        authenticatedPeer.protocolVersion = 5;
         authenticatedPeer.supportsProjectCache = true;
         authenticatedPeer.supportsFramePackages = true;
+        authenticatedPeer.supportsResultBundles = true;
         authenticatedPeer.name = "SIGNED-NAME";
         authenticatedPeer.cpuPercent = 17;
         authenticatedPeer.idleSeconds = 181;
@@ -2514,8 +2812,8 @@ bool RunSelfTest(std::wstring& report) {
         legacyUpdate.cpuPercent = 99;
         legacyUpdate.idleSeconds = 999;
         PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
-        if (legacyUpdate.protocolVersion != 4 || !legacyUpdate.supportsProjectCache ||
-            !legacyUpdate.supportsFramePackages ||
+        if (legacyUpdate.protocolVersion != 5 || !legacyUpdate.supportsProjectCache ||
+            !legacyUpdate.supportsFramePackages || !legacyUpdate.supportsResultBundles ||
             legacyUpdate.name != "SIGNED-NAME" ||
             legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
             legacyUpdate.cpuModel != "SIGNED-CPU" ||
@@ -2677,6 +2975,12 @@ bool RunSelfTest(std::wstring& report) {
                 preflight.outputFormat = "PNG";
                 preflight.outputExtension = ".png";
                 preflight.cpuSafeWhileActive = true;
+                fs::path finalOutputRoot = root / L"origin-final";
+                for (int frame = 1; frame <= 7; ++frame)
+                    preflight.primaryOutputs[frame] = finalOutputRoot /
+                        (L"primary-" + std::to_wstring(frame) + L".png");
+                preflight.compositorOutputs.push_back(
+                    {"output-0", "SelfTest Multi Output", finalOutputRoot / L"compositor"});
                 std::wstring submitError;
                 std::string jobId = origin.SubmitPrepared(
                     "two-node-self-test", preflight, 1, 7, 1, submitError);
@@ -2702,7 +3006,9 @@ bool RunSelfTest(std::wstring& report) {
                 if (clusterOk) {
                     for (const auto& frame : jobs.back().frames)
                         clusterOk = clusterOk && frame.state == TaskState::Completed &&
-                            fs::exists(frame.output);
+                            fs::exists(frame.output) &&
+                            fs::exists(finalOutputRoot / L"compositor" / L"ViewLayer" /
+                                (L"pass_" + std::to_wstring(frame.frame) + L".exr"));
                     for (size_t index = 0; index < 5; ++index)
                         clusterOk = clusterOk &&
                             jobs.back().frames[index].assignedNodeId == workerConfig.nodeId;

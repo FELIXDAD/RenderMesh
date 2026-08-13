@@ -553,6 +553,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
         };
+        output["primary_outputs"] = json::object();
+        for (const auto& [frame, path] : result.primaryOutputs)
+            output["primary_outputs"][std::to_string(frame)] = WideToUtf8(path.wstring());
+        output["compositor_outputs"] = json::array();
+        for (const auto& target : result.compositorOutputs)
+            output["compositor_outputs"].push_back({
+                {"id", target.id}, {"name", target.name},
+                {"directory", WideToUtf8(target.directory.wstring())}});
         auto dependencies = [](const std::vector<DependencyItem>& values) {
             json rows = json::array();
             for (const auto& item : values)
@@ -573,13 +581,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (!blenderOverride.empty()) renderConfig.blenderPath = blenderOverride;
         if (renderOutputDir.empty()) renderOutputDir = dataDir / L"verification" / L"render";
         std::atomic<bool> stopRequested = false;
-        fs::path output;
         std::wstring renderError;
-        bool ok = RenderBlenderFrame(renderConfig, renderSource, renderOutputDir, renderFrame,
-                                     renderFormat,
-                                     renderFormat == "PNG" ? ".png" :
-                                         renderFormat == "JPEG" ? ".jpg" : ".exr",
-                                     false, stopRequested, output, renderError);
+        bool ok = false;
+        fs::path output;
+        if (!preflightReport.empty() && fs::is_regular_file(preflightReport)) {
+            std::ifstream input(preflightReport, std::ios::binary);
+            json manifest = json::parse(input, nullptr, false);
+            std::vector<OutputTarget> targets;
+            if (!manifest.is_discarded()) {
+                renderFormat = manifest.value("render_format", renderFormat);
+                for (const auto& value : manifest.value("compositor_outputs", json::array()))
+                    targets.push_back({value.value("id", ""), value.value("name", ""), {}});
+            }
+            std::atomic<bool> finishCurrentThenStop = false;
+            std::map<int, std::vector<RenderArtifact>> artifacts;
+            ok = !manifest.is_discarded() && RenderBlenderPackage(
+                renderConfig, renderSource, renderOutputDir, {renderFrame}, renderFormat,
+                manifest.value("file_extension", ".png"), false, false, stopRequested,
+                finishCurrentThenStop, targets, artifacts, renderError);
+            if (ok && artifacts.contains(renderFrame)) {
+                auto primary = std::find_if(
+                    artifacts[renderFrame].begin(), artifacts[renderFrame].end(),
+                    [](const RenderArtifact& artifact) {
+                        return artifact.logicalPath == "primary";
+                    });
+                if (primary != artifacts[renderFrame].end()) output = primary->source;
+            }
+        } else {
+            ok = RenderBlenderFrame(renderConfig, renderSource, renderOutputDir, renderFrame,
+                                    renderFormat,
+                                    renderFormat == "PNG" ? ".png" :
+                                        renderFormat == "JPEG" ? ".jpg" : ".exr",
+                                    false, stopRequested, output, renderError);
+        }
         PrintToParentConsole(ok ? L"渲染成功：" + output.wstring() : renderError);
         return ok ? 0 : 4;
     }
