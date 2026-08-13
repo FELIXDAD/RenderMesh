@@ -36,6 +36,7 @@ std::string NewInviteCode();
 bool IsInviteCode(const std::string& value);
 bool IsSafeOutputExtension(const std::string& value);
 std::string Sha256Prefix(const std::string& value, size_t chars = 16);
+std::string Sha256File(const fs::path& path);
 std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
 fs::path DefaultDataDirectory();
@@ -158,6 +159,7 @@ struct RenderJob {
     std::string id;
     std::string name;
     fs::path preparedBlend;
+    std::string projectHash;
     std::string outputFormat = "PNG";
     std::string outputExtension = ".png";
     std::string blenderVersion;
@@ -193,7 +195,9 @@ struct WorkItem {
     std::string taskId;
     std::string jobId;
     int frame = 1;
+    std::string projectHash;
     fs::path blend;
+    fs::path temporaryTaskDir;
     fs::path outputDir;
     std::string outputFormat;
     std::string outputExtension;

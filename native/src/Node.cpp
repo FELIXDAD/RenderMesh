@@ -49,6 +49,13 @@ bool SafeId(const std::string& value) {
     });
 }
 
+bool SafeSha256(const std::string& value) {
+    return value.size() == 64 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        });
+}
+
 int HeaderInt(const httplib::Request& request, const char* name, int fallback = 0) {
     try {
         return std::stoi(request.get_header_value(name));
@@ -228,6 +235,102 @@ void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     candidate.gpuModels = existing.gpuModels;
 }
 
+fs::path ProjectCacheDirectory(const fs::path& dataDir, const std::string& hash) {
+    return dataDir / L"cache" / L"projects" / Utf8ToWide(hash);
+}
+
+bool CacheEntryValid(const fs::path& dataDir, const std::string& hash) {
+    if (!SafeSha256(hash)) return false;
+    fs::path directory = ProjectCacheDirectory(dataDir, hash);
+    fs::path source = directory / L"source.blend";
+    fs::path metadata = directory / L"cache-entry.json";
+    if (!fs::is_regular_file(source) || !fs::is_regular_file(metadata)) return false;
+    try {
+        std::ifstream input(metadata, std::ios::binary);
+        json value = json::parse(input);
+        return value.value("project_hash", "") == hash;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool CacheMetadataMatches(
+    const fs::path& dataDir, const std::string& hash, const std::string& version,
+    const std::string& engine, bool requiresGpu, const std::vector<std::string>& addons) {
+    if (!CacheEntryValid(dataDir, hash)) return false;
+    try {
+        std::ifstream input(ProjectCacheDirectory(dataDir, hash) / L"cache-entry.json",
+                            std::ios::binary);
+        json value = json::parse(input);
+        return value.value("blender_version", "") == version &&
+            value.value("render_engine", "") == engine &&
+            value.value("requires_gpu", false) == requiresGpu &&
+            value.value("addons", std::vector<std::string>{}) == addons;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool WriteCacheMetadata(
+    const fs::path& dataDir, const std::string& hash, const std::string& version,
+    const std::string& engine, bool requiresGpu, const std::vector<std::string>& addons,
+    std::wstring& error) {
+    fs::path destination = ProjectCacheDirectory(dataDir, hash) / L"cache-entry.json";
+    fs::path temporary = destination;
+    temporary += L".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << json{{"project_hash", hash}, {"blender_version", version},
+                       {"render_engine", engine}, {"requires_gpu", requiresGpu},
+                       {"addons", addons}}.dump(2);
+        output.flush();
+        if (!output) {
+            error = L"无法写入工程缓存元数据";
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = LastErrorMessage();
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+void TouchCacheEntry(const fs::path& dataDir, const std::string& hash) {
+    fs::path marker = ProjectCacheDirectory(dataDir, hash) / L"last-used";
+    std::ofstream output(marker, std::ios::binary | std::ios::trunc);
+    output << "used";
+}
+
+size_t CleanupExpiredProjectCaches(
+    const fs::path& dataDir,
+    fs::file_time_type now = fs::file_time_type::clock::now(),
+    std::chrono::hours maxAge = std::chrono::hours(24 * 7)) {
+    fs::path root = dataDir / L"cache" / L"projects";
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) return 0;
+    size_t removed = 0;
+    for (const auto& entry : fs::directory_iterator(root, ec)) {
+        if (ec || !entry.is_directory(ec)) continue;
+        std::string hash = WideToUtf8(entry.path().filename().wstring());
+        if (!SafeSha256(hash)) continue;
+        fs::path marker = entry.path() / L"last-used";
+        fs::path source = entry.path() / L"source.blend";
+        fs::file_time_type lastUsed = fs::last_write_time(
+            fs::exists(marker, ec) ? marker : source, ec);
+        if (ec || now - lastUsed <= maxAge) {
+            ec.clear();
+            continue;
+        }
+        uintmax_t count = fs::remove_all(entry.path(), ec);
+        if (!ec && count) ++removed;
+        ec.clear();
+    }
+    return removed;
+}
+
 httplib::Result PostFile(
     const std::string& host,
     int port,
@@ -297,6 +400,7 @@ struct NodeApp::Impl {
     mutable std::mutex manualStatusMutex;
     std::wstring manualStatus;
     std::mutex workMutex;
+    std::mutex cacheMutex;
     std::mutex pairingMutex;
     std::map<std::string, std::deque<std::chrono::steady_clock::time_point>> pairingAttempts;
     std::condition_variable workCv;
@@ -312,6 +416,7 @@ struct NodeApp::Impl {
     std::thread manualPeerThread;
     std::thread schedulerThread;
     std::thread workerThread;
+    std::thread cacheThread;
 
     void Notify() {
         std::function<void()> callback;
@@ -332,6 +437,18 @@ struct NodeApp::Impl {
     void SetManualStatus(std::wstring value) {
         std::scoped_lock lock(manualStatusMutex);
         manualStatus = std::move(value);
+    }
+
+    void CacheMaintenanceLoop() {
+        while (!stopRequested.load()) {
+            if (workerAssigned.load() == 0) {
+                std::scoped_lock lock(cacheMutex);
+                size_t removed = CleanupExpiredProjectCaches(owner->DataDir());
+                if (removed)
+                    LogInfo("expired project caches removed=" + std::to_string(removed));
+            }
+            for (int step = 0; step < 600 && !stopRequested.load(); ++step) Sleep(100);
+        }
     }
 
     void PersistJobs() {
@@ -357,6 +474,7 @@ struct NodeApp::Impl {
                 rows.push_back({
                     {"id", job.id}, {"name", job.name},
                     {"blend", WideToUtf8(job.preparedBlend.wstring())},
+                    {"project_hash", job.projectHash},
                     {"format", job.outputFormat}, {"extension", job.outputExtension},
                     {"version", job.blenderVersion},
                     {"render_engine", job.renderEngine},
@@ -392,6 +510,9 @@ struct NodeApp::Impl {
                 job.id = row.value("id", "");
                 job.name = row.value("name", "");
                 job.preparedBlend = Utf8ToWide(row.value("blend", ""));
+                job.projectHash = row.value("project_hash", "");
+                if (!SafeSha256(job.projectHash) && fs::is_regular_file(job.preparedBlend))
+                    job.projectHash = Sha256File(job.preparedBlend);
                 job.outputFormat = row.value("format", "PNG");
                 job.outputExtension = row.value("extension", FrameExtension(job.outputFormat));
                 job.blenderVersion = row.value("version", "");
@@ -531,6 +652,248 @@ struct NodeApp::Impl {
             }.dump(), "application/json");
             LogInfo("approved LAN pairing for node " + clientNodeId);
         });
+        server.Get("/v2/cache/status", [&](const httplib::Request& request,
+                                             httplib::Response& response) {
+            Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
+                !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                   config.clusterToken)) {
+                response.status = 401;
+                return;
+            }
+            std::string hash = request.has_param("hash") ? request.get_param_value("hash") : "";
+            std::string version = request.get_header_value("X-RM-Blender");
+            std::string engine = request.get_header_value("X-RM-Engine");
+            bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
+            auto addons = HeaderStringList(request, "X-RM-Addons");
+            if (!SafeSha256(hash) || version.empty() || engine.empty()) {
+                response.status = 422;
+                return;
+            }
+            std::scoped_lock lock(cacheMutex);
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
+                                      requiresGpu, addons)) {
+                response.status = 404;
+                return;
+            }
+            response.set_content(json{{"cached", true}, {"project_hash", hash}}.dump(),
+                                 "application/json");
+        });
+        server.Post(
+            "/v2/cache",
+            [&](const httplib::Request& request, httplib::Response& response,
+                const httplib::ContentReader& reader) {
+                Config config = owner->GetConfig();
+                if (config.pairingPending || config.clusterToken.size() < 16 ||
+                    !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                       config.clusterToken)) {
+                    response.status = 401;
+                    return;
+                }
+                if (!config.shareEnabled) {
+                    response.status = 409;
+                    response.set_content("compute sharing is disabled", "text/plain");
+                    return;
+                }
+                std::string hash = request.get_header_value("X-RM-Project");
+                std::string version = request.get_header_value("X-RM-Blender");
+                std::string engine = request.get_header_value("X-RM-Engine");
+                bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
+                bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
+                auto addons = HeaderStringList(request, "X-RM-Addons");
+                if (!SafeSha256(hash) || version.empty() || engine.empty()) {
+                    response.status = 422;
+                    return;
+                }
+                if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                    response.status = 425;
+                    response.set_content("GPU project waits until this computer is idle",
+                                         "text/plain");
+                    return;
+                }
+                if (!HasTransferCapacity(request, owner->DataDir())) {
+                    response.status = 507;
+                    return;
+                }
+                std::unique_lock cacheLock(cacheMutex);
+                if (CacheMetadataMatches(owner->DataDir(), hash, version, engine,
+                                         requiresGpu, addons)) {
+                    TouchCacheEntry(owner->DataDir(), hash);
+                    response.status = 200;
+                    response.set_content("already cached", "text/plain");
+                    return;
+                }
+                int expectedAssigned = 0;
+                if (!workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
+                    response.status = 409;
+                    response.set_content("worker is busy", "text/plain");
+                    return;
+                }
+                struct CacheReservation {
+                    std::atomic<int>& count;
+                    ~CacheReservation() { --count; }
+                } reservation{workerAssigned};
+                fs::path directory = ProjectCacheDirectory(owner->DataDir(), hash);
+                fs::path blend = directory / L"source.blend";
+                std::wstring receiveError;
+                if (!StreamRequestToFile(reader, blend, receiveError)) {
+                    response.status = 500;
+                    response.set_content(WideToUtf8(receiveError), "text/plain");
+                    return;
+                }
+                if (Sha256File(blend) != hash) {
+                    std::error_code ignored;
+                    fs::remove_all(directory, ignored);
+                    response.status = 422;
+                    response.set_content("project hash mismatch", "text/plain");
+                    return;
+                }
+                if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                    std::error_code ignored;
+                    fs::remove_all(directory, ignored);
+                    response.status = 425;
+                    response.set_content("computer became active during project upload",
+                                         "text/plain");
+                    return;
+                }
+                std::wstring compatibility;
+                std::atomic<bool> compatibilityStop = false;
+                std::atomic<bool> resumedInput = false;
+                std::atomic<bool>* effectiveStop = &stopRequested;
+                std::thread compatibilityGuard;
+                if (!owner->mockRenderer_ && !cpuSafe) {
+                    effectiveStop = &compatibilityStop;
+                    compatibilityGuard = std::thread([&] {
+                        while (!compatibilityStop.load()) {
+                            if (stopRequested.load()) {
+                                compatibilityStop = true;
+                                break;
+                            }
+                            if (IdleSeconds() < config.idleAfterSeconds) {
+                                resumedInput = true;
+                                compatibilityStop = true;
+                                break;
+                            }
+                            Sleep(250);
+                        }
+                    });
+                }
+                bool compatible = owner->mockRenderer_ || CheckWorkerCompatibility(
+                    config, owner->DataDir(), blend, version, engine, requiresGpu, addons,
+                    *effectiveStop, compatibility);
+                compatibilityStop = true;
+                if (compatibilityGuard.joinable()) compatibilityGuard.join();
+                if (!compatible) {
+                    std::error_code ignored;
+                    fs::remove_all(directory, ignored);
+                    response.status = resumedInput.load() ? 425 : 409;
+                    if (resumedInput.load())
+                        compatibility = L"电脑恢复使用，已中止工程缓存兼容性检查";
+                    response.set_content(WideToUtf8(compatibility),
+                                         "text/plain; charset=utf-8");
+                    return;
+                }
+                if (!WriteCacheMetadata(owner->DataDir(), hash, version, engine,
+                                        requiresGpu, addons, receiveError)) {
+                    response.status = 500;
+                    response.set_content(WideToUtf8(receiveError), "text/plain; charset=utf-8");
+                    return;
+                }
+                TouchCacheEntry(owner->DataDir(), hash);
+                response.status = 201;
+                response.set_content("cached", "text/plain");
+                LogInfo("project cached; hash=" + hash.substr(0, 16));
+            });
+        server.Post("/v2/task", [&](const httplib::Request& request,
+                                      httplib::Response& response) {
+            Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
+                !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                   config.clusterToken)) {
+                response.status = 401;
+                return;
+            }
+            if (!config.shareEnabled) {
+                response.status = 409;
+                response.set_content("compute sharing is disabled", "text/plain");
+                return;
+            }
+            std::string taskId = request.get_header_value("X-RM-Task");
+            std::string jobId = request.get_header_value("X-RM-Job");
+            std::string hash = request.get_header_value("X-RM-Project");
+            int frame = HeaderInt(request, "X-RM-Frame", 0);
+            int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
+            std::string format = request.get_header_value("X-RM-Format");
+            std::string extension = request.get_header_value("X-RM-Extension");
+            std::string version = request.get_header_value("X-RM-Blender");
+            std::string engine = request.get_header_value("X-RM-Engine");
+            bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
+            bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
+            std::string attemptToken = request.get_header_value("X-RM-Attempt");
+            auto addons = HeaderStringList(request, "X-RM-Addons");
+            if (!SafeId(taskId) || !SafeId(jobId) || !SafeSha256(hash) || frame < 1 ||
+                frame > 1000000 || originPort < 1024 || originPort > 65535 ||
+                !SafeId(attemptToken) || format.empty() ||
+                !IsSafeOutputExtension(extension)) {
+                response.status = 422;
+                return;
+            }
+            if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                response.status = 425;
+                response.set_content("GPU task waits until this computer is idle", "text/plain");
+                return;
+            }
+            std::unique_lock cacheLock(cacheMutex);
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
+                                      requiresGpu, addons)) {
+                response.status = 404;
+                response.set_content("project cache miss", "text/plain");
+                return;
+            }
+            int expectedAssigned = 0;
+            if (!workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
+                response.status = 409;
+                response.set_content("worker is busy", "text/plain");
+                return;
+            }
+            struct AssignmentReservation {
+                std::atomic<int>& count;
+                bool handedOff = false;
+                ~AssignmentReservation() { if (!handedOff) --count; }
+            } reservation{workerAssigned};
+            TouchCacheEntry(owner->DataDir(), hash);
+            fs::path taskDir = owner->DataDir() / L"incoming" / Utf8ToWide(taskId);
+            WorkItem item;
+            item.taskId = taskId;
+            item.jobId = jobId;
+            item.frame = frame;
+            item.projectHash = hash;
+            item.blend = ProjectCacheDirectory(owner->DataDir(), hash) / L"source.blend";
+            item.temporaryTaskDir = taskDir;
+            item.outputDir = taskDir / L"outputs";
+            item.outputFormat = format;
+            item.outputExtension = extension;
+            item.blenderVersion = version;
+            item.renderEngine = engine;
+            item.cpuSafeWhileActive = cpuSafe;
+            item.requiresGpu = requiresGpu;
+            item.requiredAddons = std::move(addons);
+            item.attemptToken = attemptToken;
+            item.remote = true;
+            item.originAddress = request.remote_addr;
+            item.originPort = originPort;
+            {
+                std::scoped_lock lock(workMutex);
+                work.push(std::move(item));
+            }
+            reservation.handedOff = true;
+            cacheLock.unlock();
+            workCv.notify_one();
+            Notify();
+            response.status = 202;
+            response.set_content("accepted cached project", "text/plain");
+            LogInfo("accepted cached task " + taskId + "; project=" + hash.substr(0, 16));
+        });
         server.Get("/v1/prove", [&](const httplib::Request& request,
                                      httplib::Response& response) {
             std::string challenge = request.has_param("challenge")
@@ -667,6 +1030,7 @@ struct NodeApp::Impl {
                 item.jobId = jobId;
                 item.frame = frame;
                 item.blend = blend;
+                item.temporaryTaskDir = taskDir;
                 item.outputDir = taskDir / L"outputs";
                 item.outputFormat = format;
                 item.outputExtension = extension;
@@ -1105,6 +1469,7 @@ struct NodeApp::Impl {
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
             {"X-RM-Job", job.id}, {"X-RM-Frame", std::to_string(frame.frame)},
+            {"X-RM-Project", job.projectHash},
             {"X-RM-Format", job.outputFormat}, {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Extension", job.outputExtension},
             {"X-RM-Engine", job.renderEngine},
@@ -1114,8 +1479,47 @@ struct NodeApp::Impl {
             {"X-RM-Addons", json(job.requiredAddons).dump()},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
-        auto result = PostFile(peer.address, peer.httpPort, "/v1/task", headers,
-                               job.preparedBlend, &stopRequested);
+        httplib::Result result;
+        if (peer.protocolVersion >= 2 && SafeSha256(job.projectHash)) {
+            httplib::Client cacheClient(peer.address, peer.httpPort);
+            cacheClient.set_connection_timeout(3, 0);
+            cacheClient.set_read_timeout(5, 0);
+            cacheClient.set_write_timeout(5, 0);
+            httplib::Headers cacheStatusHeaders = {
+                {"X-RM-Token", config.clusterToken},
+                {"X-RM-Blender", job.blenderVersion},
+                {"X-RM-Engine", job.renderEngine},
+                {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
+                {"X-RM-Addons", json(job.requiredAddons).dump()},
+            };
+            auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
+                                          cacheStatusHeaders);
+            if (!status || status->status == 404) {
+                httplib::Headers cacheHeaders = {
+                    {"X-RM-Token", config.clusterToken},
+                    {"X-RM-Project", job.projectHash},
+                    {"X-RM-Blender", job.blenderVersion},
+                    {"X-RM-Engine", job.renderEngine},
+                    {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+                    {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
+                    {"X-RM-Addons", json(job.requiredAddons).dump()},
+                };
+                auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", cacheHeaders,
+                                       job.preparedBlend, &stopRequested);
+                if (!upload || (upload->status != 200 && upload->status != 201)) {
+                    error = upload && !upload->body.empty() ? upload->body
+                        : "project cache upload failed";
+                    return false;
+                }
+            } else if (status->status != 200) {
+                error = status->body.empty() ? "project cache query failed" : status->body;
+                return false;
+            }
+            result = cacheClient.Post("/v2/task", headers, "", "application/octet-stream");
+        } else {
+            result = PostFile(peer.address, peer.httpPort, "/v1/task", headers,
+                              job.preparedBlend, &stopRequested);
+        }
         if (!result) {
             error = "network error: " + httplib::to_string(result.error());
             return false;
@@ -1396,7 +1800,13 @@ struct NodeApp::Impl {
                 // lost delivery. Keep only a small diagnostic record, never an
                 // unbounded copy of the received project and frame output.
                 std::error_code ignored;
-                fs::remove_all(item.blend.parent_path(), ignored);
+                fs::remove_all(item.temporaryTaskDir.empty()
+                                   ? item.blend.parent_path() : item.temporaryTaskDir,
+                               ignored);
+                if (!item.projectHash.empty()) {
+                    std::scoped_lock lock(cacheMutex);
+                    TouchCacheEntry(owner->DataDir(), item.projectHash);
+                }
             } else {
                 std::scoped_lock lock(stateMutex);
                 for (auto& job : jobs) {
@@ -1462,6 +1872,7 @@ bool NodeApp::Start(std::wstring& error) {
     impl_->manualPeerThread = std::thread([this] { impl_->ManualPeerLoop(); });
     impl_->schedulerThread = std::thread([this] { impl_->SchedulerLoop(); });
     impl_->workerThread = std::thread([this] { impl_->WorkerLoop(); });
+    impl_->cacheThread = std::thread([this] { impl_->CacheMaintenanceLoop(); });
     LogInfo("node started; id=" + config.nodeId + "; port=" +
             std::to_string(config.httpPort));
     return true;
@@ -1477,6 +1888,7 @@ void NodeApp::Stop() {
     if (impl_->manualPeerThread.joinable()) impl_->manualPeerThread.join();
     if (impl_->schedulerThread.joinable()) impl_->schedulerThread.join();
     if (impl_->workerThread.joinable()) impl_->workerThread.join();
+    if (impl_->cacheThread.joinable()) impl_->cacheThread.join();
     WSACleanup();
     LogInfo("node stopped");
 }
@@ -1607,6 +2019,11 @@ std::string NodeApp::SubmitPrepared(
     job.id = id;
     job.name = std::move(name);
     job.preparedBlend = source;
+    job.projectHash = Sha256File(source);
+    if (!SafeSha256(job.projectHash)) {
+        error = L"无法计算已打包工程的 SHA-256";
+        return {};
+    }
     job.outputFormat = report.outputFormat;
     job.outputExtension = report.outputExtension;
     job.blenderVersion = report.blenderVersion;
@@ -1707,6 +2124,32 @@ bool RunSelfTest(std::wstring& report) {
         if (HmacSha256("key", "The quick brown fox jumps over the lazy dog") !=
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") {
             report = L"HMAC-SHA256 自检失败";
+            return false;
+        }
+        fs::path hashFixture = root / L"sha256-fixture.bin";
+        {
+            std::ofstream fixture(hashFixture, std::ios::binary | std::ios::trunc);
+            fixture << "abc";
+        }
+        if (Sha256File(hashFixture) !=
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+            report = L"Streaming file SHA-256 self-test failed";
+            return false;
+        }
+        const std::string staleHash(64, 'a');
+        fs::path staleCache = ProjectCacheDirectory(root, staleHash);
+        fs::create_directories(staleCache);
+        {
+            std::ofstream(staleCache / L"source.blend", std::ios::binary) << "cached";
+            std::ofstream(staleCache / L"cache-entry.json", std::ios::binary)
+                << json{{"project_hash", staleHash}}.dump();
+        }
+        TouchCacheEntry(root, staleHash);
+        auto cacheNow = fs::file_time_type::clock::now();
+        fs::last_write_time(staleCache / L"last-used", cacheNow - std::chrono::hours(24 * 8));
+        if (!CacheEntryValid(root, staleHash) ||
+            CleanupExpiredProjectCaches(root, cacheNow) != 1 || fs::exists(staleCache)) {
+            report = L"Seven-day project cache cleanup self-test failed";
             return false;
         }
         Config signatureConfig;
@@ -1926,6 +2369,8 @@ bool RunSelfTest(std::wstring& report) {
                     for (const auto& frame : jobs.back().frames)
                         clusterOk = clusterOk && frame.state == TaskState::Completed &&
                             fs::exists(frame.output);
+                    clusterOk = clusterOk && SafeSha256(jobs.back().projectHash) &&
+                        CacheEntryValid(workerRoot, jobs.back().projectHash);
                 }
                 if (clusterOk) {
                     worker.Stop();

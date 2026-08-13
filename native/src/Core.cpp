@@ -608,6 +608,38 @@ std::string Sha256Prefix(const std::string& value, size_t chars) {
     return output.str().substr(0, chars);
 }
 
+std::string Sha256File(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0, resultSize = 0;
+    std::array<unsigned char, 32> digest{};
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return {};
+    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                      reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
+    std::vector<unsigned char> object(objectSize);
+    bool ok = BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) == 0;
+    std::array<char, 1024 * 1024> buffer{};
+    while (ok && input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize count = input.gcount();
+        if (count > 0)
+            ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()),
+                                static_cast<ULONG>(count), 0) == 0;
+    }
+    ok = ok && !input.bad() &&
+        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
+    if (hash) BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!ok) return {};
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
+    return output.str();
+}
+
 std::string HmacSha256(const std::string& key, const std::string& value) {
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;

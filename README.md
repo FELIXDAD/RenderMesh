@@ -8,7 +8,7 @@ RenderMesh 是面向公司内网 Windows 10/11 工作站的轻量级 Blender 帧
 - 共享算力默认关闭；用户主动开启后才接收别人的任务。
 - 主路径针对 Eevee 和 Cycles GPU：只在电脑连续空闲（默认 3 分钟）后接单；若键鼠恢复，会中止该次渲染并安全重派。
 - 极少数 Cycles CPU 任务才使用 Windows Job Object 进程树硬上限：活跃时默认 15%，空闲后 100%，可在界面修改。
-- 动画按帧拆分，使用流式 HTTP 发送已打包的 `.blend`，Worker 渲染后将单帧结果回传 Origin。
+- 动画按帧拆分；已打包的 `.blend` 先按 SHA-256 查询 Worker 缓存，仅首次缺失时流式上传，Worker 渲染后将单帧结果回传 Origin。
 - 界面显示在线电脑、CPU/GPU 型号、信任状态、共享/活跃/空闲状态、CPU 限额、已分配帧数和任务进度。
 - 六位数字邀请码直接显示；内部仍使用随机长凭证完成发现、任务和结果鉴权。
 - 配置和队列持久化到 `%LOCALAPPDATA%\RenderMesh`，写入使用临时文件原子替换；后台日志按日期写入 `logs` 目录。
@@ -51,13 +51,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\native\build.ps1 -Conf
 Start-Process .\native\build\Release\RenderMesh.exe -ArgumentList '--self-test','--no-dialog' -Wait
 ```
 
-内置自检覆盖配置持久化、HMAC、2 MiB 流式传输、CPU 15%→100% Job Object 策略、两个真实 HTTP 节点之间三帧任务的分发/回传、远端节点接单后掉线时自动重派，以及过期租约回传拒绝（渲染器使用测试桩）。真实 Blender 预检与渲染验证步骤见 [验证记录](docs/VERIFICATION.md)。
+内置自检覆盖配置持久化、HMAC、文件 SHA-256、七天缓存清理、2 MiB 流式传输、CPU 15%→100% Job Object 策略、两个真实 HTTP 节点之间三帧任务经内容缓存分发/回传、远端节点接单后掉线时自动重派，以及过期租约回传拒绝（渲染器使用测试桩）。真实 Blender 预检与渲染验证步骤见 [验证记录](docs/VERIFICATION.md)。
 
 ## 当前边界
 
 - 只支持动画按帧拆分，不拆分同一帧的 Cycles samples。
 - 每台 Worker 同时运行一个 Blender 进程。
-- 已打包工程目前会逐帧上传，尚无内容哈希缓存；大型工程会重复占用局域网带宽。Worker 回传后会删除该帧临时工程；回传失败只保留小型诊断记录，避免磁盘无限增长。
+- 已打包工程使用完整 SHA-256 作为 Worker 缓存键；同一工程只在缓存缺失或 Blender/引擎/GPU/插件兼容条件变化时重新上传。最后一次任务执行超过七天后自动清理工程缓存；每帧输出临时目录在回传后立即删除，回传失败只保留小型诊断记录。
 - HTTP 数据面没有 TLS，集群码也不是企业身份系统；只应部署在可信公司 LAN/VLAN，不能暴露到互联网。
 - CPU 可以硬限额；Windows 没有跨 NVIDIA/AMD/Intel 的通用 GPU 百分比硬配额，因此 GPU/未知渲染器采用更保守的“仅空闲运行”策略。
 - EXE 当前未做商业代码签名，Windows SmartScreen 可能显示未知发布者；发布到全公司前建议由 IT 使用公司证书签名。
