@@ -172,7 +172,7 @@ bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring
 const char* kPreflightScript = R"PY(import bpy, addon_utils, json, os, sys, glob, re, traceback
 
 args = sys.argv[sys.argv.index('--') + 1:]
-prepared, report_path = args[0], args[1]
+prepared, report_path, validation_frame = args[0], args[1], int(args[2])
 warnings = []
 
 def path_key(path):
@@ -329,7 +329,8 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
                                     not uses_optix_denoiser and not uses_compositor),
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
           'addons': sorted(enabled_addons),
-          'missing': [], 'unpacked': [], 'warnings': warnings}
+          'missing': [], 'unpacked': [], 'warnings': warnings,
+          'validation_render': False, 'validation_error': ''}
 try:
     before = gather()
     report['missing'] = [dict(x, path=missing) for x in before
@@ -345,9 +346,32 @@ try:
                              for missing in x.get('missing_paths', [])]
         report['unpacked'] = [dict(x, path=unpacked) for x in after
                               for unpacked in x.get('unpacked_paths', [])]
-        report['pass'] = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
+        assets_ok = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
+        if assets_ok:
+            undefined_nodes = []
+            for tree in bpy.data.node_groups:
+                for node in tree.nodes:
+                    if getattr(node, 'bl_idname', '') == 'NodeUndefined' or node.type == 'UNDEFINED':
+                        undefined_nodes.append(f'{tree.name}/{node.name}')
+            if undefined_nodes:
+                raise RuntimeError('Undefined nodes, likely missing add-on: ' +
+                                   ', '.join(undefined_nodes[:12]))
+            scene = bpy.context.scene
+            scene.frame_set(validation_frame)
+            scene.render.resolution_x = min(max(1, scene.render.resolution_x), 64)
+            scene.render.resolution_y = min(max(1, scene.render.resolution_y), 64)
+            scene.render.resolution_percentage = 100
+            if scene.render.engine == 'CYCLES':
+                scene.cycles.samples = 1
+                scene.cycles.use_denoising = False
+            render_result = bpy.ops.render.render(write_still=False)
+            if 'FINISHED' not in render_result:
+                raise RuntimeError(f'Validation render returned {render_result}')
+            report['validation_render'] = True
+            report['pass'] = True
 except Exception:
-    warnings.append(traceback.format_exc())
+    report['validation_error'] = traceback.format_exc()
+    warnings.append(report['validation_error'])
 with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(report, f, ensure_ascii=False, indent=2)
 )PY";
@@ -613,6 +637,7 @@ PreflightReport PreflightBlend(
     const fs::path& dataDir,
     const fs::path& source,
     const fs::path& prepared,
+    int validationFrame,
     std::atomic<bool>* stopRequested) {
     PreflightReport report;
     fs::path blender = FindBlender(config);
@@ -636,7 +661,7 @@ PreflightReport PreflightBlend(
     ProcessResult process = RunProcess(
         blender,
         {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
-         prepared.wstring(), reportPath.wstring()},
+         prepared.wstring(), reportPath.wstring(), std::to_wstring(validationFrame)},
         log, nullptr, stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
         report.summary = L"Blender 预检失败。请查看：" + log.wstring();
@@ -652,6 +677,7 @@ PreflightReport PreflightBlend(
         report.requiresGpu = data.value("requires_gpu", false);
         report.addons = data.value("addons", std::vector<std::string>{});
         report.warnings = data.value("warnings", std::vector<std::string>{});
+        std::string validationError = data.value("validation_error", std::string{});
         auto parseDependencies = [](const json& values) {
             std::vector<DependencyItem> result;
             for (const auto& item : values) {
@@ -673,6 +699,9 @@ PreflightReport PreflightBlend(
             const auto& rows = report.missing.empty() ? report.unpacked : report.missing;
             for (size_t i = 0; i < std::min<size_t>(rows.size(), 5); ++i)
                 report.summary += L"\n• " + Utf8ToWide(rows[i].path);
+            if (rows.empty() && !validationError.empty())
+                report.summary += L"\n验证渲染失败；可能是相机、插件、节点或渲染引擎错误。详见：" +
+                    log.wstring();
         }
     } catch (const std::exception& exception) {
         report.summary = L"无法读取预检报告：" + Utf8ToWide(exception.what());
