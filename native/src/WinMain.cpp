@@ -20,7 +20,7 @@ enum ControlId {
     ID_NODE_NAME,
     ID_CPU_SLIDER,
     ID_CPU_VALUE,
-    ID_IDLE_MINUTES,
+    ID_IDLE_SECONDS,
     ID_BLENDER_PATH,
     ID_BROWSE_BLENDER,
     ID_CLUSTER_TOKEN,
@@ -32,7 +32,6 @@ enum ControlId {
     ID_FRAME_START,
     ID_FRAME_END,
     ID_FRAME_STEP,
-    ID_OUTPUT_FORMAT,
     ID_SUBMIT,
     ID_PREFLIGHT,
     ID_NODES,
@@ -150,9 +149,9 @@ void LoadConfigIntoUi() {
                  config.shareEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(ID_CPU_SLIDER), TBM_SETPOS, TRUE, config.activeCpuPercent);
     SetText(ID_CPU_VALUE, std::to_wstring(config.activeCpuPercent) + L"%");
-    SetText(ID_IDLE_MINUTES, std::to_wstring(config.idleAfterSeconds / 60.0));
+    SetText(ID_IDLE_SECONDS, std::to_wstring(config.idleAfterSeconds));
     SetText(ID_BLENDER_PATH, config.blenderPath.wstring());
-    SetText(ID_CLUSTER_TOKEN, Utf8ToWide(config.clusterToken));
+    SetText(ID_CLUSTER_TOKEN, Utf8ToWide(config.inviteCode));
     SetText(ID_MANUAL_ENDPOINT, Utf8ToWide(config.manualPeerEndpoint));
 }
 
@@ -161,9 +160,9 @@ Config ReadConfigFromUi() {
     config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
     config.shareEnabled = SendMessageW(Item(ID_SHARE), BM_GETCHECK, 0, 0) == BST_CHECKED;
     config.activeCpuPercent = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
-    config.idleAfterSeconds = std::max(30, static_cast<int>(IntValue(ID_IDLE_MINUTES, 3) * 60));
+    config.idleAfterSeconds = std::clamp(IntValue(ID_IDLE_SECONDS, 180), 1, 86400);
     config.blenderPath = Text(Item(ID_BLENDER_PATH));
-    config.clusterToken = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
+    config.inviteCode = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
     return config;
 }
 
@@ -174,8 +173,12 @@ bool SaveSettings() {
         MessageBoxW(gWindow, error.c_str(), L"设置未保存", MB_ICONERROR);
         return false;
     }
-    MessageBoxW(gWindow, L"设置已保存。共享开关和空闲策略立即生效。", L"RenderMesh",
-                MB_ICONINFORMATION);
+    Config saved = gApp->GetConfig();
+    MessageBoxW(gWindow,
+                saved.pairingPending
+                    ? L"邀请码已保存，正在局域网中寻找使用该邀请码的电脑进行配对。"
+                    : L"设置已保存。共享开关和空闲策略立即生效。",
+                L"RenderMesh", MB_ICONINFORMATION);
     return true;
 }
 
@@ -200,6 +203,7 @@ void ConnectManualPeer() {
 void RefreshLists() {
     if (!gApp) return;
     auto peers = gApp->Peers();
+    HardwareInfo hardware = gApp->Hardware();
     Config config = gApp->GetConfig();
     std::wstring manualStatus = gApp->ManualPeerStatus();
     if (!manualStatus.empty()) SetText(ID_MANUAL_STATUS, manualStatus);
@@ -213,7 +217,14 @@ void RefreshLists() {
         : L"未共享");
     SetCell(nodes, row, 3, std::to_wstring(config.activeCpuPercent) + L"%");
     SetCell(nodes, row, 4, std::to_wstring(gApp->AssignedCount()));
-    SetCell(nodes, row, 5, LocalEndpointSummary(config.httpPort));
+    SetCell(nodes, row, 5, Utf8ToWide(hardware.cpuModel));
+    std::wstring localGpus;
+    for (const auto& gpu : hardware.gpuModels) {
+        if (!localGpus.empty()) localGpus += L" / ";
+        localGpus += Utf8ToWide(gpu);
+    }
+    SetCell(nodes, row, 6, localGpus.empty() ? L"未检测到" : localGpus);
+    SetCell(nodes, row, 7, LocalEndpointSummary(config.httpPort));
     for (const auto& peer : peers) {
         ++row;
         SetCell(nodes, row, 0, Utf8ToWide(peer.name));
@@ -224,7 +235,14 @@ void RefreshLists() {
             : L"未共享");
         SetCell(nodes, row, 3, std::to_wstring(peer.cpuPercent) + L"%");
         SetCell(nodes, row, 4, std::to_wstring(peer.assigned));
-        SetCell(nodes, row, 5, Utf8ToWide(peer.address) + L":" + std::to_wstring(peer.httpPort));
+        SetCell(nodes, row, 5, peer.cpuModel.empty() ? L"未报告" : Utf8ToWide(peer.cpuModel));
+        std::wstring remoteGpus;
+        for (const auto& gpu : peer.gpuModels) {
+            if (!remoteGpus.empty()) remoteGpus += L" / ";
+            remoteGpus += Utf8ToWide(gpu);
+        }
+        SetCell(nodes, row, 6, remoteGpus.empty() ? L"未报告" : remoteGpus);
+        SetCell(nodes, row, 7, Utf8ToWide(peer.address) + L":" + std::to_wstring(peer.httpPort));
     }
 
     HWND jobs = Item(ID_JOBS);
@@ -251,7 +269,8 @@ void RefreshLists() {
         SetCell(jobs, index, 5,
                 (gApp->DataDir() / L"jobs" / Utf8ToWide(job.id) / L"outputs").wstring());
     }
-    SetText(ID_STATUS, L"在线电脑：" + std::to_wstring(peers.size() + 1) +
+    SetText(ID_STATUS, std::wstring(config.pairingPending ? L"正在邀请码配对    " : L"") +
+        L"在线电脑：" + std::to_wstring(peers.size() + 1) +
         L"    已分配渲染：" + std::to_wstring(gApp->AssignedCount()) +
         L"    Blender：" + (FindBlender(config).empty() ? L"未检测到" : L"已检测") +
         L"    本机空闲：" + std::to_wstring(static_cast<int>(IdleSeconds())) + L" 秒");
@@ -267,9 +286,6 @@ void StartSubmission() {
     int frameStart = IntValue(ID_FRAME_START, 1);
     int frameEnd = IntValue(ID_FRAME_END, 1);
     int frameStep = IntValue(ID_FRAME_STEP, 1);
-    wchar_t formatBuffer[32]{};
-    GetWindowTextW(Item(ID_OUTPUT_FORMAT), formatBuffer, 32);
-    std::string format = WideToUtf8(formatBuffer);
     if (!fs::exists(source) || source.extension() != L".blend" || name.empty() ||
         frameEnd < frameStart || frameStep < 1) {
         gPreflightRunning = false;
@@ -291,7 +307,7 @@ void StartSubmission() {
         if (preflight.passed) {
             std::wstring error;
             std::string id = gApp->SubmitPrepared(name, preflight, frameStart, frameEnd,
-                                                   frameStep, format, error);
+                                                   frameStep, error);
             if (id.empty()) message = L"预检通过，但任务创建失败：" + error;
             else message += L"\n任务已创建并开始分发。";
         }
@@ -317,15 +333,15 @@ void BuildUi() {
                              ID_CPU_SLIDER);
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
     Label(L"15%", 300, 208, 55, 24, ID_CPU_VALUE);
-    Label(L"无键鼠输入后启用 GPU（分钟）", 36, 248, 220, 20);
-    AddControl(L"EDIT", L"3", WS_BORDER | ES_NUMBER, 260, 245, 95, 25, ID_IDLE_MINUTES);
+    Label(L"无键鼠输入后启用 GPU（秒）", 36, 248, 220, 20);
+    AddControl(L"EDIT", L"180", WS_BORDER | ES_NUMBER, 260, 245, 95, 25, ID_IDLE_SECONDS);
     Label(L"Blender 程序", 36, 285, 100, 20);
     AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 140, 282, 150, 25, ID_BLENDER_PATH);
     AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON, 297, 281, 58, 27, ID_BROWSE_BLENDER);
 
     AddControl(L"BUTTON", L"集群与保存", BS_GROUPBOX, 20, 342, 360, 148, 0);
     Label(L"邀请码（所有电脑保持一致）", 36, 372, 260, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD, 36, 396, 240, 25,
+    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 36, 396, 240, 25,
                ID_CLUSTER_TOKEN);
     AddControl(L"BUTTON", L"复制", BS_PUSHBUTTON, 284, 395, 70, 27, ID_COPY_TOKEN);
     AddControl(L"BUTTON", L"保存设置", BS_DEFPUSHBUTTON, 36, 444, 318, 30, ID_SAVE_SETTINGS);
@@ -343,12 +359,7 @@ void BuildUi() {
     AddControl(L"EDIT", L"100", WS_BORDER | ES_NUMBER, 970, 145, 70, 25, ID_FRAME_END);
     Label(L"步长", 1050, 148, 40, 20);
     AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER, 1090, 145, 42, 25, ID_FRAME_STEP);
-    Label(L"输出格式", 418, 185, 80, 20);
-    HWND format = AddControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 500, 181, 160,
-                             120, ID_OUTPUT_FORMAT);
-    for (const wchar_t* value : {L"PNG", L"JPEG", L"OPEN_EXR"})
-        SendMessageW(format, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value));
-    SendMessageW(format, CB_SETCURSEL, 0, 0);
+    Label(L"输出格式由 Blender 工程设置决定", 418, 185, 300, 20);
     AddControl(L"BUTTON", L"预检并分发", BS_DEFPUSHBUTTON, 900, 181, 232, 31, ID_SUBMIT);
     Label(L"提交前会用 Blender 检查并打包链接素材，记录插件环境；不兼容 Worker 不会接单。",
           418, 229, 700, 22);
@@ -366,7 +377,8 @@ void BuildUi() {
     ListView_SetExtendedListViewStyle(nodes, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     AddColumn(nodes, 0, 190, L"电脑"); AddColumn(nodes, 1, 100, L"连接");
     AddColumn(nodes, 2, 145, L"算力状态"); AddColumn(nodes, 3, 95, L"活动限额");
-    AddColumn(nodes, 4, 90, L"已分配"); AddColumn(nodes, 5, 250, L"地址");
+    AddColumn(nodes, 4, 90, L"已分配"); AddColumn(nodes, 5, 230, L"CPU 型号");
+    AddColumn(nodes, 6, 260, L"GPU 型号"); AddColumn(nodes, 7, 250, L"地址");
 
     AddControl(L"BUTTON", L"任务队列", BS_GROUPBOX, 20, 696, 1130, 184, 0);
     HWND jobs = AddControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
@@ -507,6 +519,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--run-seconds" && i + 1 < argumentCount) runSeconds = _wtoi(arguments[++i]);
     }
     LocalFree(arguments);
+    InitializeLogging(dataDir);
     if (selfTest) {
         std::wstring result;
         bool ok = RunSelfTest(result);
@@ -533,6 +546,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         json output = {
             {"pass", result.passed}, {"version", result.blenderVersion},
             {"render_engine", result.renderEngine},
+            {"render_format", result.outputFormat},
+            {"file_extension", result.outputExtension},
             {"cpu_safe_while_active", result.cpuSafeWhileActive},
             {"requires_gpu", result.requiresGpu},
             {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
@@ -561,7 +576,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         fs::path output;
         std::wstring renderError;
         bool ok = RenderBlenderFrame(renderConfig, renderSource, renderOutputDir, renderFrame,
-                                     renderFormat, false, stopRequested, output, renderError);
+                                     renderFormat,
+                                     renderFormat == "PNG" ? ".png" :
+                                         renderFormat == "JPEG" ? ".jpg" : ".exr",
+                                     false, stopRequested, output, renderError);
         PrintToParentConsole(ok ? L"渲染成功：" + output.wstring() : renderError);
         return ok ? 0 : 4;
     }

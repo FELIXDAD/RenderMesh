@@ -1,17 +1,75 @@
 #include "Core.hpp"
 
 #include <bcrypt.h>
+#include <dxgi1_2.h>
 #include <shlobj.h>
 
 #include <algorithm>
 #include <array>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 namespace rm {
 
 namespace {
+
+std::mutex gLogMutex;
+fs::path gLogDirectory;
+fs::path gLogPath;
+
+std::string TrimAscii(std::string value) {
+    auto whitespace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    value.erase(value.begin(), std::find_if_not(value.begin(), value.end(), whitespace));
+    value.erase(std::find_if_not(value.rbegin(), value.rend(), whitespace).base(), value.end());
+    return value;
+}
+
+std::string LogDayStamp() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    char value[16]{};
+    std::snprintf(value, sizeof(value), "%04u-%02u-%02u",
+                  time.wYear, time.wMonth, time.wDay);
+    return value;
+}
+
+std::string LogTimestamp() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    char value[32]{};
+    std::snprintf(value, sizeof(value), "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+                  time.wYear, time.wMonth, time.wDay,
+                  time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+    return value;
+}
+
+void WriteLogLine(const char* level, const std::string& message) {
+    std::scoped_lock lock(gLogMutex);
+    if (gLogDirectory.empty()) return;
+    fs::path expected = gLogDirectory / Utf8ToWide("RenderMesh-" + LogDayStamp() + ".log");
+    if (expected != gLogPath) gLogPath = std::move(expected);
+    std::string clean = message;
+    std::replace(clean.begin(), clean.end(), '\r', ' ');
+    std::replace(clean.begin(), clean.end(), '\n', ' ');
+    std::ofstream output(gLogPath, std::ios::binary | std::ios::app);
+    if (output)
+        output << LogTimestamp() << " [" << level << "] " << clean << "\r\n";
+}
+
+std::string InviteCodeFromToken(const std::string& token) {
+    std::string prefix = Sha256Prefix(token, 8);
+    unsigned long value = 0;
+    try {
+        value = std::stoul(prefix, nullptr, 16);
+    } catch (...) {
+        return NewInviteCode();
+    }
+    char code[7]{};
+    std::snprintf(code, sizeof(code), "%06lu", value % 1000000ul);
+    return code;
+}
 
 std::wstring QuoteArg(const std::wstring& value) {
     if (value.find_first_of(L" \t\"") == std::wstring::npos) return value;
@@ -326,6 +384,8 @@ uses_optix_denoiser = (engine == 'CYCLES' and
 uses_compositor = getattr(bpy.context.scene, 'compositing_node_group', None) is not None
 report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
           'render_engine': engine,
+          'render_format': bpy.context.scene.render.image_settings.file_format,
+          'file_extension': bpy.context.scene.render.file_extension,
           'cpu_safe_while_active': (engine == 'CYCLES' and cycles_device == 'CPU' and
                                     not uses_optix_denoiser and not uses_compositor),
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
@@ -495,6 +555,35 @@ std::string NewRandomHex(size_t bytes) {
     return output.str();
 }
 
+std::string NewInviteCode() {
+    uint32_t value = 0;
+    constexpr uint32_t range = 1000000;
+    constexpr uint32_t limit = UINT32_MAX - (UINT32_MAX % range);
+    do {
+        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&value), sizeof(value),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            throw std::runtime_error("BCryptGenRandom failed");
+        }
+    } while (value >= limit);
+    char code[7]{};
+    std::snprintf(code, sizeof(code), "%06u", value % range);
+    return code;
+}
+
+bool IsInviteCode(const std::string& value) {
+    return value.size() == 6 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return ch >= '0' && ch <= '9';
+        });
+}
+
+bool IsSafeOutputExtension(const std::string& value) {
+    return value.size() >= 2 && value.size() <= 16 && value.front() == '.' &&
+        std::all_of(value.begin() + 1, value.end(), [](unsigned char ch) {
+            return std::isalnum(ch) != 0 || ch == '_';
+        });
+}
+
 std::string Sha256Prefix(const std::string& value, size_t chars) {
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
@@ -570,6 +659,59 @@ double IdleSeconds() {
     return static_cast<double>(elapsed) / 1000.0;
 }
 
+void InitializeLogging(const fs::path& dataDir) {
+    std::scoped_lock lock(gLogMutex);
+    gLogDirectory = dataDir / L"logs";
+    std::error_code ignored;
+    fs::create_directories(gLogDirectory, ignored);
+    gLogPath = gLogDirectory / Utf8ToWide("RenderMesh-" + LogDayStamp() + ".log");
+}
+
+void LogInfo(const std::string& message) { WriteLogLine("INFO", message); }
+void LogWarning(const std::string& message) { WriteLogLine("WARN", message); }
+void LogError(const std::string& message) { WriteLogLine("ERROR", message); }
+
+fs::path CurrentLogPath() {
+    std::scoped_lock lock(gLogMutex);
+    return gLogPath;
+}
+
+HardwareInfo QueryHardwareInfo() {
+    HardwareInfo result;
+    wchar_t cpu[512]{};
+    DWORD cpuBytes = sizeof(cpu);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"ProcessorNameString", RRF_RT_REG_SZ, nullptr, cpu, &cpuBytes) ==
+        ERROR_SUCCESS) {
+        result.cpuModel = TrimAscii(WideToUtf8(cpu));
+    }
+    if (result.cpuModel.empty()) result.cpuModel = "Unknown CPU";
+
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_IDXGIFactory1,
+                                     reinterpret_cast<void**>(&factory)))) {
+        for (UINT index = 0;; ++index) {
+            IDXGIAdapter1* adapter = nullptr;
+            HRESULT status = factory->EnumAdapters1(index, &adapter);
+            if (status == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(status)) break;
+            DXGI_ADAPTER_DESC1 description{};
+            if (SUCCEEDED(adapter->GetDesc1(&description)) &&
+                !(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                std::string name = TrimAscii(WideToUtf8(description.Description));
+                if (!name.empty() &&
+                    std::find(result.gpuModels.begin(), result.gpuModels.end(), name) ==
+                        result.gpuModels.end())
+                    result.gpuModels.push_back(std::move(name));
+            }
+            adapter->Release();
+        }
+        factory->Release();
+    }
+    return result;
+}
+
 ConfigStore::ConfigStore(fs::path dataDir)
     : dataDir_(std::move(dataDir)), configPath_(dataDir_ / L"config.json") {}
 
@@ -580,6 +722,7 @@ Config ConfigStore::Load() {
     GetComputerNameW(hostname, &hostnameSize);
     config.nodeName = WideToUtf8(std::wstring(hostname, hostnameSize));
     config.nodeId = NewRandomHex(16);
+    config.inviteCode = NewInviteCode();
     config.clusterToken = NewRandomHex(16);
     if (!fs::exists(configPath_)) {
         std::wstring ignored;
@@ -591,9 +734,15 @@ Config ConfigStore::Load() {
         config.nodeId = data.value("node_id", config.nodeId);
         config.nodeName = data.value("node_name", config.nodeName);
         config.clusterToken = data.value("cluster_token", config.clusterToken);
+        config.inviteCode = data.value("invite_code", std::string{});
+        if (!IsInviteCode(config.inviteCode))
+            config.inviteCode = InviteCodeFromToken(config.clusterToken);
+        config.pairingPending = data.value("pairing_pending", false);
+        if (!config.pairingPending && config.clusterToken.size() < 32)
+            config.clusterToken = NewRandomHex(16);
         config.shareEnabled = data.value("share_enabled", false);
         config.activeCpuPercent = std::clamp(data.value("active_cpu_percent", 15), 1, 100);
-        config.idleAfterSeconds = std::clamp(data.value("idle_after_seconds", 180), 30, 86400);
+        config.idleAfterSeconds = std::clamp(data.value("idle_after_seconds", 180), 1, 86400);
         config.httpPort = std::clamp(data.value("http_port", 8391), 1024, 65535);
         config.discoveryPort = std::clamp(data.value("discovery_port", 8390), 1024, 65535);
         config.blenderPath = Utf8ToWide(data.value("blender_path", std::string{}));
@@ -611,7 +760,9 @@ bool ConfigStore::Save(const Config& config, std::wstring& error) {
     json data = {
         {"node_id", config.nodeId},
         {"node_name", config.nodeName},
+        {"invite_code", config.inviteCode},
         {"cluster_token", config.clusterToken},
+        {"pairing_pending", config.pairingPending},
         {"share_enabled", config.shareEnabled},
         {"active_cpu_percent", config.activeCpuPercent},
         {"idle_after_seconds", config.idleAfterSeconds},
@@ -695,6 +846,12 @@ PreflightReport PreflightBlend(
         report.passed = data.value("pass", false);
         report.blenderVersion = data.value("version", std::string{});
         report.renderEngine = data.value("render_engine", std::string{});
+        report.outputFormat = data.value("render_format", std::string{});
+        report.outputExtension = data.value("file_extension", std::string{});
+        if (report.outputFormat.empty() || !IsSafeOutputExtension(report.outputExtension)) {
+            report.passed = false;
+            report.warnings.push_back("The project output format has no safe file extension");
+        }
         report.cpuSafeWhileActive = data.value("cpu_safe_while_active", false);
         report.requiresGpu = data.value("requires_gpu", false);
         report.addons = data.value("addons", std::vector<std::string>{});
@@ -714,7 +871,8 @@ PreflightReport PreflightBlend(
         if (report.passed) {
             report.summary = L"预检通过：素材已打包，Blender " +
                 Utf8ToWide(report.blenderVersion) + L"，插件环境 " +
-                std::to_wstring(report.addons.size()) + L" 项。";
+                std::to_wstring(report.addons.size()) + L" 项，输出格式 " +
+                Utf8ToWide(report.outputFormat) + L"。";
         } else {
             report.summary = L"预检未通过：缺失 " + std::to_wstring(report.missing.size()) +
                 L" 项，无法打包 " + std::to_wstring(report.unpacked.size()) + L" 项。";
@@ -810,6 +968,7 @@ bool RenderBlenderFrame(
     const fs::path& outputDir,
     int frame,
     const std::string& outputFormat,
+    const std::string& outputExtension,
     bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
@@ -822,9 +981,11 @@ bool RenderBlenderFrame(
     fs::create_directories(outputDir);
     fs::path prefix = outputDir / L"frame_######";
     fs::path log = outputDir / (L"frame_" + std::to_wstring(frame) + L".log");
-    std::wstring extension = outputFormat == "PNG" ? L".png"
-        : outputFormat == "JPEG"                    ? L".jpg"
-                                                     : L".exr";
+    if (outputFormat.empty() || !IsSafeOutputExtension(outputExtension)) {
+        error = L"工程输出格式信息无效";
+        return false;
+    }
+    std::wstring extension = Utf8ToWide(outputExtension);
     std::wstring frameText = std::to_wstring(frame);
     output = outputDir / (L"frame_" +
         std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText + extension);
@@ -833,8 +994,7 @@ bool RenderBlenderFrame(
     ProcessResult process = RunProcess(
         blender,
         {L"--background", L"--disable-autoexec", blend.wstring(), L"--render-output",
-         prefix.wstring(), L"--render-format", Utf8ToWide(outputFormat), L"--render-frame",
-         std::to_wstring(frame)},
+         prefix.wstring(), L"--render-frame", std::to_wstring(frame)},
         log, applySharingLimit ? &config : nullptr, &stopRequested);
     if (!process.started || process.exitCode != 0) {
         error = process.error.empty()

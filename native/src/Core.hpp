@@ -32,6 +32,9 @@ std::string WideToUtf8(const std::wstring& value);
 std::wstring Utf8ToWide(const std::string& value);
 std::wstring LastErrorMessage(DWORD code = GetLastError());
 std::string NewRandomHex(size_t bytes);
+std::string NewInviteCode();
+bool IsInviteCode(const std::string& value);
+bool IsSafeOutputExtension(const std::string& value);
 std::string Sha256Prefix(const std::string& value, size_t chars = 16);
 std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
@@ -40,11 +43,25 @@ double IdleSeconds();
 std::optional<std::string> DirectedBroadcastAddress(
     const std::string& address, unsigned long prefixLength);
 std::wstring LocalEndpointSummary(int port);
+void InitializeLogging(const fs::path& dataDir);
+void LogInfo(const std::string& message);
+void LogWarning(const std::string& message);
+void LogError(const std::string& message);
+fs::path CurrentLogPath();
+
+struct HardwareInfo {
+    std::string cpuModel;
+    std::vector<std::string> gpuModels;
+};
+
+HardwareInfo QueryHardwareInfo();
 
 struct Config {
     std::string nodeId;
     std::string nodeName;
+    std::string inviteCode;
     std::string clusterToken;
+    bool pairingPending = false;
     bool shareEnabled = false;
     int activeCpuPercent = 15;
     int idleAfterSeconds = 180;
@@ -76,6 +93,8 @@ struct PreflightReport {
     bool passed = false;
     std::string blenderVersion;
     std::string renderEngine;
+    std::string outputFormat;
+    std::string outputExtension;
     bool cpuSafeWhileActive = false;
     bool requiresGpu = false;
     std::vector<std::string> addons;
@@ -112,6 +131,7 @@ bool RenderBlenderFrame(
     const fs::path& outputDir,
     int frame,
     const std::string& outputFormat,
+    const std::string& outputExtension,
     bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
@@ -139,6 +159,7 @@ struct RenderJob {
     std::string name;
     fs::path preparedBlend;
     std::string outputFormat = "PNG";
+    std::string outputExtension = ".png";
     std::string blenderVersion;
     std::string renderEngine;
     bool cpuSafeWhileActive = false;
@@ -157,6 +178,8 @@ struct Peer {
     bool trusted = false;
     int cpuPercent = 15;
     int assigned = 0;
+    std::string cpuModel;
+    std::vector<std::string> gpuModels;
     std::string currentTaskId;
     bool currentTaskKnown = true;
     bool manualRoute = false;
@@ -172,6 +195,7 @@ struct WorkItem {
     fs::path blend;
     fs::path outputDir;
     std::string outputFormat;
+    std::string outputExtension;
     std::string blenderVersion;
     std::string renderEngine;
     bool cpuSafeWhileActive = false;
@@ -207,11 +231,12 @@ public:
     void SetChangedCallback(std::function<void()> callback);
 
     Config GetConfig() const;
-    bool UpdateConfig(const Config& config, std::wstring& error);
+    bool UpdateConfig(Config config, std::wstring& error);
     bool AddManualPeer(const std::string& endpoint, std::wstring& result);
     std::wstring ManualPeerStatus() const;
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
+    HardwareInfo Hardware() const;
     int AssignedCount() const;
     bool Running() const { return running_; }
 
@@ -225,7 +250,6 @@ public:
         int frameStart,
         int frameEnd,
         int frameStep,
-        std::string outputFormat,
         std::wstring& error);
 
     fs::path DataDir() const { return store_.DataDir(); }

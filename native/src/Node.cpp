@@ -6,6 +6,7 @@
 #include "../third_party/httplib.h"
 
 #include <algorithm>
+#include <deque>
 #include <fstream>
 #include <regex>
 
@@ -116,12 +117,24 @@ bool HasTransferCapacity(const httplib::Request& request, const fs::path& direct
 }
 
 std::string DiscoverySignature(const Config& config, const json& message) {
-    return HmacSha256(config.clusterToken,
+    std::string signedValue =
         message.value("node_id", "") + "|" + message.value("nonce", "") + "|" +
         std::to_string(message.value("port", 0)) + "|" +
         (message.value("share", false) ? "1" : "0") + "|" +
         std::to_string(message.value("assigned", 0)) + "|" +
         message.value("task_id", "") + "|" +
+        json(message.value("addresses", std::vector<std::string>{})).dump();
+    if (message.value("protocol", 1) >= 2) {
+        signedValue += "|" + message.value("cpu_model", "") + "|" +
+            json(message.value("gpu_models", std::vector<std::string>{})).dump();
+    }
+    return HmacSha256(config.clusterToken, signedValue);
+}
+
+std::string PairingBeaconProof(const std::string& inviteCode, const json& message) {
+    return HmacSha256(inviteCode,
+        "pairing-beacon|" + message.value("node_id", "") + "|" +
+        message.value("nonce", "") + "|" + std::to_string(message.value("port", 0)) + "|" +
         json(message.value("addresses", std::vector<std::string>{})).dump());
 }
 
@@ -264,10 +277,11 @@ std::wstring LocalEndpointSummary(int port) {
 
 struct NodeApp::Impl {
     explicit Impl(NodeApp* app, std::chrono::milliseconds grace)
-        : owner(app), assignmentGrace(grace) {}
+        : owner(app), assignmentGrace(grace), hardware(QueryHardwareInfo()) {}
 
     NodeApp* owner;
     std::chrono::milliseconds assignmentGrace;
+    HardwareInfo hardware;
     mutable std::mutex stateMutex;
     std::mutex persistMutex;
     std::map<std::string, Peer> peers;
@@ -277,6 +291,8 @@ struct NodeApp::Impl {
     mutable std::mutex manualStatusMutex;
     std::wstring manualStatus;
     std::mutex workMutex;
+    std::mutex pairingMutex;
+    std::map<std::string, std::deque<std::chrono::steady_clock::time_point>> pairingAttempts;
     std::condition_variable workCv;
     std::queue<WorkItem> work;
     std::mutex currentTaskMutex;
@@ -335,7 +351,8 @@ struct NodeApp::Impl {
                 rows.push_back({
                     {"id", job.id}, {"name", job.name},
                     {"blend", WideToUtf8(job.preparedBlend.wstring())},
-                    {"format", job.outputFormat}, {"version", job.blenderVersion},
+                    {"format", job.outputFormat}, {"extension", job.outputExtension},
+                    {"version", job.blenderVersion},
                     {"render_engine", job.renderEngine},
                     {"cpu_safe_while_active", job.cpuSafeWhileActive},
                     {"requires_gpu", job.requiresGpu},
@@ -370,6 +387,7 @@ struct NodeApp::Impl {
                 job.name = row.value("name", "");
                 job.preparedBlend = Utf8ToWide(row.value("blend", ""));
                 job.outputFormat = row.value("format", "PNG");
+                job.outputExtension = row.value("extension", FrameExtension(job.outputFormat));
                 job.blenderVersion = row.value("version", "");
                 job.renderEngine = row.value("render_engine", "");
                 job.cpuSafeWhileActive = row.value("cpu_safe_while_active", false);
@@ -397,6 +415,69 @@ struct NodeApp::Impl {
         }
     }
 
+    bool AllowPairingAttempt(const std::string& address) {
+        std::scoped_lock lock(pairingMutex);
+        auto now = std::chrono::steady_clock::now();
+        auto& attempts = pairingAttempts[address];
+        while (!attempts.empty() && now - attempts.front() > std::chrono::minutes(1))
+            attempts.pop_front();
+        if (attempts.size() >= 6) return false;
+        attempts.push_back(now);
+        return true;
+    }
+
+    bool TryPair(const std::string& address, int port, const std::string& serverNodeId,
+                 std::wstring& result) {
+        Config pending = owner->GetConfig();
+        if (!pending.pairingPending || !IsInviteCode(pending.inviteCode) ||
+            !SafeId(serverNodeId))
+            return false;
+        std::string nonce = NewRandomHex(16);
+        std::string requestProof = HmacSha256(
+            pending.inviteCode,
+            "pair-request|" + pending.nodeId + "|" + serverNodeId + "|" + nonce);
+        httplib::Client client(address, port);
+        client.set_connection_timeout(2, 0);
+        client.set_read_timeout(2, 0);
+        client.set_write_timeout(2, 0);
+        httplib::Headers headers = {
+            {"X-RM-Node", pending.nodeId}, {"X-RM-Nonce", nonce},
+            {"X-RM-Proof", requestProof},
+        };
+        auto response = client.Post("/v2/pair", headers, "", "application/octet-stream");
+        if (!response || response->status != 200) {
+            result = L"找到邀请码相同的电脑，但配对请求被拒绝";
+            return false;
+        }
+        json body = json::parse(response->body, nullptr, false);
+        std::string credential = body.value("cluster_token", "");
+        std::string responseNode = body.value("node_id", "");
+        std::string expected = HmacSha256(
+            pending.inviteCode,
+            "pair-response|" + serverNodeId + "|" + pending.nodeId + "|" + nonce + "|" +
+                credential);
+        if (body.is_discarded() || responseNode != serverNodeId || credential.size() < 32 ||
+            !ConstantTimeEqual(body.value("proof", ""), expected)) {
+            result = L"配对响应无效";
+            return false;
+        }
+        Config current = owner->GetConfig();
+        if (!current.pairingPending || current.inviteCode != pending.inviteCode) {
+            result = L"邀请码已在配对期间发生变化";
+            return false;
+        }
+        current.clusterToken = std::move(credential);
+        current.pairingPending = false;
+        std::wstring saveError;
+        if (!owner->UpdateConfig(std::move(current), saveError)) {
+            result = L"配对成功，但无法保存内部凭证：" + saveError;
+            return false;
+        }
+        result = L"邀请码配对成功";
+        LogInfo("node pairing completed with " + serverNodeId);
+        return true;
+    }
+
     void ConfigureServer() {
         server.set_payload_max_length(100ull * 1024 * 1024 * 1024);
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
@@ -405,9 +486,44 @@ struct NodeApp::Impl {
                 json{{"status", "ok"}, {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
+                     {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
+                     {"pairing_available", !config.pairingPending},
                      {"task_id", CurrentTaskId()}, {"idle", static_cast<int>(IdleSeconds())}}
                     .dump(),
                 "application/json");
+        });
+        server.Post("/v2/pair", [&](const httplib::Request& request,
+                                      httplib::Response& response) {
+            if (!AllowPairingAttempt(request.remote_addr)) {
+                response.status = 429;
+                response.set_content("too many pairing attempts", "text/plain");
+                return;
+            }
+            Config config = owner->GetConfig();
+            std::string clientNodeId = request.get_header_value("X-RM-Node");
+            std::string nonce = request.get_header_value("X-RM-Nonce");
+            std::string claimed = request.get_header_value("X-RM-Proof");
+            if (config.pairingPending || config.clusterToken.size() < 32 ||
+                !SafeId(clientNodeId) || !SafeId(nonce) || nonce.size() < 16) {
+                response.status = 409;
+                return;
+            }
+            std::string expected = HmacSha256(
+                config.inviteCode,
+                "pair-request|" + clientNodeId + "|" + config.nodeId + "|" + nonce);
+            if (!ConstantTimeEqual(claimed, expected)) {
+                response.status = 401;
+                return;
+            }
+            response.set_content(json{
+                {"node_id", config.nodeId},
+                {"cluster_token", config.clusterToken},
+                {"proof", HmacSha256(
+                    config.inviteCode,
+                    "pair-response|" + config.nodeId + "|" + clientNodeId + "|" + nonce +
+                        "|" + config.clusterToken)},
+            }.dump(), "application/json");
+            LogInfo("approved LAN pairing for node " + clientNodeId);
         });
         server.Get("/v1/prove", [&](const httplib::Request& request,
                                      httplib::Response& response) {
@@ -418,6 +534,10 @@ struct NodeApp::Impl {
                 return;
             }
             Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 32) {
+                response.status = 409;
+                return;
+            }
             response.set_content(json{
                 {"node_id", config.nodeId},
                 {"proof", HmacSha256(config.clusterToken,
@@ -429,7 +549,8 @@ struct NodeApp::Impl {
             [&](const httplib::Request& request, httplib::Response& response,
                 const httplib::ContentReader& reader) {
                 Config config = owner->GetConfig();
-                if (!ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                if (config.pairingPending || config.clusterToken.size() < 32 ||
+                    !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
                                        config.clusterToken)) {
                     response.status = 401;
                     response.set_content("invalid cluster token", "text/plain");
@@ -445,6 +566,8 @@ struct NodeApp::Impl {
                 int frame = HeaderInt(request, "X-RM-Frame", 0);
                 int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
                 std::string format = request.get_header_value("X-RM-Format");
+                std::string extension = request.get_header_value("X-RM-Extension");
+                if (extension.empty()) extension = FrameExtension(format);
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string renderEngine = request.get_header_value("X-RM-Engine");
                 bool cpuSafeWhileActive = request.get_header_value("X-RM-CPU-Safe") == "1";
@@ -453,8 +576,8 @@ struct NodeApp::Impl {
                 auto addons = HeaderStringList(request, "X-RM-Addons");
                 if (!SafeId(taskId) || !SafeId(jobId) || frame < 1 || frame > 1000000 || originPort < 1024 ||
                     originPort > 65535 ||
-                    !SafeId(attemptToken) ||
-                    (format != "PNG" && format != "JPEG" && format != "OPEN_EXR")) {
+                    !SafeId(attemptToken) || format.empty() ||
+                    !IsSafeOutputExtension(extension)) {
                     response.status = 422;
                     response.set_content("invalid task metadata", "text/plain");
                     return;
@@ -540,6 +663,7 @@ struct NodeApp::Impl {
                 item.blend = blend;
                 item.outputDir = taskDir / L"outputs";
                 item.outputFormat = format;
+                item.outputExtension = extension;
                 item.blenderVersion = version;
                 item.renderEngine = renderEngine;
                 item.cpuSafeWhileActive = cpuSafeWhileActive;
@@ -558,13 +682,16 @@ struct NodeApp::Impl {
                 Notify();
                 response.status = 202;
                 response.set_content("accepted", "text/plain");
+                LogInfo("accepted remote task " + taskId + "; frame=" +
+                        std::to_string(frame) + "; origin=" + request.remote_addr);
             });
         server.Post(
             "/v1/result",
             [&](const httplib::Request& request, httplib::Response& response,
                 const httplib::ContentReader& reader) {
                 Config config = owner->GetConfig();
-                if (!ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                if (config.pairingPending || config.clusterToken.size() < 32 ||
+                    !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
                                        config.clusterToken)) {
                     response.status = 401;
                     return;
@@ -602,7 +729,7 @@ struct NodeApp::Impl {
                         destination = owner->DataDir() / L"jobs" / Utf8ToWide(job.id) /
                             L"outputs" /
                             (L"frame_" + std::to_wstring(it->frame) +
-                             Utf8ToWide(FrameExtension(job.outputFormat)));
+                             Utf8ToWide(job.outputExtension));
                         break;
                     }
                 }
@@ -670,6 +797,10 @@ struct NodeApp::Impl {
                 Notify();
                 response.status = ok ? 200 : 500;
                 response.set_content(ok ? "received" : "receive failed", "text/plain");
+                if (ok)
+                    LogInfo("received task result " + taskId + "; status=" + status);
+                else
+                    LogWarning("failed receiving task result " + taskId);
             });
     }
 
@@ -707,6 +838,14 @@ struct NodeApp::Impl {
             result = L"该地址指向本机。请输入另一台电脑的局域网 IP，而不是 127.0.0.1";
             return false;
         }
+        if (config.pairingPending) {
+            if (!health.value("pairing_available", false) ||
+                !TryPair(address, port, nodeId, result)) {
+                if (result.empty()) result = L"目标电脑暂时不能接受邀请码配对";
+                return false;
+            }
+            config = owner->GetConfig();
+        }
         std::string challenge = NewRandomHex(16);
         auto proofResponse = client.Get("/v1/prove?challenge=" + challenge);
         if (!proofResponse || proofResponse->status != 200) {
@@ -730,6 +869,8 @@ struct NodeApp::Impl {
         peer.trusted = true;
         peer.cpuPercent = health.value("cpu", 15);
         peer.assigned = health.value("assigned", 0);
+        peer.cpuModel = health.value("cpu_model", "");
+        peer.gpuModels = health.value("gpu_models", std::vector<std::string>{});
         peer.currentTaskKnown = health.contains("task_id");
         peer.currentTaskId = health.value("task_id", "");
         peer.manualRoute = true;
@@ -804,17 +945,27 @@ struct NodeApp::Impl {
                 std::vector<std::string> localAddresses;
                 for (const auto& network : networks)
                     localAddresses.push_back(network.address);
-                json message = {
-                    {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
-                    {"nonce", NewRandomHex(8)},
-                    {"addresses", localAddresses},
-                    {"port", config.httpPort}, {"share", config.shareEnabled},
-                    {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
-                    {"task_id", CurrentTaskId()},
-                    {"idle", static_cast<int>(IdleSeconds())},
-                };
-                message["signature"] = DiscoverySignature(config, message);
-                std::string payload = message.dump();
+                std::vector<std::string> payloads;
+                if (!config.pairingPending && config.clusterToken.size() >= 32) {
+                    json message = {
+                        {"protocol", 2}, {"node_id", config.nodeId}, {"name", config.nodeName},
+                        {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
+                        {"port", config.httpPort}, {"share", config.shareEnabled},
+                        {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
+                        {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
+                        {"task_id", CurrentTaskId()},
+                        {"idle", static_cast<int>(IdleSeconds())},
+                    };
+                    message["signature"] = DiscoverySignature(config, message);
+                    payloads.push_back(message.dump());
+                    json pairing = {
+                        {"protocol", 2}, {"kind", "pairing"}, {"node_id", config.nodeId},
+                        {"name", config.nodeName}, {"nonce", NewRandomHex(8)},
+                        {"addresses", localAddresses}, {"port", config.httpPort},
+                    };
+                    pairing["proof"] = PairingBeaconProof(config.inviteCode, pairing);
+                    payloads.push_back(pairing.dump());
+                }
                 for (const auto& network : BroadcastCapableInterfaces(networks)) {
                     SOCKET sendSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                     if (sendSocket == INVALID_SOCKET) continue;
@@ -833,8 +984,9 @@ struct NodeApp::Impl {
                     broadcast.sin_family = AF_INET;
                     inet_pton(AF_INET, network.broadcast->c_str(), &broadcast.sin_addr);
                     broadcast.sin_port = htons(static_cast<u_short>(config.discoveryPort));
-                    sendto(sendSocket, payload.data(), static_cast<int>(payload.size()), 0,
-                           reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
+                    for (const auto& payload : payloads)
+                        sendto(sendSocket, payload.data(), static_cast<int>(payload.size()), 0,
+                               reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
                     closesocket(sendSocket);
                 }
                 nextBroadcast = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -847,18 +999,40 @@ struct NodeApp::Impl {
             if (received <= 0) continue;
             try {
                 json message = json::parse(std::string(buffer, received));
-                if (message.value("protocol", 0) != 1) continue;
+                int protocol = message.value("protocol", 0);
+                if (protocol != 1 && protocol != 2) continue;
+                char remoteAddress[INET_ADDRSTRLEN]{};
+                inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
+                if (protocol == 2 && message.value("kind", "") == "pairing") {
+                    Config pending = owner->GetConfig();
+                    std::string serverNodeId = message.value("node_id", "");
+                    int serverPort = message.value("port", 0);
+                    auto addresses = message.value("addresses", std::vector<std::string>{});
+                    bool valid = pending.pairingPending && SafeId(serverNodeId) &&
+                        serverNodeId != pending.nodeId && serverPort >= 1024 && serverPort <= 65535 &&
+                        std::find(addresses.begin(), addresses.end(), std::string(remoteAddress)) !=
+                            addresses.end() &&
+                        ConstantTimeEqual(message.value("proof", ""),
+                                          PairingBeaconProof(pending.inviteCode, message));
+                    if (valid) {
+                        std::wstring pairingStatus;
+                        if (TryPair(remoteAddress, serverPort, serverNodeId, pairingStatus))
+                            SetManualStatus(std::move(pairingStatus));
+                        Notify();
+                    }
+                    continue;
+                }
                 Peer peer;
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
-                char address[INET_ADDRSTRLEN]{};
-                inet_ntop(AF_INET, &remote.sin_addr, address, sizeof(address));
-                peer.address = address;
+                peer.address = remoteAddress;
                 peer.name = message.value("name", peer.nodeId);
                 peer.httpPort = message.value("port", 8391);
                 peer.shareEnabled = message.value("share", false);
                 peer.cpuPercent = message.value("cpu", 15);
                 peer.assigned = message.value("assigned", 0);
+                peer.cpuModel = message.value("cpu_model", "");
+                peer.gpuModels = message.value("gpu_models", std::vector<std::string>{});
                 peer.currentTaskId = message.value("task_id", "");
                 peer.currentTaskKnown = true;
                 peer.idleSeconds = message.value("idle", 0.0);
@@ -934,6 +1108,7 @@ struct NodeApp::Impl {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
             {"X-RM-Job", job.id}, {"X-RM-Frame", std::to_string(frame.frame)},
             {"X-RM-Format", job.outputFormat}, {"X-RM-Blender", job.blenderVersion},
+            {"X-RM-Extension", job.outputExtension},
             {"X-RM-Engine", job.renderEngine},
             {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
@@ -949,8 +1124,10 @@ struct NodeApp::Impl {
         }
         if (result->status != 202) {
             error = result->body.empty() ? "worker rejected task" : result->body;
+            LogWarning("worker rejected task " + frame.taskId + "; node=" + peer.nodeId);
             return false;
         }
+        LogInfo("dispatched task " + frame.taskId + "; node=" + peer.nodeId);
         return true;
     }
 
@@ -1072,6 +1249,7 @@ struct NodeApp::Impl {
                 item.blend = jobCopy.preparedBlend;
                 item.outputDir = owner->DataDir() / L"jobs" / Utf8ToWide(jobCopy.id) / L"outputs";
                 item.outputFormat = jobCopy.outputFormat;
+                item.outputExtension = jobCopy.outputExtension;
                 item.blenderVersion = jobCopy.blenderVersion;
                 item.renderEngine = jobCopy.renderEngine;
                 item.cpuSafeWhileActive = jobCopy.cpuSafeWhileActive;
@@ -1155,6 +1333,8 @@ struct NodeApp::Impl {
                 std::scoped_lock lock(currentTaskMutex);
                 currentTaskId = item.taskId;
             }
+            LogInfo("render started; task=" + item.taskId + "; frame=" +
+                    std::to_string(item.frame));
             fs::path output;
             std::wstring renderError;
             bool success = false;
@@ -1167,7 +1347,8 @@ struct NodeApp::Impl {
             } else if (owner->mockRenderer_) {
                 fs::create_directories(item.outputDir);
                 output = item.outputDir /
-                    (L"frame_" + std::to_wstring(item.frame) + Utf8ToWide(FrameExtension(item.outputFormat)));
+                    (L"frame_" + std::to_wstring(item.frame) +
+                     Utf8ToWide(item.outputExtension));
                 std::ofstream mock(output, std::ios::binary);
                 mock << "RenderMesh mock frame " << item.frame;
                 success = static_cast<bool>(mock);
@@ -1194,8 +1375,8 @@ struct NodeApp::Impl {
                     });
                 }
                 success = RenderBlenderFrame(renderConfig, item.blend, item.outputDir,
-                                             item.frame, item.outputFormat, item.remote, *effectiveStop,
-                                             output, renderError);
+                                             item.frame, item.outputFormat, item.outputExtension,
+                                             item.remote, *effectiveStop, output, renderError);
                 policyStop = true;
                 if (inputGuard.joinable()) inputGuard.join();
                 retryAfterIdle = resumedInput.load();
@@ -1237,6 +1418,14 @@ struct NodeApp::Impl {
                 currentTaskId.clear();
             }
             --workerAssigned;
+            if (success)
+                LogInfo("render completed; task=" + item.taskId + "; frame=" +
+                        std::to_string(item.frame));
+            else if (retryAfterIdle)
+                LogInfo("render deferred after user activity; task=" + item.taskId);
+            else
+                LogError("render failed; task=" + item.taskId + "; error=" +
+                         WideToUtf8(renderError));
             PersistJobs();
             Notify();
         }
@@ -1267,6 +1456,7 @@ bool NodeApp::Start(std::wstring& error) {
         running_ = false;
         WSACleanup();
         error = L"TCP 端口 " + std::to_wstring(config.httpPort) + L" 已被占用";
+        LogError("failed to bind HTTP port " + std::to_string(config.httpPort));
         return false;
     }
     impl_->serverThread = std::thread([this] { impl_->server.listen_after_bind(); });
@@ -1274,6 +1464,8 @@ bool NodeApp::Start(std::wstring& error) {
     impl_->manualPeerThread = std::thread([this] { impl_->ManualPeerLoop(); });
     impl_->schedulerThread = std::thread([this] { impl_->SchedulerLoop(); });
     impl_->workerThread = std::thread([this] { impl_->WorkerLoop(); });
+    LogInfo("node started; id=" + config.nodeId + "; port=" +
+            std::to_string(config.httpPort));
     return true;
 }
 
@@ -1288,6 +1480,7 @@ void NodeApp::Stop() {
     if (impl_->schedulerThread.joinable()) impl_->schedulerThread.join();
     if (impl_->workerThread.joinable()) impl_->workerThread.join();
     WSACleanup();
+    LogInfo("node stopped");
 }
 
 void NodeApp::SetChangedCallback(std::function<void()> callback) {
@@ -1300,10 +1493,17 @@ Config NodeApp::GetConfig() const {
     return config_;
 }
 
-bool NodeApp::UpdateConfig(const Config& config, std::wstring& error) {
-    if (config.nodeName.empty() || config.clusterToken.size() < 16 ||
+bool NodeApp::UpdateConfig(Config config, std::wstring& error) {
+    Config current = GetConfig();
+    if (config.inviteCode != current.inviteCode) {
+        config.clusterToken.clear();
+        config.pairingPending = true;
+        config.manualPeerEndpoint.clear();
+    }
+    if (config.nodeName.empty() || !IsInviteCode(config.inviteCode) ||
+        (!config.pairingPending && config.clusterToken.size() < 32) ||
         config.activeCpuPercent < 1 || config.activeCpuPercent > 100 ||
-        config.idleAfterSeconds < 30) {
+        config.idleAfterSeconds < 1 || config.idleAfterSeconds > 86400) {
         error = L"设置值无效";
         return false;
     }
@@ -1313,6 +1513,7 @@ bool NodeApp::UpdateConfig(const Config& config, std::wstring& error) {
         config_ = config;
     }
     impl_->Notify();
+    LogInfo("settings updated for node " + config.nodeId);
     return true;
 }
 
@@ -1360,6 +1561,8 @@ std::vector<RenderJob> NodeApp::Jobs() const {
     return impl_->jobs;
 }
 
+HardwareInfo NodeApp::Hardware() const { return impl_->hardware; }
+
 int NodeApp::AssignedCount() const {
     return impl_->workerAssigned.load();
 }
@@ -1381,15 +1584,14 @@ std::string NodeApp::SubmitPrepared(
     int frameStart,
     int frameEnd,
     int frameStep,
-    std::string outputFormat,
     std::wstring& error) {
     if (!report.passed || !fs::exists(report.preparedBlend)) {
         error = L"工程未通过预检";
         return {};
     }
     if (name.empty() || frameStart < 1 || frameEnd < frameStart || frameEnd > 1000000 ||
-        frameStep < 1 ||
-        (outputFormat != "PNG" && outputFormat != "JPEG" && outputFormat != "OPEN_EXR")) {
+        frameStep < 1 || report.outputFormat.empty() ||
+        !IsSafeOutputExtension(report.outputExtension)) {
         error = L"任务参数无效";
         return {};
     }
@@ -1407,7 +1609,8 @@ std::string NodeApp::SubmitPrepared(
     job.id = id;
     job.name = std::move(name);
     job.preparedBlend = source;
-    job.outputFormat = std::move(outputFormat);
+    job.outputFormat = report.outputFormat;
+    job.outputExtension = report.outputExtension;
     job.blenderVersion = report.blenderVersion;
     job.renderEngine = report.renderEngine;
     job.cpuSafeWhileActive = report.cpuSafeWhileActive;
@@ -1430,6 +1633,8 @@ std::string NodeApp::SubmitPrepared(
     }
     impl_->PersistJobs();
     impl_->Notify();
+    LogInfo("job submitted; id=" + id + "; frames=" +
+            std::to_string(job.frames.size()) + "; format=" + job.outputFormat);
     return id;
 }
 
@@ -1440,15 +1645,62 @@ bool RunSelfTest(std::wstring& report) {
         fs::create_directories(root);
         ConfigStore store(root);
         Config config = store.Load();
+        if (!IsInviteCode(config.inviteCode) || config.clusterToken.size() < 32) {
+            report = L"Default invite-code or internal credential generation failed";
+            return false;
+        }
         config.nodeName = "SELFTEST";
         config.activeCpuPercent = 17;
+        config.idleAfterSeconds = 7;
+        config.inviteCode = "042731";
         config.manualPeerEndpoint = "192.168.28.28:8391";
         std::wstring error;
         Config persisted;
         if (!store.Save(config, error) ||
             (persisted = store.Load()).activeCpuPercent != 17 ||
+            persisted.idleAfterSeconds != 7 ||
+            persisted.inviteCode != "042731" ||
+            persisted.clusterToken != config.clusterToken ||
             persisted.manualPeerEndpoint != config.manualPeerEndpoint) {
             report = L"配置持久化失败：" + error;
+            return false;
+        }
+        if (!IsInviteCode("000000") || !IsInviteCode("999999") ||
+            IsInviteCode("12345") || IsInviteCode("1234567") ||
+            IsInviteCode("12A456")) {
+            report = L"Six-digit invite-code validation failed";
+            return false;
+        }
+        fs::path joinRoot = root / L"join-config";
+        ConfigStore joinStore(joinRoot);
+        Config joinConfig = joinStore.Load();
+        std::string previousCredential = joinConfig.clusterToken;
+        NodeApp joinApp(std::move(joinStore), joinConfig, true);
+        Config joinUpdate = joinApp.GetConfig();
+        joinUpdate.inviteCode = joinUpdate.inviteCode == "654321" ? "123456" : "654321";
+        if (!joinApp.UpdateConfig(joinUpdate, error)) {
+            report = L"Entering a six-digit invite code was rejected: " + error;
+            return false;
+        }
+        Config pendingJoin = joinApp.GetConfig();
+        if (!pendingJoin.pairingPending || !pendingJoin.clusterToken.empty() ||
+            pendingJoin.inviteCode != joinUpdate.inviteCode || previousCredential.empty()) {
+            report = L"Six-digit invite code did not enter pairing state";
+            return false;
+        }
+        InitializeLogging(root);
+        LogInfo("self-test-log-marker");
+        fs::path logPath = CurrentLogPath();
+        std::ifstream logInput(logPath, std::ios::binary);
+        std::string logText((std::istreambuf_iterator<char>(logInput)), {});
+        if (!fs::is_regular_file(logPath) ||
+            logText.find("self-test-log-marker") == std::string::npos) {
+            report = L"Persistent logging self-test failed";
+            return false;
+        }
+        HardwareInfo hardware = QueryHardwareInfo();
+        if (hardware.cpuModel.empty()) {
+            report = L"CPU model detection self-test failed";
             return false;
         }
         if (HmacSha256("key", "The quick brown fox jumps over the lazy dog") !=
@@ -1547,11 +1799,13 @@ bool RunSelfTest(std::wstring& report) {
             std::string sharedToken = NewRandomHex(16);
             originConfig.nodeName = "SELFTEST-ORIGIN";
             originConfig.nodeId = "selftest-origin";
-            originConfig.clusterToken = sharedToken;
+            originConfig.inviteCode = "123456";
+            originConfig.clusterToken = NewRandomHex(16);
             originConfig.httpPort = 18531;
             originConfig.discoveryPort = 18530;
             workerConfig.nodeName = "SELFTEST-WORKER";
             workerConfig.nodeId = "selftest-worker";
+            workerConfig.inviteCode = "654321";
             workerConfig.clusterToken = sharedToken;
             workerConfig.httpPort = 18532;
             workerConfig.discoveryPort = 18533;
@@ -1577,9 +1831,23 @@ bool RunSelfTest(std::wstring& report) {
                     "127.0.0.1:" + std::to_string(malformedPort), malformedResult);
                 malformedServer.stop();
                 if (malformedThread.joinable()) malformedThread.join();
+                Config pairingConfig = origin.GetConfig();
+                pairingConfig.inviteCode = workerConfig.inviteCode;
+                bool pairingStarted = origin.UpdateConfig(pairingConfig, error) &&
+                    origin.GetConfig().pairingPending;
                 std::wstring connectResult;
                 bool manuallyConnected = origin.AddManualPeer(
                     "127.0.0.1:" + std::to_string(workerConfig.httpPort), connectResult);
+                Config pairedConfig = origin.GetConfig();
+                bool paired = !pairedConfig.pairingPending &&
+                    pairedConfig.clusterToken == sharedToken;
+                bool hardwareReported = false;
+                for (const auto& peer : origin.Peers()) {
+                    if (peer.nodeId == workerConfig.nodeId && !peer.cpuModel.empty()) {
+                        hardwareReported = true;
+                        break;
+                    }
+                }
 
                 fs::path prepared = root / L"prepared.blend";
                 {
@@ -1591,11 +1859,14 @@ bool RunSelfTest(std::wstring& report) {
                 preflight.preparedBlend = prepared;
                 preflight.blenderVersion = "4.5";
                 preflight.renderEngine = "CYCLES";
+                preflight.outputFormat = "PNG";
+                preflight.outputExtension = ".png";
                 preflight.cpuSafeWhileActive = true;
                 std::wstring submitError;
                 std::string jobId = origin.SubmitPrepared(
-                    "two-node-self-test", preflight, 1, 3, 1, "PNG", submitError);
-                bool clusterOk = malformedRejected && manuallyConnected && !jobId.empty();
+                    "two-node-self-test", preflight, 1, 3, 1, submitError);
+                bool clusterOk = malformedRejected && pairingStarted && paired &&
+                    manuallyConnected && hardwareReported && !jobId.empty();
                 bool usedRemote = false;
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
                 while (clusterOk && std::chrono::steady_clock::now() < deadline) {
@@ -1650,7 +1921,7 @@ bool RunSelfTest(std::wstring& report) {
                     lostPeer.trusted = true;
                     origin.InjectPeerForTest(std::move(lostPeer));
                     std::string recoveryJob = origin.SubmitPrepared(
-                        "lost-worker-self-test", preflight, 4, 4, 1, "PNG", submitError);
+                        "lost-worker-self-test", preflight, 4, 4, 1, submitError);
                     bool reachedAssigned = false;
                     std::string expiredAttempt;
                     auto assignDeadline = std::chrono::steady_clock::now() +
