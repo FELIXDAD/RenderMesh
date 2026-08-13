@@ -147,6 +147,7 @@ bool RenderBlenderPackage(
     const std::string& outputFormat,
     const std::string& outputExtension,
     bool applySharingLimit,
+    bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
     std::map<int, fs::path>& completed,

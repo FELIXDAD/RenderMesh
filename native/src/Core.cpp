@@ -1097,6 +1097,7 @@ bool RenderBlenderPackage(
     const std::string& outputFormat,
     const std::string& outputExtension,
     bool applySharingLimit,
+    bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
     std::map<int, fs::path>& completed,
@@ -1139,11 +1140,16 @@ bool RenderBlenderPackage(
     std::atomic<bool> processFinished = false;
     std::thread stopMarkerThread([&] {
         while (!processFinished.load() && !stopRequested.load()) {
-            if (finishCurrentThenStop.load()) {
+            if (stopAfterCurrentOnActivity &&
+                IdleSeconds() < config.idleAfterSeconds) {
+                finishCurrentThenStop = true;
+                // Detection and marker publication deliberately happen in the
+                // same thread, so no second polling interval can start another
+                // Blender frame after activity has already been observed.
                 std::ofstream(stopMarker, std::ios::binary | std::ios::trunc) << "stop";
                 return;
             }
-            Sleep(100);
+            Sleep(50);
         }
     });
     ProcessResult process = RunProcess(

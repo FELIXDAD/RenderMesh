@@ -397,6 +397,38 @@ httplib::Result PostFile(
     return result;
 }
 
+httplib::Result PostEmpty(
+    const std::string& host,
+    int port,
+    const std::string& route,
+    const httplib::Headers& headers,
+    std::atomic<bool>* stopRequested = nullptr) {
+    httplib::Client client(host, port);
+    client.set_connection_timeout(3, 0);
+    client.set_read_timeout(5, 0);
+    client.set_write_timeout(5, 0);
+    std::mutex cancellationMutex;
+    std::condition_variable cancellationChanged;
+    bool finished = false;
+    std::thread cancellationThread;
+    if (stopRequested) {
+        cancellationThread = std::thread([&] {
+            std::unique_lock lock(cancellationMutex);
+            while (!finished && !stopRequested->load())
+                cancellationChanged.wait_for(lock, std::chrono::milliseconds(100));
+            if (!finished) client.stop();
+        });
+    }
+    auto result = client.Post(route, headers, "", "application/octet-stream");
+    {
+        std::scoped_lock lock(cancellationMutex);
+        finished = true;
+    }
+    cancellationChanged.notify_all();
+    if (cancellationThread.joinable()) cancellationThread.join();
+    return result;
+}
+
 std::string FrameExtension(const std::string& format) {
     return format == "PNG" ? ".png" : format == "JPEG" ? ".jpg" : ".exr";
 }
@@ -1741,11 +1773,8 @@ struct NodeApp::Impl {
             {"X-RM-Addons", json(job.requiredAddons).dump()},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
-        httplib::Client client(peer.address, peer.httpPort);
-        client.set_connection_timeout(3, 0);
-        client.set_read_timeout(5, 0);
-        client.set_write_timeout(5, 0);
-        auto result = client.Post("/v3/package", headers, "", "application/octet-stream");
+        auto result = PostEmpty(peer.address, peer.httpPort, "/v3/package", headers,
+                                &stopRequested);
         if (!result) {
             error = "retry: package dispatch network error: " +
                 httplib::to_string(result.error());
@@ -1980,15 +2009,18 @@ struct NodeApp::Impl {
             {"X-RM-Error", WideToUtf8(renderError)},
         };
         for (int attempt = 0; attempt < 4 && !stopRequested.load(); ++attempt) {
-            if (attempt) std::this_thread::sleep_for(std::chrono::seconds(attempt * 2));
+            if (attempt) {
+                for (int step = 0; step < attempt * 20 && !stopRequested.load(); ++step)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (stopRequested.load()) break;
+            }
             httplib::Result result;
             if (success && !retry) {
                 result = PostFile(item.originAddress, item.originPort, "/v1/result", headers,
                                   output, &stopRequested);
             } else {
-                httplib::Client client(item.originAddress, item.originPort);
-                client.set_connection_timeout(3, 0);
-                result = client.Post("/v1/result", headers, "", "application/octet-stream");
+                result = PostEmpty(item.originAddress, item.originPort, "/v1/result",
+                                   headers, &stopRequested);
             }
             if (result && result->status == 200) return true;
         }
@@ -2037,27 +2069,13 @@ struct NodeApp::Impl {
                 }
             } else {
                 std::atomic<bool> finishCurrentThenStop = false;
-                std::atomic<bool> monitorFinished = false;
-                std::thread inputGuard;
-                if (item.remote && !item.cpuSafeWhileActive) {
-                    inputGuard = std::thread([&] {
-                        while (!monitorFinished.load() && !stopRequested.load()) {
-                            if (IdleSeconds() < renderConfig.idleAfterSeconds) {
-                                finishCurrentThenStop = true;
-                                break;
-                            }
-                            Sleep(50);
-                        }
-                    });
-                }
                 std::vector<int> frameNumbers;
                 for (const auto& frame : item.frames) frameNumbers.push_back(frame.frame);
                 RenderBlenderPackage(
                     renderConfig, item.blend, item.outputDir, frameNumbers,
                     item.outputFormat, item.outputExtension, item.remote,
-                    stopRequested, finishCurrentThenStop, outputs, renderError);
-                monitorFinished = true;
-                if (inputGuard.joinable()) inputGuard.join();
+                    item.remote && !item.cpuSafeWhileActive, stopRequested,
+                    finishCurrentThenStop, outputs, renderError);
                 retryAfterIdle = finishCurrentThenStop.load();
             }
             if (item.remote) {
