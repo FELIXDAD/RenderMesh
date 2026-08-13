@@ -509,6 +509,37 @@ with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 )PY";
 
+const char* kBatchRenderScript = R"PY(import bpy, json, os, sys, traceback
+args = sys.argv[sys.argv.index('--') + 1:]
+output_dir, manifest_path, stop_path, frames_json = args[:4]
+frames = json.loads(frames_json)
+scene = bpy.context.scene
+completed = []
+error = ''
+def persist():
+    temporary = manifest_path + '.tmp'
+    with open(temporary, 'w', encoding='utf-8') as handle:
+        json.dump({'completed': completed, 'error': error}, handle,
+                  ensure_ascii=False, indent=2)
+    os.replace(temporary, manifest_path)
+try:
+    for index, frame in enumerate(frames):
+        if index and os.path.exists(stop_path):
+            break
+        scene.frame_set(int(frame))
+        scene.render.filepath = os.path.join(output_dir, f'frame_{int(frame):06d}')
+        result = bpy.ops.render.render(write_still=True)
+        if 'FINISHED' not in result:
+            raise RuntimeError(f'Render frame {frame} returned {result}')
+        completed.append(int(frame))
+        persist()
+except Exception:
+    error = traceback.format_exc()
+    persist()
+    raise
+persist()
+)PY";
+
 }  // namespace
 
 std::string WideToUtf8(const std::wstring& value) {
@@ -583,6 +614,18 @@ bool IsSafeOutputExtension(const std::string& value) {
         std::all_of(value.begin() + 1, value.end(), [](unsigned char ch) {
             return std::isalnum(ch) != 0 || ch == '_';
         }));
+}
+
+std::vector<std::vector<int>> BuildFramePackages(
+    const std::vector<int>& frames, size_t packageSize) {
+    std::vector<std::vector<int>> result;
+    if (packageSize == 0) return result;
+    for (size_t offset = 0; offset < frames.size(); offset += packageSize) {
+        size_t end = std::min(frames.size(), offset + packageSize);
+        result.emplace_back(frames.begin() + static_cast<std::ptrdiff_t>(offset),
+                            frames.begin() + static_cast<std::ptrdiff_t>(end));
+    }
+    return result;
 }
 
 std::string Sha256Prefix(const std::string& value, size_t chars) {
@@ -1041,6 +1084,101 @@ bool RenderBlenderFrame(
     }
     if (!fs::exists(output)) {
         error = L"Blender 已退出，但没有生成帧文件。日志：" + log.wstring();
+        return false;
+    }
+    return true;
+}
+
+bool RenderBlenderPackage(
+    const Config& config,
+    const fs::path& blend,
+    const fs::path& outputDir,
+    const std::vector<int>& frames,
+    const std::string& outputFormat,
+    const std::string& outputExtension,
+    bool applySharingLimit,
+    std::atomic<bool>& stopRequested,
+    std::atomic<bool>& finishCurrentThenStop,
+    std::map<int, fs::path>& completed,
+    std::wstring& error) {
+    completed.clear();
+    if (frames.empty() || frames.size() > 5 || outputFormat.empty() ||
+        !IsSafeOutputExtension(outputExtension)) {
+        error = L"渲染任务包参数无效";
+        return false;
+    }
+    fs::path blender = FindBlender(config);
+    if (blender.empty()) {
+        error = L"未找到 Blender";
+        return false;
+    }
+    fs::create_directories(outputDir);
+    fs::path script = outputDir / L"render-package.py";
+    fs::path manifest = outputDir / L"render-package.json";
+    fs::path stopMarker = outputDir / L"stop-after-current";
+    fs::path log = outputDir / L"render-package.log";
+    {
+        std::ofstream output(script, std::ios::binary | std::ios::trunc);
+        output << kBatchRenderScript;
+        if (!output) {
+            error = L"无法写入批量渲染脚本";
+            return false;
+        }
+    }
+    std::error_code ignored;
+    fs::remove(manifest, ignored);
+    fs::remove(stopMarker, ignored);
+    for (int frame : frames) {
+        std::wstring frameText = std::to_wstring(frame);
+        fs::path expected = outputDir / (L"frame_" +
+            std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText +
+            Utf8ToWide(outputExtension));
+        fs::remove(expected, ignored);
+    }
+
+    std::atomic<bool> processFinished = false;
+    std::thread stopMarkerThread([&] {
+        while (!processFinished.load() && !stopRequested.load()) {
+            if (finishCurrentThenStop.load()) {
+                std::ofstream(stopMarker, std::ios::binary | std::ios::trunc) << "stop";
+                return;
+            }
+            Sleep(100);
+        }
+    });
+    ProcessResult process = RunProcess(
+        blender,
+        {L"--background", L"--disable-autoexec", blend.wstring(), L"--python",
+         script.wstring(), L"--", outputDir.wstring(), manifest.wstring(),
+         stopMarker.wstring(), Utf8ToWide(json(frames).dump())},
+        log, applySharingLimit ? &config : nullptr, &stopRequested);
+    processFinished = true;
+    if (stopMarkerThread.joinable()) stopMarkerThread.join();
+
+    try {
+        if (fs::is_regular_file(manifest)) {
+            json progress = json::parse(ReadText(manifest));
+            for (int frame : progress.value("completed", std::vector<int>{})) {
+                if (std::find(frames.begin(), frames.end(), frame) == frames.end()) continue;
+                std::wstring frameText = std::to_wstring(frame);
+                fs::path expected = outputDir / (L"frame_" +
+                    std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText +
+                    Utf8ToWide(outputExtension));
+                if (fs::is_regular_file(expected)) completed[frame] = expected;
+            }
+            std::string scriptError = progress.value("error", "");
+            if (!scriptError.empty()) error = Utf8ToWide(scriptError);
+        }
+    } catch (const std::exception& exception) {
+        error = L"批量渲染进度文件无效：" + Utf8ToWide(exception.what());
+    }
+    if (!process.started || process.exitCode != 0) {
+        if (error.empty()) {
+            error = process.error.empty()
+                ? L"Blender 批量渲染失败，退出码 " + std::to_wstring(process.exitCode) +
+                      L"。日志：" + log.wstring()
+                : process.error;
+        }
         return false;
     }
     return true;

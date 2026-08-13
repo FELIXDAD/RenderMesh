@@ -35,6 +35,8 @@ std::string NewRandomHex(size_t bytes);
 std::string NewInviteCode();
 bool IsInviteCode(const std::string& value);
 bool IsSafeOutputExtension(const std::string& value);
+std::vector<std::vector<int>> BuildFramePackages(
+    const std::vector<int>& frames, size_t packageSize = 5);
 std::string Sha256Prefix(const std::string& value, size_t chars = 16);
 std::string Sha256File(const fs::path& path);
 std::string HmacSha256(const std::string& key, const std::string& value);
@@ -137,6 +139,18 @@ bool RenderBlenderFrame(
     std::atomic<bool>& stopRequested,
     fs::path& output,
     std::wstring& error);
+bool RenderBlenderPackage(
+    const Config& config,
+    const fs::path& blend,
+    const fs::path& outputDir,
+    const std::vector<int>& frames,
+    const std::string& outputFormat,
+    const std::string& outputExtension,
+    bool applySharingLimit,
+    std::atomic<bool>& stopRequested,
+    std::atomic<bool>& finishCurrentThenStop,
+    std::map<int, fs::path>& completed,
+    std::wstring& error);
 
 enum class TaskState { Pending, Dispatching, Assigned, Rendering, Completed, Failed };
 
@@ -148,6 +162,7 @@ struct FrameTask {
     TaskState state = TaskState::Pending;
     std::string assignedNodeId;
     std::string assignedNodeName;
+    std::string assignedPackageId;
     std::chrono::steady_clock::time_point assignedAt{};
     int dispatchAttempts = 0;
     std::string attemptToken;
@@ -174,6 +189,7 @@ struct RenderJob {
 struct Peer {
     int protocolVersion = 1;
     bool supportsProjectCache = false;
+    bool supportsFramePackages = false;
     std::string nodeId;
     std::string name;
     std::string address;
@@ -193,9 +209,16 @@ struct Peer {
 };
 
 struct WorkItem {
+    struct Frame {
+        std::string taskId;
+        int frame = 1;
+        std::string attemptToken;
+    };
     std::string taskId;
     std::string jobId;
     int frame = 1;
+    std::string packageId;
+    std::vector<Frame> frames;
     std::string projectHash;
     fs::path blend;
     fs::path temporaryTaskDir;

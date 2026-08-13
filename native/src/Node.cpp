@@ -9,6 +9,7 @@
 #include <deque>
 #include <fstream>
 #include <regex>
+#include <set>
 
 namespace rm {
 
@@ -143,6 +144,8 @@ std::string DiscoverySignature(const Config& config, const json& message) {
     }
     if (message.value("protocol", 1) >= 3)
         signedValue += "|" + std::string(message.value("project_cache", false) ? "1" : "0");
+    if (message.value("protocol", 1) >= 4)
+        signedValue += "|" + std::string(message.value("frame_packages", false) ? "1" : "0");
     return HmacSha256(config.clusterToken, signedValue);
 }
 
@@ -234,6 +237,7 @@ void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     if (candidate.protocolVersion != 1 || existing.protocolVersion < 2) return;
     candidate.protocolVersion = existing.protocolVersion;
     candidate.supportsProjectCache = existing.supportsProjectCache;
+    candidate.supportsFramePackages = existing.supportsFramePackages;
     candidate.name = existing.name;
     candidate.cpuPercent = existing.cpuPercent;
     candidate.idleSeconds = existing.idleSeconds;
@@ -491,6 +495,7 @@ struct NodeApp::Impl {
                         {"state", static_cast<int>(frame.state)},
                         {"assigned_node_id", frame.assignedNodeId},
                         {"assigned_node_name", frame.assignedNodeName},
+                        {"assigned_package_id", frame.assignedPackageId},
                         {"dispatch_attempts", frame.dispatchAttempts},
                         {"attempt_token", frame.attemptToken},
                         {"output", WideToUtf8(frame.output.wstring())},
@@ -556,6 +561,7 @@ struct NodeApp::Impl {
                         frame.state = TaskState::Pending;
                     frame.assignedNodeId = value.value("assigned_node_id", "");
                     frame.assignedNodeName = value.value("assigned_node_name", "");
+                    frame.assignedPackageId = value.value("assigned_package_id", "");
                     frame.dispatchAttempts = value.value("dispatch_attempts", 0);
                     frame.attemptToken = value.value("attempt_token", "");
                     frame.output = Utf8ToWide(value.value("output", ""));
@@ -636,7 +642,8 @@ struct NodeApp::Impl {
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             Config config = owner->GetConfig();
             response.set_content(
-                json{{"status", "ok"}, {"protocol", 3}, {"project_cache", true},
+                json{{"status", "ok"}, {"protocol", 4}, {"project_cache", true},
+                     {"frame_packages", true},
                      {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
@@ -801,7 +808,7 @@ struct NodeApp::Impl {
                                 compatibilityStop = true;
                                 break;
                             }
-                            Sleep(250);
+                            Sleep(50);
                         }
                     });
                 }
@@ -920,6 +927,122 @@ struct NodeApp::Impl {
             response.status = 202;
             response.set_content("accepted cached project", "text/plain");
             LogInfo("accepted cached task " + taskId + "; project=" + hash.substr(0, 16));
+        });
+        server.Post("/v3/package", [&](const httplib::Request& request,
+                                         httplib::Response& response) {
+            Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
+                !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                   config.clusterToken)) {
+                response.status = 401;
+                return;
+            }
+            if (!config.shareEnabled) {
+                response.status = 409;
+                response.set_content("compute sharing is disabled", "text/plain");
+                return;
+            }
+            std::string packageId = request.get_header_value("X-RM-Package");
+            std::string jobId = request.get_header_value("X-RM-Job");
+            std::string hash = request.get_header_value("X-RM-Project");
+            int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
+            std::string format = request.get_header_value("X-RM-Format");
+            std::string extension = request.get_header_value("X-RM-Extension");
+            std::string version = request.get_header_value("X-RM-Blender");
+            std::string engine = request.get_header_value("X-RM-Engine");
+            bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
+            bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
+            auto addons = HeaderStringList(request, "X-RM-Addons");
+            std::vector<WorkItem::Frame> packageFrames;
+            try {
+                json values = json::parse(request.get_header_value("X-RM-Frames"));
+                if (!values.is_array() || values.empty() || values.size() > 5)
+                    throw std::runtime_error("invalid frame count");
+                std::set<std::string> taskIds;
+                std::set<int> frameNumbers;
+                for (const auto& value : values) {
+                    WorkItem::Frame frame;
+                    frame.taskId = value.value("task", "");
+                    frame.frame = value.value("frame", 0);
+                    frame.attemptToken = value.value("attempt", "");
+                    if (!SafeId(frame.taskId) || !SafeId(frame.attemptToken) ||
+                        frame.frame < 1 || frame.frame > 1000000 ||
+                        !taskIds.insert(frame.taskId).second ||
+                        !frameNumbers.insert(frame.frame).second)
+                        throw std::runtime_error("invalid frame metadata");
+                    packageFrames.push_back(std::move(frame));
+                }
+            } catch (...) {
+                response.status = 422;
+                response.set_content("invalid frame package", "text/plain");
+                return;
+            }
+            const size_t packageFrameCount = packageFrames.size();
+            if (!SafeId(packageId) || !SafeId(jobId) || !SafeSha256(hash) ||
+                originPort < 1024 || originPort > 65535 || format.empty() ||
+                version.empty() || engine.empty() || !IsSafeOutputExtension(extension)) {
+                response.status = 422;
+                return;
+            }
+            if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                response.status = 425;
+                response.set_content("GPU package waits until this computer is idle",
+                                     "text/plain");
+                return;
+            }
+            std::unique_lock cacheLock(cacheMutex);
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
+                                      requiresGpu, addons)) {
+                response.status = 404;
+                response.set_content("project cache miss", "text/plain");
+                return;
+            }
+            int expectedAssigned = 0;
+            if (!workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
+                response.status = 409;
+                response.set_content("worker is busy", "text/plain");
+                return;
+            }
+            struct AssignmentReservation {
+                std::atomic<int>& count;
+                bool handedOff = false;
+                ~AssignmentReservation() { if (!handedOff) --count; }
+            } reservation{workerAssigned};
+            TouchCacheEntry(owner->DataDir(), hash);
+            fs::path taskDir = owner->DataDir() / L"incoming" / Utf8ToWide(packageId);
+            WorkItem item;
+            item.taskId = packageFrames.front().taskId;
+            item.jobId = jobId;
+            item.frame = packageFrames.front().frame;
+            item.attemptToken = packageFrames.front().attemptToken;
+            item.packageId = packageId;
+            item.frames = std::move(packageFrames);
+            item.projectHash = hash;
+            item.blend = ProjectCacheDirectory(owner->DataDir(), hash) / L"source.blend";
+            item.temporaryTaskDir = taskDir;
+            item.outputDir = taskDir / L"outputs";
+            item.outputFormat = format;
+            item.outputExtension = extension;
+            item.blenderVersion = version;
+            item.renderEngine = engine;
+            item.cpuSafeWhileActive = cpuSafe;
+            item.requiresGpu = requiresGpu;
+            item.requiredAddons = std::move(addons);
+            item.remote = true;
+            item.originAddress = request.remote_addr;
+            item.originPort = originPort;
+            {
+                std::scoped_lock lock(workMutex);
+                work.push(std::move(item));
+            }
+            reservation.handedOff = true;
+            cacheLock.unlock();
+            workCv.notify_one();
+            Notify();
+            response.status = 202;
+            response.set_content("accepted frame package", "text/plain");
+            LogInfo("accepted package " + packageId + "; frames=" +
+                    std::to_string(packageFrameCount));
         });
         server.Get("/v1/prove", [&](const httplib::Request& request,
                                      httplib::Response& response) {
@@ -1189,6 +1312,7 @@ struct NodeApp::Impl {
                         if (!receiveError.empty()) target.error = WideToUtf8(receiveError);
                     }
                     target.assignedAt = {};
+                    target.assignedPackageId.clear();
                 }
                 PersistJobs();
                 Notify();
@@ -1260,6 +1384,7 @@ struct NodeApp::Impl {
         peer.nodeId = nodeId;
         peer.protocolVersion = health.value("protocol", 1);
         peer.supportsProjectCache = health.value("project_cache", false);
+        peer.supportsFramePackages = health.value("frame_packages", false);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -1346,8 +1471,8 @@ struct NodeApp::Impl {
                     localAddresses.push_back(network.address);
                 std::vector<std::string> payloads;
                 if (!config.pairingPending && config.clusterToken.size() >= 16) {
-                    json messageV3 = {
-                        {"protocol", 3}, {"project_cache", true},
+                    json messageV4 = {
+                        {"protocol", 4}, {"project_cache", true}, {"frame_packages", true},
                         {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
@@ -1356,9 +1481,9 @@ struct NodeApp::Impl {
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    messageV3["signature"] = DiscoverySignature(config, messageV3);
-                    payloads.push_back(messageV3.dump());
-                    // Keep a v1 beacon during the protocol-v3 rollout so an older
+                    messageV4["signature"] = DiscoverySignature(config, messageV4);
+                    payloads.push_back(messageV4.dump());
+                    // Keep a v1 beacon during the protocol-v4 rollout so an older
                     // installed node can still discover this endpoint.
                     json messageV1 = {
                         {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
@@ -1405,12 +1530,13 @@ struct NodeApp::Impl {
             try {
                 json message = json::parse(std::string(buffer, received));
                 int protocol = message.value("protocol", 0);
-                if (protocol != 1 && protocol != 2 && protocol != 3) continue;
+                if (protocol < 1 || protocol > 4) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
                 peer.protocolVersion = protocol;
                 peer.supportsProjectCache = message.value("project_cache", false);
+                peer.supportsFramePackages = message.value("frame_packages", false);
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -1476,13 +1602,11 @@ struct NodeApp::Impl {
         return std::nullopt;
     }
 
-    bool DispatchRemote(const Peer& peer, const RenderJob& job, const FrameTask& frame,
-                        const std::string& attemptToken,
-                        std::string& error) {
-        Config config = owner->GetConfig();
+    bool VerifyRemotePeer(const Peer& peer, const Config& config, std::string& error) {
         std::string challenge = NewRandomHex(16);
         httplib::Client verifier(peer.address, peer.httpPort);
         verifier.set_connection_timeout(3, 0);
+        verifier.set_read_timeout(5, 0);
         auto proofResponse = verifier.Get("/v1/prove?challenge=" + challenge);
         if (!proofResponse || proofResponse->status != 200) {
             error = "worker failed fresh ownership proof";
@@ -1496,6 +1620,59 @@ struct NodeApp::Impl {
             error = "worker ownership proof was invalid";
             return false;
         }
+        return true;
+    }
+
+    bool EnsureRemoteProjectCache(
+        const Peer& peer, const Config& config, const RenderJob& job, std::string& error) {
+        if (!peer.supportsProjectCache || !SafeSha256(job.projectHash)) return true;
+        httplib::Client cacheClient(peer.address, peer.httpPort);
+        cacheClient.set_connection_timeout(3, 0);
+        cacheClient.set_read_timeout(5, 0);
+        cacheClient.set_write_timeout(5, 0);
+        httplib::Headers statusHeaders = {
+            {"X-RM-Token", config.clusterToken},
+            {"X-RM-Blender", job.blenderVersion},
+            {"X-RM-Engine", job.renderEngine},
+            {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
+            {"X-RM-Addons", json(job.requiredAddons).dump()},
+        };
+        auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
+                                      statusHeaders);
+        if (!status) {
+            error = "retry: project cache query failed: " +
+                httplib::to_string(status.error());
+            return false;
+        }
+        if (status->status == 200) return true;
+        if (status->status != 404) {
+            error = status->body.empty() ? "project cache query failed" : status->body;
+            return false;
+        }
+        httplib::Headers uploadHeaders = {
+            {"X-RM-Token", config.clusterToken},
+            {"X-RM-Project", job.projectHash},
+            {"X-RM-Blender", job.blenderVersion},
+            {"X-RM-Engine", job.renderEngine},
+            {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
+            {"X-RM-Addons", json(job.requiredAddons).dump()},
+        };
+        auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", uploadHeaders,
+                               job.preparedBlend, &stopRequested, 3600);
+        if (!upload || (upload->status != 200 && upload->status != 201)) {
+            error = upload && !upload->body.empty() ? upload->body
+                : "project cache upload failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool DispatchRemote(const Peer& peer, const RenderJob& job, const FrameTask& frame,
+                        const std::string& attemptToken,
+        std::string& error) {
+        Config config = owner->GetConfig();
+        if (!VerifyRemotePeer(peer, config, error)) return false;
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
             {"X-RM-Job", job.id}, {"X-RM-Frame", std::to_string(frame.frame)},
@@ -1515,41 +1692,7 @@ struct NodeApp::Impl {
             cacheClient.set_connection_timeout(3, 0);
             cacheClient.set_read_timeout(5, 0);
             cacheClient.set_write_timeout(5, 0);
-            httplib::Headers cacheStatusHeaders = {
-                {"X-RM-Token", config.clusterToken},
-                {"X-RM-Blender", job.blenderVersion},
-                {"X-RM-Engine", job.renderEngine},
-                {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
-                {"X-RM-Addons", json(job.requiredAddons).dump()},
-            };
-            auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
-                                          cacheStatusHeaders);
-            if (!status) {
-                error = "retry: project cache query failed: " +
-                    httplib::to_string(status.error());
-                return false;
-            }
-            if (status->status == 404) {
-                httplib::Headers cacheHeaders = {
-                    {"X-RM-Token", config.clusterToken},
-                    {"X-RM-Project", job.projectHash},
-                    {"X-RM-Blender", job.blenderVersion},
-                    {"X-RM-Engine", job.renderEngine},
-                    {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
-                    {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
-                    {"X-RM-Addons", json(job.requiredAddons).dump()},
-                };
-                auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", cacheHeaders,
-                                       job.preparedBlend, &stopRequested, 3600);
-                if (!upload || (upload->status != 200 && upload->status != 201)) {
-                    error = upload && !upload->body.empty() ? upload->body
-                        : "project cache upload failed";
-                    return false;
-                }
-            } else if (status->status != 200) {
-                error = status->body.empty() ? "project cache query failed" : status->body;
-                return false;
-            }
+            if (!EnsureRemoteProjectCache(peer, config, job, error)) return false;
             result = cacheClient.Post("/v2/task", headers, "", "application/octet-stream");
         } else {
             result = PostFile(peer.address, peer.httpPort, "/v1/task", headers,
@@ -1568,6 +1711,56 @@ struct NodeApp::Impl {
         return true;
     }
 
+    bool DispatchRemotePackage(
+        const Peer& peer, const RenderJob& job, const std::vector<FrameTask>& frames,
+        const std::vector<std::string>& attemptTokens, const std::string& packageId,
+        std::string& error) {
+        if (!peer.supportsFramePackages || !peer.supportsProjectCache || frames.empty() ||
+            frames.size() > 5 || frames.size() != attemptTokens.size()) {
+            error = "worker does not support frame packages";
+            return false;
+        }
+        Config config = owner->GetConfig();
+        if (!VerifyRemotePeer(peer, config, error) ||
+            !EnsureRemoteProjectCache(peer, config, job, error))
+            return false;
+        json frameMetadata = json::array();
+        for (size_t index = 0; index < frames.size(); ++index) {
+            frameMetadata.push_back({{"task", frames[index].taskId},
+                                     {"frame", frames[index].frame},
+                                     {"attempt", attemptTokens[index]}});
+        }
+        httplib::Headers headers = {
+            {"X-RM-Token", config.clusterToken}, {"X-RM-Package", packageId},
+            {"X-RM-Job", job.id}, {"X-RM-Frames", frameMetadata.dump()},
+            {"X-RM-Project", job.projectHash}, {"X-RM-Format", job.outputFormat},
+            {"X-RM-Extension", job.outputExtension},
+            {"X-RM-Blender", job.blenderVersion}, {"X-RM-Engine", job.renderEngine},
+            {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
+            {"X-RM-Addons", json(job.requiredAddons).dump()},
+            {"X-RM-Origin-Port", std::to_string(config.httpPort)},
+        };
+        httplib::Client client(peer.address, peer.httpPort);
+        client.set_connection_timeout(3, 0);
+        client.set_read_timeout(5, 0);
+        client.set_write_timeout(5, 0);
+        auto result = client.Post("/v3/package", headers, "", "application/octet-stream");
+        if (!result) {
+            error = "retry: package dispatch network error: " +
+                httplib::to_string(result.error());
+            return false;
+        }
+        if (result->status != 202) {
+            error = result->body.empty() ? "worker rejected package" : result->body;
+            LogWarning("worker rejected package " + packageId + "; node=" + peer.nodeId);
+            return false;
+        }
+        LogInfo("dispatched package " + packageId + "; frames=" +
+                std::to_string(frames.size()) + "; node=" + peer.nodeId);
+        return true;
+    }
+
     bool RecoverLostAssignments() {
         bool recovered = false;
         auto nowSteady = std::chrono::steady_clock::now();
@@ -1581,13 +1774,16 @@ struct NodeApp::Impl {
                 auto peer = peers.find(frame.assignedNodeId);
                 bool peerGone = peer == peers.end() || nowSteady - peer->second.lastSeen > kPeerTimeout;
                 bool peerNoLongerWorking = !peerGone &&
-                    PeerExplicitlyStoppedTask(peer->second, frame.taskId);
+                    PeerExplicitlyStoppedTask(peer->second,
+                        frame.assignedPackageId.empty() ? frame.taskId
+                                                        : frame.assignedPackageId);
                 if (!peerGone && !peerNoLongerWorking) continue;
                 frame.state = TaskState::Pending;
                 frame.error = peerGone ? "worker went offline; frame requeued"
                                        : "worker stopped without returning a result; frame requeued";
                 frame.assignedNodeId.clear();
                 frame.assignedNodeName.clear();
+                frame.assignedPackageId.clear();
                 frame.assignedAt = {};
                 frame.attemptToken.clear();
                 recovered = true;
@@ -1602,9 +1798,12 @@ struct NodeApp::Impl {
                 PersistJobs();
                 Notify();
             }
-            size_t jobIndex = 0, frameIndex = 0;
+            auto peer = AvailablePeer();
+            const size_t wantedFrames = !peer || peer->supportsFramePackages ? 5 : 1;
+            size_t jobIndex = 0;
+            std::vector<size_t> frameIndices;
             RenderJob jobCopy;
-            FrameTask frameCopy;
+            std::vector<FrameTask> frameCopies;
             bool found = false;
             {
                 std::scoped_lock lock(stateMutex);
@@ -1612,10 +1811,17 @@ struct NodeApp::Impl {
                     for (size_t f = 0; f < jobs[j].frames.size(); ++f) {
                         if (jobs[j].frames[f].state == TaskState::Pending) {
                             jobIndex = j;
-                            frameIndex = f;
-                            jobs[j].frames[f].state = TaskState::Dispatching;
                             jobCopy = jobs[j];
-                            frameCopy = jobs[j].frames[f];
+                            for (size_t candidate = f;
+                                 candidate < jobs[j].frames.size() &&
+                                 frameIndices.size() < wantedFrames;
+                                 ++candidate) {
+                                if (jobs[j].frames[candidate].state != TaskState::Pending)
+                                    continue;
+                                jobs[j].frames[candidate].state = TaskState::Dispatching;
+                                frameIndices.push_back(candidate);
+                                frameCopies.push_back(jobs[j].frames[candidate]);
+                            }
                             found = true;
                             break;
                         }
@@ -1628,30 +1834,43 @@ struct NodeApp::Impl {
             }
             bool handled = false;
             bool deferredRemote = false;
-            auto peer = AvailablePeer();
             if (peer) {
                 std::string dispatchError;
-                std::string attemptToken = NewRandomHex(12);
+                std::string packageId = peer->supportsFramePackages
+                    ? NewRandomHex(12) : frameCopies.front().taskId;
+                std::vector<std::string> attemptTokens;
+                for (size_t index = 0; index < frameCopies.size(); ++index)
+                    attemptTokens.push_back(NewRandomHex(12));
                 {
                     std::scoped_lock lock(stateMutex);
-                    if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size()) {
-                        auto& frame = jobs[jobIndex].frames[frameIndex];
-                        // Publish the lease before uploading. A very fast worker can
-                        // return its result before POST /v1/task itself returns.
+                    for (size_t index = 0; index < frameIndices.size(); ++index) {
+                        if (jobIndex >= jobs.size() ||
+                            frameIndices[index] >= jobs[jobIndex].frames.size())
+                            continue;
+                        auto& frame = jobs[jobIndex].frames[frameIndices[index]];
                         frame.state = TaskState::Assigned;
                         frame.assignedNodeId = peer->nodeId;
                         frame.assignedNodeName = peer->name;
+                        frame.assignedPackageId = packageId;
                         frame.assignedAt = {};
-                        frame.attemptToken = attemptToken;
+                        frame.attemptToken = attemptTokens[index];
                         ++frame.dispatchAttempts;
                     }
                 }
-                if (DispatchRemote(*peer, jobCopy, frameCopy, attemptToken, dispatchError)) {
+                bool dispatched = peer->supportsFramePackages
+                    ? DispatchRemotePackage(*peer, jobCopy, frameCopies, attemptTokens,
+                                            packageId, dispatchError)
+                    : DispatchRemote(*peer, jobCopy, frameCopies.front(),
+                                     attemptTokens.front(), dispatchError);
+                if (dispatched) {
                     std::scoped_lock lock(stateMutex);
-                    if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size()) {
-                        auto& frame = jobs[jobIndex].frames[frameIndex];
+                    for (size_t index = 0; index < frameIndices.size(); ++index) {
+                        if (jobIndex >= jobs.size() ||
+                            frameIndices[index] >= jobs[jobIndex].frames.size())
+                            continue;
+                        auto& frame = jobs[jobIndex].frames[frameIndices[index]];
                         if (frame.state == TaskState::Assigned &&
-                            frame.attemptToken == attemptToken) {
+                            frame.attemptToken == attemptTokens[index]) {
                             frame.assignedAt = std::chrono::steady_clock::now();
                             frame.error.clear();
                         }
@@ -1659,25 +1878,29 @@ struct NodeApp::Impl {
                     handled = true;
                 } else {
                     std::scoped_lock lock(stateMutex);
-                    if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size()) {
-                        auto& frame = jobs[jobIndex].frames[frameIndex];
+                    size_t restored = 0;
+                    for (size_t index = 0; index < frameIndices.size(); ++index) {
+                        if (jobIndex >= jobs.size() ||
+                            frameIndices[index] >= jobs[jobIndex].frames.size())
+                            continue;
+                        auto& frame = jobs[jobIndex].frames[frameIndices[index]];
                         if (frame.state == TaskState::Assigned &&
-                            frame.attemptToken == attemptToken) {
+                            frame.attemptToken == attemptTokens[index]) {
                             deferredRemote = dispatchError.starts_with("retry:");
                             frame.state = deferredRemote ? TaskState::Pending
                                                          : TaskState::Dispatching;
                             frame.assignedNodeId.clear();
                             frame.assignedNodeName.clear();
+                            frame.assignedPackageId.clear();
                             frame.assignedAt = {};
                             frame.attemptToken.clear();
                             frame.error = dispatchError;
-                        } else {
-                            // The worker may have completed or requested a retry
-                            // before the task-upload client observed its 202 reply.
-                            // Never enqueue a duplicate local execution in that case.
-                            handled = true;
+                            ++restored;
                         }
                     }
+                    // A fast worker may return some package results before the 202
+                    // response reaches the client. Never locally duplicate those.
+                    if (restored != frameIndices.size()) handled = true;
                 }
                 if (deferredRemote) {
                     handled = true;
@@ -1687,11 +1910,15 @@ struct NodeApp::Impl {
             int expectedAssigned = 0;
             if (!handled && workerAssigned.compare_exchange_strong(expectedAssigned, 1)) {
                 WorkItem item;
-                item.taskId = frameCopy.taskId;
+                item.taskId = frameCopies.front().taskId;
                 item.jobId = jobCopy.id;
-                item.frame = frameCopy.frame;
+                item.frame = frameCopies.front().frame;
+                item.packageId = NewRandomHex(12);
+                for (const auto& frame : frameCopies)
+                    item.frames.push_back({frame.taskId, frame.frame, {}});
                 item.blend = jobCopy.preparedBlend;
-                item.outputDir = owner->DataDir() / L"jobs" / Utf8ToWide(jobCopy.id) / L"outputs";
+                item.outputDir = owner->DataDir() / L"jobs" / Utf8ToWide(jobCopy.id) /
+                    L"outputs";
                 item.outputFormat = jobCopy.outputFormat;
                 item.outputExtension = jobCopy.outputExtension;
                 item.blenderVersion = jobCopy.blenderVersion;
@@ -1705,13 +1932,16 @@ struct NodeApp::Impl {
                 }
                 {
                     std::scoped_lock lock(stateMutex);
-                    auto& frame = jobs[jobIndex].frames[frameIndex];
-                    frame.state = TaskState::Rendering;
                     Config config = owner->GetConfig();
-                    frame.assignedNodeId = config.nodeId;
-                    frame.assignedNodeName = config.nodeName;
-                    frame.assignedAt = {};
-                    frame.attemptToken.clear();
+                    for (size_t frameIndex : frameIndices) {
+                        auto& frame = jobs[jobIndex].frames[frameIndex];
+                        frame.state = TaskState::Rendering;
+                        frame.assignedNodeId = config.nodeId;
+                        frame.assignedNodeName = config.nodeName;
+                        frame.assignedPackageId = item.packageId;
+                        frame.assignedAt = {};
+                        frame.attemptToken.clear();
+                    }
                 }
                 workCv.notify_one();
                 handled = true;
@@ -1719,13 +1949,17 @@ struct NodeApp::Impl {
             if (!handled) {
                 {
                     std::scoped_lock lock(stateMutex);
-                    if (jobIndex < jobs.size() && frameIndex < jobs[jobIndex].frames.size()) {
-                        auto& frame = jobs[jobIndex].frames[frameIndex];
-                        frame.state = TaskState::Pending;
-                        frame.assignedNodeId.clear();
-                        frame.assignedNodeName.clear();
-                        frame.assignedAt = {};
-                        frame.attemptToken.clear();
+                    if (jobIndex < jobs.size()) {
+                        for (size_t frameIndex : frameIndices) {
+                            if (frameIndex >= jobs[jobIndex].frames.size()) continue;
+                            auto& frame = jobs[jobIndex].frames[frameIndex];
+                            frame.state = TaskState::Pending;
+                            frame.assignedNodeId.clear();
+                            frame.assignedNodeName.clear();
+                            frame.assignedPackageId.clear();
+                            frame.assignedAt = {};
+                            frame.attemptToken.clear();
+                        }
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -1735,12 +1969,13 @@ struct NodeApp::Impl {
         }
     }
 
-    bool SendRemoteResult(const WorkItem& item, bool success, bool retry,
+    bool SendRemoteResult(const WorkItem& item, const WorkItem::Frame& frame,
+                          bool success, bool retry,
                           const fs::path& output, const std::wstring& renderError) {
         Config config = owner->GetConfig();
         httplib::Headers headers = {
-            {"X-RM-Token", config.clusterToken}, {"X-RM-Task", item.taskId},
-            {"X-RM-Attempt", item.attemptToken},
+            {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
+            {"X-RM-Attempt", frame.attemptToken},
             {"X-RM-Status", retry ? "retry" : success ? "completed" : "failed"},
             {"X-RM-Error", WideToUtf8(renderError)},
         };
@@ -1773,15 +2008,17 @@ struct NodeApp::Impl {
                 item = std::move(work.front());
                 work.pop();
             }
+            if (item.frames.empty())
+                item.frames.push_back({item.taskId, item.frame, item.attemptToken});
             {
                 std::scoped_lock lock(currentTaskMutex);
-                currentTaskId = item.taskId;
+                currentTaskId = item.packageId.empty() ? item.taskId : item.packageId;
             }
-            LogInfo("render started; task=" + item.taskId + "; frame=" +
-                    std::to_string(item.frame));
-            fs::path output;
+            LogInfo("render package started; package=" +
+                    (item.packageId.empty() ? item.taskId : item.packageId) + "; frames=" +
+                    std::to_string(item.frames.size()));
+            std::map<int, fs::path> outputs;
             std::wstring renderError;
-            bool success = false;
             bool retryAfterIdle = false;
             Config renderConfig = owner->GetConfig();
             if (item.remote && !item.cpuSafeWhileActive &&
@@ -1790,53 +2027,60 @@ struct NodeApp::Impl {
                 retryAfterIdle = true;
             } else if (owner->mockRenderer_) {
                 fs::create_directories(item.outputDir);
-                output = item.outputDir /
-                    (L"frame_" + std::to_wstring(item.frame) +
-                     Utf8ToWide(item.outputExtension));
-                std::ofstream mock(output, std::ios::binary);
-                mock << "RenderMesh mock frame " << item.frame;
-                success = static_cast<bool>(mock);
+                for (const auto& frame : item.frames) {
+                    fs::path output = item.outputDir /
+                        (L"frame_" + std::to_wstring(frame.frame) +
+                         Utf8ToWide(item.outputExtension));
+                    std::ofstream mock(output, std::ios::binary);
+                    mock << "RenderMesh mock frame " << frame.frame;
+                    if (mock) outputs[frame.frame] = output;
+                }
             } else {
-                std::atomic<bool> policyStop = false;
-                std::atomic<bool> resumedInput = false;
-                std::atomic<bool>* effectiveStop = &stopRequested;
+                std::atomic<bool> finishCurrentThenStop = false;
+                std::atomic<bool> monitorFinished = false;
                 std::thread inputGuard;
                 if (item.remote && !item.cpuSafeWhileActive) {
-                    effectiveStop = &policyStop;
                     inputGuard = std::thread([&] {
-                        while (!policyStop.load()) {
-                            if (stopRequested.load()) {
-                                policyStop = true;
-                                break;
-                            }
+                        while (!monitorFinished.load() && !stopRequested.load()) {
                             if (IdleSeconds() < renderConfig.idleAfterSeconds) {
-                                resumedInput = true;
-                                policyStop = true;
+                                finishCurrentThenStop = true;
                                 break;
                             }
-                            Sleep(250);
+                            Sleep(50);
                         }
                     });
                 }
-                success = RenderBlenderFrame(renderConfig, item.blend, item.outputDir,
-                                             item.frame, item.outputFormat, item.outputExtension,
-                                             item.remote, *effectiveStop, output, renderError);
-                policyStop = true;
+                std::vector<int> frameNumbers;
+                for (const auto& frame : item.frames) frameNumbers.push_back(frame.frame);
+                RenderBlenderPackage(
+                    renderConfig, item.blend, item.outputDir, frameNumbers,
+                    item.outputFormat, item.outputExtension, item.remote,
+                    stopRequested, finishCurrentThenStop, outputs, renderError);
+                monitorFinished = true;
                 if (inputGuard.joinable()) inputGuard.join();
-                retryAfterIdle = resumedInput.load();
+                retryAfterIdle = finishCurrentThenStop.load();
             }
             if (item.remote) {
-                bool delivered = SendRemoteResult(item, success, retryAfterIdle, output, renderError);
-                if (!delivered) {
-                    std::error_code ignored;
-                    fs::path failures = owner->DataDir() / L"failed-results";
-                    fs::create_directories(failures, ignored);
-                    std::ofstream record(failures / (Utf8ToWide(item.taskId) + L".txt"),
-                                         std::ios::binary | std::ios::trunc);
-                    record << "origin=" << item.originAddress << ':' << item.originPort << '\n'
-                           << "attempt=" << item.attemptToken << '\n'
-                           << "status=" << (retryAfterIdle ? "retry" : success ? "completed" : "failed") << '\n'
-                           << "error=" << WideToUtf8(renderError) << '\n';
+                for (const auto& frame : item.frames) {
+                    auto output = outputs.find(frame.frame);
+                    bool frameSuccess = output != outputs.end();
+                    bool frameRetry = !frameSuccess && retryAfterIdle;
+                    bool delivered = SendRemoteResult(
+                        item, frame, frameSuccess, frameRetry,
+                        frameSuccess ? output->second : fs::path{}, renderError);
+                    if (!delivered) {
+                        std::error_code ignored;
+                        fs::path failures = owner->DataDir() / L"failed-results";
+                        fs::create_directories(failures, ignored);
+                        std::ofstream record(
+                            failures / (Utf8ToWide(frame.taskId) + L".txt"),
+                            std::ios::binary | std::ios::trunc);
+                        record << "origin=" << item.originAddress << ':' << item.originPort << '\n'
+                               << "attempt=" << frame.attemptToken << '\n'
+                               << "status=" << (frameRetry ? "retry" :
+                                                   frameSuccess ? "completed" : "failed") << '\n'
+                               << "error=" << WideToUtf8(renderError) << '\n';
+                    }
                 }
                 // The origin observes the worker's current task ID and requeues a
                 // lost delivery. Keep only a small diagnostic record, never an
@@ -1852,14 +2096,20 @@ struct NodeApp::Impl {
             } else {
                 std::scoped_lock lock(stateMutex);
                 for (auto& job : jobs) {
-                    auto frame = std::find_if(job.frames.begin(), job.frames.end(),
-                                              [&](const FrameTask& candidate) {
-                                                  return candidate.taskId == item.taskId;
-                                              });
-                    if (frame == job.frames.end()) continue;
-                    frame->state = success ? TaskState::Completed : TaskState::Failed;
-                    frame->output = output;
-                    frame->error = WideToUtf8(renderError);
+                    if (job.id != item.jobId) continue;
+                    for (const auto& packagedFrame : item.frames) {
+                        auto frame = std::find_if(job.frames.begin(), job.frames.end(),
+                            [&](const FrameTask& candidate) {
+                                return candidate.taskId == packagedFrame.taskId;
+                            });
+                        if (frame == job.frames.end()) continue;
+                        auto output = outputs.find(packagedFrame.frame);
+                        bool frameSuccess = output != outputs.end();
+                        frame->state = frameSuccess ? TaskState::Completed : TaskState::Failed;
+                        frame->assignedPackageId.clear();
+                        if (frameSuccess) frame->output = output->second;
+                        frame->error = frameSuccess ? "" : WideToUtf8(renderError);
+                    }
                     break;
                 }
             }
@@ -1868,13 +2118,15 @@ struct NodeApp::Impl {
                 currentTaskId.clear();
             }
             --workerAssigned;
-            if (success)
-                LogInfo("render completed; task=" + item.taskId + "; frame=" +
-                        std::to_string(item.frame));
+            if (outputs.size() == item.frames.size())
+                LogInfo("render package completed; package=" +
+                        (item.packageId.empty() ? item.taskId : item.packageId));
             else if (retryAfterIdle)
-                LogInfo("render deferred after user activity; task=" + item.taskId);
+                LogInfo("render package stopped after current frame; package=" +
+                        (item.packageId.empty() ? item.taskId : item.packageId));
             else
-                LogError("render failed; task=" + item.taskId + "; error=" +
+                LogError("render package failed; package=" +
+                         (item.packageId.empty() ? item.taskId : item.packageId) + "; error=" +
                          WideToUtf8(renderError));
             PersistJobs();
             Notify();
@@ -2097,6 +2349,13 @@ std::string NodeApp::SubmitPrepared(
 
 bool RunSelfTest(std::wstring& report) {
     try {
+        const auto packages = BuildFramePackages({1, 3, 5, 7, 9, 11, 13});
+        if (packages.size() != 2 || packages[0] != std::vector<int>({1, 3, 5, 7, 9}) ||
+            packages[1] != std::vector<int>({11, 13}) ||
+            !BuildFramePackages({1, 2}, 0).empty()) {
+            report = L"Five-frame package partition self-test failed";
+            return false;
+        }
         fs::path root = fs::temp_directory_path() / (L"RenderMesh-SelfTest-" +
             Utf8ToWide(NewRandomHex(4)));
         fs::create_directories(root);
@@ -2211,19 +2470,21 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Protocol-v2 discovery state was not authenticated";
             return false;
         }
-        json discoveryV3 = discoveryV2;
-        discoveryV3["protocol"] = 3;
-        discoveryV3["project_cache"] = true;
-        std::string discoveryV3Proof = DiscoverySignature(signatureConfig, discoveryV3);
-        discoveryV3["project_cache"] = false;
-        if (ConstantTimeEqual(discoveryV3Proof,
-                              DiscoverySignature(signatureConfig, discoveryV3))) {
-            report = L"Protocol-v3 cache capability was not authenticated";
+        json discoveryV4 = discoveryV2;
+        discoveryV4["protocol"] = 4;
+        discoveryV4["project_cache"] = true;
+        discoveryV4["frame_packages"] = true;
+        std::string discoveryV4Proof = DiscoverySignature(signatureConfig, discoveryV4);
+        discoveryV4["frame_packages"] = false;
+        if (ConstantTimeEqual(discoveryV4Proof,
+                              DiscoverySignature(signatureConfig, discoveryV4))) {
+            report = L"Protocol-v4 package capability was not authenticated";
             return false;
         }
         Peer authenticatedPeer;
-        authenticatedPeer.protocolVersion = 3;
+        authenticatedPeer.protocolVersion = 4;
         authenticatedPeer.supportsProjectCache = true;
+        authenticatedPeer.supportsFramePackages = true;
         authenticatedPeer.name = "SIGNED-NAME";
         authenticatedPeer.cpuPercent = 17;
         authenticatedPeer.idleSeconds = 181;
@@ -2235,7 +2496,8 @@ bool RunSelfTest(std::wstring& report) {
         legacyUpdate.cpuPercent = 99;
         legacyUpdate.idleSeconds = 999;
         PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
-        if (legacyUpdate.protocolVersion != 3 || !legacyUpdate.supportsProjectCache ||
+        if (legacyUpdate.protocolVersion != 4 || !legacyUpdate.supportsProjectCache ||
+            !legacyUpdate.supportsFramePackages ||
             legacyUpdate.name != "SIGNED-NAME" ||
             legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
             legacyUpdate.cpuModel != "SIGNED-CPU" ||
@@ -2399,7 +2661,7 @@ bool RunSelfTest(std::wstring& report) {
                 preflight.cpuSafeWhileActive = true;
                 std::wstring submitError;
                 std::string jobId = origin.SubmitPrepared(
-                    "two-node-self-test", preflight, 1, 3, 1, submitError);
+                    "two-node-self-test", preflight, 1, 7, 1, submitError);
                 bool clusterOk = malformedRejected && pairingStarted && paired &&
                     manuallyConnected && hardwareReported && !jobId.empty();
                 bool usedRemote = false;
@@ -2423,6 +2685,9 @@ bool RunSelfTest(std::wstring& report) {
                     for (const auto& frame : jobs.back().frames)
                         clusterOk = clusterOk && frame.state == TaskState::Completed &&
                             fs::exists(frame.output);
+                    for (size_t index = 0; index < 5; ++index)
+                        clusterOk = clusterOk &&
+                            jobs.back().frames[index].assignedNodeId == workerConfig.nodeId;
                     clusterOk = clusterOk && SafeSha256(jobs.back().projectHash) &&
                         CacheEntryValid(workerRoot, jobs.back().projectHash);
                 }
