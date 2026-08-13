@@ -58,6 +58,25 @@ bool SafeSha256(const std::string& value) {
         });
 }
 
+std::string HeaderDisplayText(std::string value, size_t limit = 256) {
+    if (value.size() > limit) value.resize(limit);
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
+        return ch < 0x20 || ch == 0x7f;
+    }), value.end());
+    return value;
+}
+
+int64_t UnixMilliseconds(std::chrono::system_clock::time_point value) {
+    if (value.time_since_epoch() == std::chrono::system_clock::duration::zero()) return 0;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        value.time_since_epoch()).count();
+}
+
+std::chrono::system_clock::time_point TimeFromUnixMilliseconds(int64_t value) {
+    if (value <= 0) return {};
+    return std::chrono::system_clock::time_point(std::chrono::milliseconds(value));
+}
+
 int HeaderInt(const httplib::Request& request, const char* name, int fallback = 0) {
     try {
         return std::stoi(request.get_header_value(name));
@@ -132,7 +151,9 @@ bool StreamRequestToFile(
     return true;
 }
 
-bool HasTransferCapacity(const httplib::Request& request, const fs::path& directory) {
+bool HasTransferCapacity(
+    const httplib::Request& request, const fs::path& directory,
+    uint64_t stagingCopies = 1) {
     std::string value = request.get_header_value("Content-Length");
     // A preflight disk-space guarantee is impossible for an unbounded chunked
     // body. RenderMesh clients always send a known file size, so reject other
@@ -150,7 +171,44 @@ bool HasTransferCapacity(const httplib::Request& request, const fs::path& direct
     ULARGE_INTEGER freeBytes{};
     if (!GetDiskFreeSpaceExW(directory.c_str(), &freeBytes, nullptr, nullptr)) return false;
     constexpr uint64_t reserve = 512ull * 1024 * 1024;
-    return freeBytes.QuadPart > requested && freeBytes.QuadPart - requested >= reserve;
+    if (!stagingCopies || requested > (UINT64_MAX - reserve) / stagingCopies) return false;
+    uint64_t required = requested * stagingCopies + reserve;
+    return freeBytes.QuadPart >= required;
+}
+
+bool HasFileCapacity(const fs::path& directory, uint64_t requested) {
+    std::error_code ignored;
+    fs::create_directories(directory, ignored);
+    ULARGE_INTEGER freeBytes{};
+    if (!GetDiskFreeSpaceExW(directory.c_str(), &freeBytes, nullptr, nullptr)) return false;
+    constexpr uint64_t reserve = 512ull * 1024 * 1024;
+    return requested <= UINT64_MAX - reserve && freeBytes.QuadPart >= requested + reserve;
+}
+
+bool CopyFileCancellable(
+    const fs::path& source, const fs::path& destination,
+    std::atomic<bool>* stopRequested, std::wstring& error) {
+    std::ifstream input(source, std::ios::binary);
+    std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+    std::vector<char> buffer(1024 * 1024);
+    while (input && output) {
+        if (stopRequested && stopRequested->load()) {
+            error = L"结果发布已取消";
+            break;
+        }
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        auto read = input.gcount();
+        if (read > 0) output.write(buffer.data(), read);
+        if (read == 0) break;
+    }
+    bool ok = input.eof() && output;
+    output.close();
+    if (!ok) {
+        if (error.empty()) error = L"结果文件复制不完整";
+        std::error_code ignored;
+        fs::remove(destination, ignored);
+    }
+    return ok;
 }
 
 std::string DiscoverySignature(const Config& config, const json& message) {
@@ -404,7 +462,8 @@ std::optional<fs::path> ResultDestination(
 bool PublishResultArtifacts(
     const fs::path& dataDir, const RenderJob& job, int frame,
     const std::map<std::string, fs::path>& artifacts,
-    const std::string& attemptToken, fs::path& primary, std::wstring& error) {
+    const std::string& attemptToken, fs::path& primary, std::wstring& error,
+    std::atomic<bool>* stopRequested = nullptr) {
     struct Publication {
         fs::path destination;
         fs::path temporary;
@@ -422,6 +481,10 @@ bool PublishResultArtifacts(
     std::set<std::wstring> destinations;
     std::error_code ec;
     for (const auto& [logical, source] : artifacts) {
+        if (stopRequested && stopRequested->load()) {
+            error = L"结果发布已取消";
+            return false;
+        }
         auto destination = ResultDestination(dataDir, job, frame, logical);
         std::wstring destinationKey = destination
             ? fs::absolute(*destination, ec).lexically_normal().wstring() : std::wstring{};
@@ -437,6 +500,12 @@ bool PublishResultArtifacts(
             error = L"无法创建工程输出目录：" + destination->parent_path().wstring();
             return false;
         }
+        uint64_t sourceSize = fs::file_size(source, ec);
+        if (ec || !HasFileCapacity(destination->parent_path(), sourceSize)) {
+            error = L"工程输出盘空间不足：" + destination->parent_path().wstring();
+            for (const auto& staged : publications) fs::remove(staged.temporary, ec);
+            return false;
+        }
         Publication publication;
         publication.destination = *destination;
         publication.temporary = *destination;
@@ -445,10 +514,9 @@ bool PublishResultArtifacts(
         publication.backup += Utf8ToWide(".rendermesh-" + attemptToken + ".bak");
         fs::remove(publication.temporary, ec);
         fs::remove(publication.backup, ec);
-        fs::copy_file(source, publication.temporary,
-                      fs::copy_options::overwrite_existing, ec);
-        if (ec) {
+        if (!CopyFileCancellable(source, publication.temporary, stopRequested, error)) {
             error = L"无法暂存结果到工程输出目录：" + destination->wstring();
+            fs::remove(publication.temporary, ec);
             for (const auto& staged : publications) fs::remove(staged.temporary, ec);
             return false;
         }
@@ -606,6 +674,7 @@ struct NodeApp::Impl {
     std::mutex persistMutex;
     std::map<std::string, Peer> peers;
     std::vector<RenderJob> jobs;
+    std::vector<ContributionRecord> contributions;
     std::mutex callbackMutex;
     std::function<void()> changed;
     mutable std::mutex manualStatusMutex;
@@ -639,6 +708,7 @@ struct NodeApp::Impl {
     }
 
     fs::path JobsPath() const { return owner->DataDir() / L"jobs.json"; }
+    fs::path ContributionsPath() const { return owner->DataDir() / L"contributions.json"; }
 
     std::string CurrentTaskId() {
         std::scoped_lock lock(currentTaskMutex);
@@ -689,10 +759,13 @@ struct NodeApp::Impl {
                         {"attempt_token", frame.attemptToken},
                         {"output", WideToUtf8(frame.output.wstring())},
                         {"error", frame.error},
+                        {"started_at", UnixMilliseconds(frame.startedAt)},
+                        {"ended_at", UnixMilliseconds(frame.endedAt)},
                     });
                 }
                 rows.push_back({
                     {"id", job.id}, {"name", job.name},
+                    {"source_blend", WideToUtf8(job.sourceBlend.wstring())},
                     {"blend", WideToUtf8(job.preparedBlend.wstring())},
                     {"project_hash", job.projectHash},
                     {"format", job.outputFormat}, {"extension", job.outputExtension},
@@ -703,6 +776,7 @@ struct NodeApp::Impl {
                     {"primary_outputs", primaryOutputs},
                     {"compositor_outputs", compositorOutputs},
                     {"addons", job.requiredAddons}, {"frames", frames},
+                    {"created_at", UnixMilliseconds(job.createdAt)},
                 });
             }
         }
@@ -731,6 +805,7 @@ struct NodeApp::Impl {
                 RenderJob job;
                 job.id = row.value("id", "");
                 job.name = row.value("name", "");
+                job.sourceBlend = Utf8ToWide(row.value("source_blend", ""));
                 job.preparedBlend = Utf8ToWide(row.value("blend", ""));
                 job.projectHash = row.value("project_hash", "");
                 if (!SafeSha256(job.projectHash) && fs::is_regular_file(job.preparedBlend))
@@ -761,7 +836,10 @@ struct NodeApp::Impl {
                     FrameTask frame;
                     frame.taskId = value.value("task_id", "");
                     frame.frame = value.value("frame", 1);
-                    frame.state = static_cast<TaskState>(value.value("state", 0));
+                    int state = value.value("state", 0);
+                    frame.state = state >= static_cast<int>(TaskState::Pending) &&
+                            state <= static_cast<int>(TaskState::Stopped)
+                        ? static_cast<TaskState>(state) : TaskState::Pending;
                     if (frame.state == TaskState::Assigned || frame.state == TaskState::Dispatching ||
                         frame.state == TaskState::Rendering)
                         frame.state = TaskState::Pending;
@@ -772,10 +850,77 @@ struct NodeApp::Impl {
                     frame.attemptToken = value.value("attempt_token", "");
                     frame.output = Utf8ToWide(value.value("output", ""));
                     frame.error = value.value("error", "");
+                    frame.startedAt = TimeFromUnixMilliseconds(value.value("started_at", int64_t{0}));
+                    frame.endedAt = TimeFromUnixMilliseconds(value.value("ended_at", int64_t{0}));
                     job.frames.push_back(std::move(frame));
                 }
+                job.createdAt = TimeFromUnixMilliseconds(row.value("created_at", int64_t{0}));
                 if (!job.id.empty()) jobs.push_back(std::move(job));
             }
+        } catch (...) {
+        }
+    }
+
+    void PersistContributions() {
+        std::scoped_lock persistLock(persistMutex);
+        json rows = json::array();
+        {
+            std::scoped_lock lock(stateMutex);
+            for (const auto& record : contributions) {
+                rows.push_back({
+                    {"package_id", record.packageId}, {"job_id", record.jobId},
+                    {"job_name", record.jobName}, {"origin_name", record.originName},
+                    {"origin_address", record.originAddress}, {"frames", record.frames},
+                    {"completed_frames", record.completedFrames}, {"state", record.state},
+                    {"error", record.error},
+                    {"started_at", UnixMilliseconds(record.startedAt)},
+                    {"ended_at", UnixMilliseconds(record.endedAt)},
+                });
+            }
+        }
+        fs::create_directories(owner->DataDir());
+        fs::path temporary = ContributionsPath();
+        temporary += L".tmp";
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            output << rows.dump(2);
+        }
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (MoveFileExW(temporary.c_str(), ContributionsPath().c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                return;
+            Sleep(static_cast<DWORD>((attempt + 1) * 20));
+        }
+    }
+
+    void LoadContributions() {
+        if (!fs::exists(ContributionsPath())) return;
+        try {
+            std::ifstream input(ContributionsPath(), std::ios::binary);
+            json rows = json::parse(input);
+            if (!rows.is_array()) return;
+            std::vector<ContributionRecord> loaded;
+            size_t first = rows.size() > 5000 ? rows.size() - 5000 : 0;
+            for (size_t index = first; index < rows.size(); ++index) {
+                const auto& row = rows[index];
+                ContributionRecord record;
+                record.packageId = row.value("package_id", "");
+                record.jobId = row.value("job_id", "");
+                record.jobName = row.value("job_name", "");
+                record.originName = row.value("origin_name", "");
+                record.originAddress = row.value("origin_address", "");
+                record.frames = row.value("frames", std::vector<int>{});
+                record.completedFrames = row.value("completed_frames", std::vector<int>{});
+                record.state = row.value("state", "");
+                record.error = row.value("error", "");
+                record.startedAt = TimeFromUnixMilliseconds(row.value("started_at", int64_t{0}));
+                record.endedAt = TimeFromUnixMilliseconds(row.value("ended_at", int64_t{0}));
+                if (SafeId(record.packageId) && SafeId(record.jobId) &&
+                    !record.frames.empty() && record.frames.size() <= 5)
+                    loaded.push_back(std::move(record));
+            }
+            std::scoped_lock lock(stateMutex);
+            contributions = std::move(loaded);
         } catch (...) {
         }
     }
@@ -1060,6 +1205,8 @@ struct NodeApp::Impl {
             }
             std::string taskId = request.get_header_value("X-RM-Task");
             std::string jobId = request.get_header_value("X-RM-Job");
+            std::string jobName = HeaderDisplayText(request.get_header_value("X-RM-Job-Name"));
+            std::string originName = HeaderDisplayText(request.get_header_value("X-RM-Origin-Name"));
             std::string hash = request.get_header_value("X-RM-Project");
             int frame = HeaderInt(request, "X-RM-Frame", 0);
             int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
@@ -1106,6 +1253,7 @@ struct NodeApp::Impl {
             WorkItem item;
             item.taskId = taskId;
             item.jobId = jobId;
+            item.jobName = jobName.empty() ? jobId : std::move(jobName);
             item.frame = frame;
             item.projectHash = hash;
             item.blend = ProjectCacheDirectory(owner->DataDir(), hash) / L"source.blend";
@@ -1120,6 +1268,7 @@ struct NodeApp::Impl {
             item.requiredAddons = std::move(addons);
             item.attemptToken = attemptToken;
             item.remote = true;
+            item.originName = originName.empty() ? request.remote_addr : std::move(originName);
             item.originAddress = request.remote_addr;
             item.originPort = originPort;
             {
@@ -1150,6 +1299,8 @@ struct NodeApp::Impl {
             }
             std::string packageId = request.get_header_value("X-RM-Package");
             std::string jobId = request.get_header_value("X-RM-Job");
+            std::string jobName = HeaderDisplayText(request.get_header_value("X-RM-Job-Name"));
+            std::string originName = HeaderDisplayText(request.get_header_value("X-RM-Origin-Name"));
             std::string hash = request.get_header_value("X-RM-Project");
             int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
             std::string format = request.get_header_value("X-RM-Format");
@@ -1224,6 +1375,7 @@ struct NodeApp::Impl {
             WorkItem item;
             item.taskId = packageFrames.front().taskId;
             item.jobId = jobId;
+            item.jobName = jobName.empty() ? jobId : std::move(jobName);
             item.frame = packageFrames.front().frame;
             item.attemptToken = packageFrames.front().attemptToken;
             item.packageId = packageId;
@@ -1242,6 +1394,7 @@ struct NodeApp::Impl {
             item.compositorOutputs = std::move(compositorOutputs);
             item.remote = true;
             item.resultBundles = request.get_header_value("X-RM-Result-Bundles") == "1";
+            item.originName = originName.empty() ? request.remote_addr : std::move(originName);
             item.originAddress = request.remote_addr;
             item.originPort = originPort;
             {
@@ -1295,6 +1448,8 @@ struct NodeApp::Impl {
                 }
                 std::string taskId = request.get_header_value("X-RM-Task");
                 std::string jobId = request.get_header_value("X-RM-Job");
+                std::string jobName = HeaderDisplayText(request.get_header_value("X-RM-Job-Name"));
+                std::string originName = HeaderDisplayText(request.get_header_value("X-RM-Origin-Name"));
                 int frame = HeaderInt(request, "X-RM-Frame", 0);
                 int originPort = HeaderInt(request, "X-RM-Origin-Port", 0);
                 std::string format = request.get_header_value("X-RM-Format");
@@ -1391,6 +1546,7 @@ struct NodeApp::Impl {
                 WorkItem item;
                 item.taskId = taskId;
                 item.jobId = jobId;
+                item.jobName = jobName.empty() ? jobId : std::move(jobName);
                 item.frame = frame;
                 item.blend = blend;
                 item.temporaryTaskDir = taskDir;
@@ -1404,6 +1560,7 @@ struct NodeApp::Impl {
                 item.requiredAddons = std::move(addons);
                 item.attemptToken = attemptToken;
                 item.remote = true;
+                item.originName = originName.empty() ? request.remote_addr : std::move(originName);
                 item.originAddress = request.remote_addr;
                 item.originPort = originPort;
                 {
@@ -1469,7 +1626,8 @@ struct NodeApp::Impl {
                     response.status = 404;
                     return;
                 }
-                if (status == "completed" && !HasTransferCapacity(request, stagingRoot)) {
+                if (status == "completed" && !HasTransferCapacity(
+                        request, stagingRoot, resultBundle ? 2 : 1)) {
                     response.status = 507;
                     response.set_content("result exceeds transfer limit or available disk space", "text/plain");
                     return;
@@ -1486,7 +1644,8 @@ struct NodeApp::Impl {
                 if (status == "completed" && ok) {
                     if (resultBundle) {
                         ok = ExtractResultBundle(stagedResult, stagingRoot / L"extracted",
-                                                 receivedArtifacts, receiveError);
+                                                 receivedArtifacts, receiveError,
+                                                 &stopRequested);
                     } else {
                         receivedArtifacts["primary"] = stagedResult;
                     }
@@ -1513,21 +1672,26 @@ struct NodeApp::Impl {
                     if (status == "completed" && ok)
                         ok = PublishResultArtifacts(
                             owner->DataDir(), jobs[targetJob], target.frame,
-                            receivedArtifacts, attemptToken, publishedPrimary, receiveError);
+                            receivedArtifacts, attemptToken, publishedPrimary, receiveError,
+                            &stopRequested);
                     if (status == "completed" && ok) {
                         target.state = TaskState::Completed;
                         target.output = publishedPrimary;
                         target.error.clear();
+                        target.endedAt = std::chrono::system_clock::now();
                     } else if (status == "retry" && ok) {
                         target.state = TaskState::Pending;
                         target.error = request.get_header_value("X-RM-Error");
                         target.assignedNodeId.clear();
                         target.assignedNodeName.clear();
                         target.attemptToken.clear();
+                        target.startedAt = {};
+                        target.endedAt = {};
                     } else {
                         target.state = TaskState::Failed;
                         target.error = request.get_header_value("X-RM-Error");
                         if (!receiveError.empty()) target.error = WideToUtf8(receiveError);
+                        target.endedAt = std::chrono::system_clock::now();
                     }
                     target.assignedAt = {};
                     target.assignedPackageId.clear();
@@ -1903,11 +2067,19 @@ struct NodeApp::Impl {
     bool DispatchRemote(const Peer& peer, const RenderJob& job, const FrameTask& frame,
                         const std::string& attemptToken,
         std::string& error) {
+        // Legacy single-frame transport returns only the primary image. Never
+        // silently mark a compositor job complete without its File Output files.
+        if (!job.compositorOutputs.empty()) {
+            error = "worker single-frame protocol cannot return compositor outputs";
+            return false;
+        }
         Config config = owner->GetConfig();
         if (!VerifyRemotePeer(peer, config, error)) return false;
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
             {"X-RM-Job", job.id}, {"X-RM-Frame", std::to_string(frame.frame)},
+            {"X-RM-Job-Name", HeaderDisplayText(job.name)},
+            {"X-RM-Origin-Name", HeaderDisplayText(config.nodeName)},
             {"X-RM-Project", job.projectHash},
             {"X-RM-Format", job.outputFormat}, {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Extension", job.outputExtension},
@@ -1972,6 +2144,8 @@ struct NodeApp::Impl {
         httplib::Headers headers = {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Package", packageId},
             {"X-RM-Job", job.id}, {"X-RM-Frames", frameMetadata.dump()},
+            {"X-RM-Job-Name", HeaderDisplayText(job.name)},
+            {"X-RM-Origin-Name", HeaderDisplayText(config.nodeName)},
             {"X-RM-Compositor", compositorMetadata.dump()},
             {"X-RM-Result-Bundles", peer.supportsResultBundles ? "1" : "0"},
             {"X-RM-Project", job.projectHash}, {"X-RM-Format", job.outputFormat},
@@ -2024,6 +2198,8 @@ struct NodeApp::Impl {
                 frame.assignedPackageId.clear();
                 frame.assignedAt = {};
                 frame.attemptToken.clear();
+                frame.startedAt = {};
+                frame.endedAt = {};
                 recovered = true;
             }
         }
@@ -2079,9 +2255,16 @@ struct NodeApp::Impl {
                 std::vector<std::string> attemptTokens;
                 for (size_t index = 0; index < frameCopies.size(); ++index)
                     attemptTokens.push_back(NewRandomHex(12));
+                bool assignmentReserved = true;
                 {
                     std::scoped_lock lock(stateMutex);
+                    assignmentReserved = jobIndex < jobs.size();
+                    for (size_t index = 0; assignmentReserved && index < frameIndices.size(); ++index)
+                        assignmentReserved = frameIndices[index] < jobs[jobIndex].frames.size() &&
+                            jobs[jobIndex].frames[frameIndices[index]].state == TaskState::Dispatching;
+                    if (!assignmentReserved) handled = true;
                     for (size_t index = 0; index < frameIndices.size(); ++index) {
+                        if (!assignmentReserved) break;
                         if (jobIndex >= jobs.size() ||
                             frameIndices[index] >= jobs[jobIndex].frames.size())
                             continue;
@@ -2092,14 +2275,16 @@ struct NodeApp::Impl {
                         frame.assignedPackageId = packageId;
                         frame.assignedAt = {};
                         frame.attemptToken = attemptTokens[index];
+                        frame.startedAt = std::chrono::system_clock::now();
+                        frame.endedAt = {};
                         ++frame.dispatchAttempts;
                     }
                 }
-                bool dispatched = peer->supportsFramePackages
+                bool dispatched = assignmentReserved && (peer->supportsFramePackages
                     ? DispatchRemotePackage(*peer, jobCopy, frameCopies, attemptTokens,
                                             packageId, dispatchError)
                     : DispatchRemote(*peer, jobCopy, frameCopies.front(),
-                                     attemptTokens.front(), dispatchError);
+                                     attemptTokens.front(), dispatchError));
                 if (dispatched) {
                     std::scoped_lock lock(stateMutex);
                     for (size_t index = 0; index < frameIndices.size(); ++index) {
@@ -2132,6 +2317,8 @@ struct NodeApp::Impl {
                             frame.assignedPackageId.clear();
                             frame.assignedAt = {};
                             frame.attemptToken.clear();
+                            frame.startedAt = {};
+                            frame.endedAt = {};
                             frame.error = dispatchError;
                             ++restored;
                         }
@@ -2165,14 +2352,16 @@ struct NodeApp::Impl {
                 item.requiresGpu = jobCopy.requiresGpu;
                 item.requiredAddons = jobCopy.requiredAddons;
                 item.compositorOutputs = jobCopy.compositorOutputs;
-                {
-                    std::scoped_lock workLock(workMutex);
-                    work.push(item);
-                }
+                bool localReserved = true;
                 {
                     std::scoped_lock lock(stateMutex);
+                    localReserved = jobIndex < jobs.size();
+                    for (size_t frameIndex : frameIndices)
+                        localReserved = localReserved && frameIndex < jobs[jobIndex].frames.size() &&
+                            jobs[jobIndex].frames[frameIndex].state == TaskState::Dispatching;
                     Config config = owner->GetConfig();
                     for (size_t frameIndex : frameIndices) {
+                        if (!localReserved) break;
                         auto& frame = jobs[jobIndex].frames[frameIndex];
                         frame.state = TaskState::Rendering;
                         frame.assignedNodeId = config.nodeId;
@@ -2180,9 +2369,17 @@ struct NodeApp::Impl {
                         frame.assignedPackageId = item.packageId;
                         frame.assignedAt = {};
                         frame.attemptToken.clear();
+                        frame.startedAt = std::chrono::system_clock::now();
+                        frame.endedAt = {};
                     }
                 }
-                workCv.notify_one();
+                if (localReserved) {
+                    std::scoped_lock workLock(workMutex);
+                    work.push(std::move(item));
+                    workCv.notify_one();
+                } else {
+                    --workerAssigned;
+                }
                 handled = true;
             }
             if (!handled) {
@@ -2192,12 +2389,15 @@ struct NodeApp::Impl {
                         for (size_t frameIndex : frameIndices) {
                             if (frameIndex >= jobs[jobIndex].frames.size()) continue;
                             auto& frame = jobs[jobIndex].frames[frameIndex];
+                            if (frame.state != TaskState::Dispatching) continue;
                             frame.state = TaskState::Pending;
                             frame.assignedNodeId.clear();
                             frame.assignedNodeName.clear();
                             frame.assignedPackageId.clear();
                             frame.assignedAt = {};
                             frame.attemptToken.clear();
+                            frame.startedAt = {};
+                            frame.endedAt = {};
                         }
                     }
                 }
@@ -2254,6 +2454,31 @@ struct NodeApp::Impl {
             }
             if (item.frames.empty())
                 item.frames.push_back({item.taskId, item.frame, item.attemptToken});
+            if (!item.remote) {
+                bool allStopped = true;
+                {
+                    std::scoped_lock lock(stateMutex);
+                    auto job = std::find_if(jobs.begin(), jobs.end(), [&](const RenderJob& value) {
+                        return value.id == item.jobId;
+                    });
+                    if (job != jobs.end()) {
+                        for (const auto& packagedFrame : item.frames) {
+                            auto frame = std::find_if(job->frames.begin(), job->frames.end(),
+                                [&](const FrameTask& value) {
+                                    return value.taskId == packagedFrame.taskId;
+                                });
+                            allStopped = allStopped && frame != job->frames.end() &&
+                                frame->state == TaskState::Stopped;
+                        }
+                    }
+                }
+                if (allStopped) {
+                    --workerAssigned;
+                    PersistJobs();
+                    Notify();
+                    continue;
+                }
+            }
             {
                 std::scoped_lock lock(currentTaskMutex);
                 currentTaskId = item.packageId.empty() ? item.taskId : item.packageId;
@@ -2261,6 +2486,8 @@ struct NodeApp::Impl {
             LogInfo("render package started; package=" +
                     (item.packageId.empty() ? item.taskId : item.packageId) + "; frames=" +
                     std::to_string(item.frames.size()));
+            const auto packageStartedAt = std::chrono::system_clock::now();
+            std::vector<int> deliveredFrames;
             std::map<int, std::vector<RenderArtifact>> outputs;
             std::wstring renderError;
             bool retryAfterIdle = false;
@@ -2314,7 +2541,7 @@ struct NodeApp::Impl {
                         transferFile = item.outputDir /
                             (L"result-" + std::to_wstring(frame.frame) + L".rmbundle");
                         frameSuccess = WriteResultBundle(transferFile, output->second,
-                                                         bundleError);
+                                                         bundleError, &stopRequested);
                         if (!frameSuccess) renderError = std::move(bundleError);
                     } else if (frameSuccess) {
                         auto primary = std::find_if(
@@ -2330,6 +2557,7 @@ struct NodeApp::Impl {
                     bool delivered = SendRemoteResult(
                         item, frame, frameSuccess, frameRetry,
                         frameSuccess ? transferFile : fs::path{}, renderError);
+                    if (delivered && frameSuccess) deliveredFrames.push_back(frame.frame);
                     if (!delivered) {
                         std::error_code ignored;
                         fs::path failures = owner->DataDir() / L"failed-results";
@@ -2355,6 +2583,29 @@ struct NodeApp::Impl {
                     std::scoped_lock lock(cacheMutex);
                     TouchCacheEntry(owner->DataDir(), item.projectHash);
                 }
+                ContributionRecord record;
+                record.packageId = item.packageId.empty() ? item.taskId : item.packageId;
+                record.jobId = item.jobId;
+                record.jobName = item.jobName.empty() ? item.jobId : item.jobName;
+                record.originName = item.originName.empty() ? item.originAddress : item.originName;
+                record.originAddress = item.originAddress + ":" + std::to_string(item.originPort);
+                for (const auto& frame : item.frames) record.frames.push_back(frame.frame);
+                record.completedFrames = std::move(deliveredFrames);
+                record.state = record.completedFrames.size() == record.frames.size()
+                    ? "completed" : retryAfterIdle ? "stopped"
+                    : record.completedFrames.empty() ? "failed" : "partial";
+                record.error = record.state == "completed" ? "" : WideToUtf8(renderError);
+                record.startedAt = packageStartedAt;
+                record.endedAt = std::chrono::system_clock::now();
+                {
+                    std::scoped_lock lock(stateMutex);
+                    contributions.push_back(std::move(record));
+                    if (contributions.size() > 5000)
+                        contributions.erase(contributions.begin(),
+                                            contributions.begin() +
+                                                static_cast<ptrdiff_t>(contributions.size() - 5000));
+                }
+                PersistContributions();
             } else {
                 std::scoped_lock lock(stateMutex);
                 for (auto& job : jobs) {
@@ -2375,13 +2626,16 @@ struct NodeApp::Impl {
                                 artifacts[artifact.logicalPath] = artifact.source;
                             frameSuccess = PublishResultArtifacts(
                                 owner->DataDir(), job, packagedFrame.frame, artifacts,
-                                item.packageId, publishedPrimary, publishError);
+                                item.packageId, publishedPrimary, publishError,
+                                &stopRequested);
                         }
+                        if (frame->state == TaskState::Stopped) continue;
                         frame->state = frameSuccess ? TaskState::Completed : TaskState::Failed;
                         frame->assignedPackageId.clear();
                         if (frameSuccess) frame->output = publishedPrimary;
                         frame->error = frameSuccess ? "" : WideToUtf8(
                             publishError.empty() ? renderError : publishError);
+                        frame->endedAt = std::chrono::system_clock::now();
                     }
                     break;
                 }
@@ -2414,6 +2668,7 @@ NodeApp::NodeApp(ConfigStore store, Config config, bool mockRenderer,
     : impl_(std::make_unique<Impl>(this, assignmentGrace)), store_(std::move(store)),
       config_(std::move(config)), mockRenderer_(mockRenderer) {
     impl_->LoadJobs();
+    impl_->LoadContributions();
 }
 
 NodeApp::~NodeApp() { Stop(); }
@@ -2482,7 +2737,8 @@ bool NodeApp::UpdateConfig(Config config, std::wstring& error) {
     if (config.nodeName.empty() || !IsInviteCode(config.inviteCode) ||
         (!config.pairingPending && config.clusterToken.size() < 16) ||
         config.activeCpuPercent < 1 || config.activeCpuPercent > 100 ||
-        config.idleAfterSeconds < 1 || config.idleAfterSeconds > 86400) {
+        config.idleAfterSeconds < 1 || config.idleAfterSeconds > 86400 ||
+        (config.theme != "system" && config.theme != "light" && config.theme != "dark")) {
         error = L"设置值无效";
         return false;
     }
@@ -2540,6 +2796,58 @@ std::vector<RenderJob> NodeApp::Jobs() const {
     return impl_->jobs;
 }
 
+std::vector<ContributionRecord> NodeApp::Contributions() const {
+    std::scoped_lock lock(impl_->stateMutex);
+    return impl_->contributions;
+}
+
+bool NodeApp::StopJob(const std::string& jobId, std::wstring& error) {
+    if (!SafeId(jobId)) {
+        error = L"任务 ID 无效";
+        return false;
+    }
+    std::vector<fs::path> stopMarkers;
+    bool found = false;
+    auto now = std::chrono::system_clock::now();
+    std::string localNodeId = GetConfig().nodeId;
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        for (auto& job : impl_->jobs) {
+            if (job.id != jobId) continue;
+            found = true;
+            for (auto& frame : job.frames) {
+                if (frame.state == TaskState::Completed || frame.state == TaskState::Failed ||
+                    frame.state == TaskState::Stopped)
+                    continue;
+                if (!frame.assignedPackageId.empty() &&
+                    frame.assignedNodeId == localNodeId)
+                    stopMarkers.push_back(DataDir() / L"jobs" / Utf8ToWide(job.id) / L"packages" /
+                                          Utf8ToWide(frame.assignedPackageId) /
+                                          L"stop-after-current");
+                frame.state = TaskState::Stopped;
+                frame.endedAt = now;
+                frame.assignedAt = {};
+                frame.attemptToken.clear();
+                frame.error.clear();
+            }
+            break;
+        }
+    }
+    if (!found) {
+        error = L"未找到任务";
+        return false;
+    }
+    for (const auto& marker : stopMarkers) {
+        std::error_code ignored;
+        fs::create_directories(marker.parent_path(), ignored);
+        std::ofstream(marker, std::ios::binary | std::ios::trunc) << "stop";
+    }
+    impl_->PersistJobs();
+    impl_->Notify();
+    LogInfo("job stopped; id=" + jobId);
+    return true;
+}
+
 HardwareInfo NodeApp::Hardware() const { return impl_->hardware; }
 
 int NodeApp::AssignedCount() const {
@@ -2587,6 +2895,7 @@ std::string NodeApp::SubmitPrepared(
     RenderJob job;
     job.id = id;
     job.name = std::move(name);
+    job.sourceBlend = report.sourceBlend;
     job.preparedBlend = source;
     job.projectHash = Sha256File(source);
     if (!SafeSha256(job.projectHash)) {
@@ -2648,6 +2957,7 @@ bool RunSelfTest(std::wstring& report) {
         config.inviteCode = "042731";
         config.clusterToken = "legacy-token-123";
         config.manualPeerEndpoint = "192.168.28.28:8391";
+        config.theme = "dark";
         std::wstring error;
         Config persisted;
         if (!store.Save(config, error) ||
@@ -2655,7 +2965,8 @@ bool RunSelfTest(std::wstring& report) {
             persisted.idleAfterSeconds != 7 ||
             persisted.inviteCode != "042731" ||
             persisted.clusterToken != "legacy-token-123" ||
-            persisted.manualPeerEndpoint != config.manualPeerEndpoint) {
+            persisted.manualPeerEndpoint != config.manualPeerEndpoint ||
+            persisted.theme != "dark") {
             report = L"配置持久化失败：" + error;
             return false;
         }
@@ -2720,6 +3031,15 @@ bool RunSelfTest(std::wstring& report) {
         std::ofstream(bundlePass, std::ios::binary) << "pass";
         fs::path bundle = root / L"result.rmbundle";
         std::map<std::string, fs::path> extracted;
+        std::atomic<bool> bundleCancelled = true;
+        fs::path cancelledBundle = root / L"cancelled.rmbundle";
+        std::wstring cancelledError;
+        if (WriteResultBundle(cancelledBundle, {{"primary", bundlePrimary}},
+                              cancelledError, &bundleCancelled) ||
+            fs::exists(cancelledBundle) || fs::exists(cancelledBundle.wstring() + L".tmp")) {
+            report = L"Cancelled result bundle write self-test failed";
+            return false;
+        }
         if (!WriteResultBundle(
                 bundle,
                 {{"primary", bundlePrimary},
@@ -2729,6 +3049,13 @@ bool RunSelfTest(std::wstring& report) {
             extracted.size() != 2 || !extracted.contains("primary") ||
             !extracted.contains("compositor/output-0/ViewLayer/Depth0001.exr")) {
             report = L"Multi-output result bundle self-test failed: " + error;
+            return false;
+        }
+        std::map<std::string, fs::path> cancelledExtraction;
+        if (ExtractResultBundle(bundle, root / L"cancelled-extracted", cancelledExtraction,
+                                cancelledError, &bundleCancelled) ||
+            fs::exists(root / L"cancelled-extracted")) {
+            report = L"Cancelled result bundle extraction self-test failed";
             return false;
         }
         fs::path unsafeBundle = root / L"unsafe.rmbundle";
@@ -2969,6 +3296,7 @@ bool RunSelfTest(std::wstring& report) {
                 }
                 PreflightReport preflight;
                 preflight.passed = true;
+                preflight.sourceBlend = prepared;
                 preflight.preparedBlend = prepared;
                 preflight.blenderVersion = "4.5";
                 preflight.renderEngine = "CYCLES";
@@ -2982,10 +3310,34 @@ bool RunSelfTest(std::wstring& report) {
                 preflight.compositorOutputs.push_back(
                     {"output-0", "SelfTest Multi Output", finalOutputRoot / L"compositor"});
                 std::wstring submitError;
+                fs::path stoppedRoot = root / L"stopped-job";
+                ConfigStore stoppedStore(stoppedRoot);
+                Config stoppedConfig = stoppedStore.Load();
+                NodeApp stoppedApp(std::move(stoppedStore), stoppedConfig, true);
+                std::string stoppedJobId = stoppedApp.SubmitPrepared(
+                    "stopped-self-test", preflight, 20, 22, 1, submitError);
+                bool stoppedOk = !stoppedJobId.empty() &&
+                    stoppedApp.StopJob(stoppedJobId, submitError);
+                for (const auto& stoppedJob : stoppedApp.Jobs())
+                    if (stoppedJob.id == stoppedJobId)
+                        for (const auto& frame : stoppedJob.frames)
+                            stoppedOk = stoppedOk && frame.state == TaskState::Stopped &&
+                                frame.endedAt.time_since_epoch() !=
+                                    std::chrono::system_clock::duration::zero();
+                NodeApp reloadedStopped(ConfigStore(stoppedRoot), stoppedConfig, true);
+                bool stoppedReloaded = false;
+                for (const auto& stoppedJob : reloadedStopped.Jobs())
+                    if (stoppedJob.id == stoppedJobId) {
+                        stoppedReloaded = !stoppedJob.frames.empty();
+                        for (const auto& frame : stoppedJob.frames)
+                            stoppedReloaded = stoppedReloaded &&
+                                frame.state == TaskState::Stopped;
+                    }
                 std::string jobId = origin.SubmitPrepared(
                     "two-node-self-test", preflight, 1, 7, 1, submitError);
                 bool clusterOk = malformedRejected && pairingStarted && paired &&
-                    manuallyConnected && hardwareReported && !jobId.empty();
+                    manuallyConnected && hardwareReported && stoppedOk && stoppedReloaded &&
+                    !jobId.empty();
                 bool usedRemote = false;
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
                 while (clusterOk && std::chrono::steady_clock::now() < deadline) {
@@ -3006,6 +3358,9 @@ bool RunSelfTest(std::wstring& report) {
                 if (clusterOk) {
                     for (const auto& frame : jobs.back().frames)
                         clusterOk = clusterOk && frame.state == TaskState::Completed &&
+                            frame.startedAt.time_since_epoch() !=
+                                std::chrono::system_clock::duration::zero() &&
+                            frame.endedAt >= frame.startedAt &&
                             fs::exists(frame.output) &&
                             fs::exists(finalOutputRoot / L"compositor" / L"ViewLayer" /
                                 (L"pass_" + std::to_wstring(frame.frame) + L".exr"));
@@ -3016,7 +3371,33 @@ bool RunSelfTest(std::wstring& report) {
                         CacheEntryValid(workerRoot, jobs.back().projectHash);
                 }
                 if (clusterOk) {
+                    bool historyRecorded = false;
+                    auto historyDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+                    while (std::chrono::steady_clock::now() < historyDeadline) {
+                        for (const auto& record : worker.Contributions()) {
+                            if (record.jobId == jobId && record.jobName == "two-node-self-test" &&
+                                record.frames.size() == 5 && record.completedFrames.size() == 5 &&
+                                record.state == "completed" &&
+                                record.endedAt >= record.startedAt) {
+                                historyRecorded = true;
+                                break;
+                            }
+                        }
+                        if (historyRecorded) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                    clusterOk = historyRecorded;
+                    if (!historyRecorded) error = L"worker contribution history self-test failed";
+                }
+                if (clusterOk) {
                     worker.Stop();
+                    NodeApp reloadedWorker(ConfigStore(workerRoot), workerConfig, true);
+                    bool historyReloaded = false;
+                    for (const auto& record : reloadedWorker.Contributions())
+                        historyReloaded = historyReloaded ||
+                            (record.jobId == jobId && record.completedFrames.size() == 5);
+                    clusterOk = historyReloaded;
                     origin.RemovePeerForTest(workerConfig.nodeId);
                     httplib::Server lostServer;
                     lostServer.Get("/v1/prove", [&](const httplib::Request& request,
@@ -3046,8 +3427,10 @@ bool RunSelfTest(std::wstring& report) {
                     lostPeer.shareEnabled = true;
                     lostPeer.trusted = true;
                     origin.InjectPeerForTest(std::move(lostPeer));
+                    PreflightReport legacyRecovery = preflight;
+                    legacyRecovery.compositorOutputs.clear();
                     std::string recoveryJob = origin.SubmitPrepared(
-                        "lost-worker-self-test", preflight, 4, 4, 1, submitError);
+                        "lost-worker-self-test", legacyRecovery, 4, 4, 1, submitError);
                     bool reachedAssigned = false;
                     std::string expiredAttempt;
                     auto assignDeadline = std::chrono::steady_clock::now() +
@@ -3105,7 +3488,7 @@ bool RunSelfTest(std::wstring& report) {
                     bool staleRejected = staleResult && staleResult->status == 409;
                     clusterOk = reachedAssigned && recoveredLocally && staleRejected;
                 }
-                if (!clusterOk) error = L"two-node HTTP dispatch/result test failed";
+                if (!clusterOk && error.empty()) error = L"two-node HTTP dispatch/result test failed";
                 limited = limited && clusterOk;
             } else {
                 limited = false;

@@ -72,6 +72,7 @@ struct Config {
     int discoveryPort = 8390;
     fs::path blenderPath;
     std::string manualPeerEndpoint;
+    std::string theme = "system";
 };
 
 class ConfigStore {
@@ -117,6 +118,7 @@ struct PreflightReport {
     std::vector<std::string> warnings;
     std::map<int, fs::path> primaryOutputs;
     std::vector<OutputTarget> compositorOutputs;
+    fs::path sourceBlend;
     fs::path preparedBlend;
     std::wstring summary;
 };
@@ -169,14 +171,16 @@ bool RenderBlenderPackage(
 bool WriteResultBundle(
     const fs::path& destination,
     const std::vector<RenderArtifact>& artifacts,
-    std::wstring& error);
+    std::wstring& error,
+    std::atomic<bool>* stopRequested = nullptr);
 bool ExtractResultBundle(
     const fs::path& bundle,
     const fs::path& stagingDirectory,
     std::map<std::string, fs::path>& artifacts,
-    std::wstring& error);
+    std::wstring& error,
+    std::atomic<bool>* stopRequested = nullptr);
 
-enum class TaskState { Pending, Dispatching, Assigned, Rendering, Completed, Failed };
+enum class TaskState { Pending, Dispatching, Assigned, Rendering, Completed, Failed, Stopped };
 
 std::wstring TaskStateLabel(TaskState state);
 
@@ -192,11 +196,14 @@ struct FrameTask {
     std::string attemptToken;
     fs::path output;
     std::string error;
+    std::chrono::system_clock::time_point startedAt{};
+    std::chrono::system_clock::time_point endedAt{};
 };
 
 struct RenderJob {
     std::string id;
     std::string name;
+    fs::path sourceBlend;
     fs::path preparedBlend;
     std::string projectHash;
     std::string outputFormat = "PNG";
@@ -210,6 +217,20 @@ struct RenderJob {
     std::vector<OutputTarget> compositorOutputs;
     std::vector<FrameTask> frames;
     std::chrono::system_clock::time_point createdAt;
+};
+
+struct ContributionRecord {
+    std::string packageId;
+    std::string jobId;
+    std::string jobName;
+    std::string originName;
+    std::string originAddress;
+    std::vector<int> frames;
+    std::vector<int> completedFrames;
+    std::string state;
+    std::string error;
+    std::chrono::system_clock::time_point startedAt{};
+    std::chrono::system_clock::time_point endedAt{};
 };
 
 struct Peer {
@@ -243,6 +264,7 @@ struct WorkItem {
     };
     std::string taskId;
     std::string jobId;
+    std::string jobName;
     int frame = 1;
     std::string packageId;
     std::vector<Frame> frames;
@@ -261,6 +283,7 @@ struct WorkItem {
     std::vector<OutputTarget> compositorOutputs;
     bool remote = false;
     bool resultBundles = false;
+    std::string originName;
     std::string originAddress;
     int originPort = 8391;
 };
@@ -294,6 +317,8 @@ public:
     std::wstring ManualPeerStatus() const;
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
+    std::vector<ContributionRecord> Contributions() const;
+    bool StopJob(const std::string& jobId, std::wstring& error);
     HardwareInfo Hardware() const;
     int AssignedCount() const;
     bool Running() const { return running_; }

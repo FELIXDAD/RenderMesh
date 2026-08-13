@@ -3,8 +3,11 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <uxtheme.h>
+#include <wincodec.h>
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 
@@ -41,6 +44,21 @@ enum ControlId {
     ID_MANUAL_ENDPOINT,
     ID_CONNECT_MANUAL,
     ID_MANUAL_STATUS,
+    ID_THEME,
+    ID_JOB_DETAILS,
+    ID_CONTRIBUTIONS,
+    ID_NAV_DASHBOARD,
+    ID_NAV_TASKS,
+    ID_NAV_CONTRIBUTIONS,
+    ID_NAV_SETTINGS,
+    ID_CONTRIBUTION_LIST,
+    ID_DETAIL_FRAMES = 300,
+    ID_DETAIL_SUMMARY,
+    ID_DETAIL_PREVIEW,
+    ID_DETAIL_OPEN_SOURCE,
+    ID_DETAIL_OPEN_OUTPUT,
+    ID_DETAIL_STOP,
+    ID_DETAIL_PREVIEW_STATUS,
 };
 
 std::unique_ptr<NodeApp> gApp;
@@ -50,6 +68,109 @@ HFONT gTitleFont = nullptr;
 std::thread gPreflight;
 std::atomic<bool> gPreflightRunning = false;
 std::atomic<bool> gPreflightStop = false;
+HWND gDetailWindow = nullptr;
+std::string gDetailJobId;
+HBITMAP gPreviewBitmap = nullptr;
+int gCurrentPage = 0;
+int gInitialPage = 0;
+bool gOpenInitialDetail = false;
+bool gDarkTheme = false;
+HBRUSH gBackgroundBrush = nullptr;
+HBRUSH gSurfaceBrush = nullptr;
+std::array<std::vector<HWND>, 4> gPageControls;
+
+constexpr COLORREF kAccent = RGB(77, 69, 233);
+
+std::wstring FormatTime(std::chrono::system_clock::time_point value) {
+    if (value.time_since_epoch() == std::chrono::system_clock::duration::zero()) return L"-";
+    std::time_t raw = std::chrono::system_clock::to_time_t(value);
+    std::tm local{};
+    localtime_s(&local, &raw);
+    wchar_t text[32]{};
+    wcsftime(text, std::size(text), L"%Y-%m-%d %H:%M:%S", &local);
+    return text;
+}
+
+std::wstring FormatDuration(
+    std::chrono::system_clock::time_point started,
+    std::chrono::system_clock::time_point ended = {}) {
+    if (started.time_since_epoch() == std::chrono::system_clock::duration::zero()) return L"-";
+    if (ended.time_since_epoch() == std::chrono::system_clock::duration::zero())
+        ended = std::chrono::system_clock::now();
+    auto seconds = std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::seconds>(ended - started).count());
+    wchar_t text[40]{};
+    swprintf_s(text, L"%02lld:%02lld:%02lld", seconds / 3600,
+               (seconds / 60) % 60, seconds % 60);
+    return text;
+}
+
+std::wstring FrameNumbers(const std::vector<int>& frames) {
+    std::wstring result;
+    for (int frame : frames) {
+        if (!result.empty()) result += L", ";
+        result += std::to_wstring(frame);
+    }
+    return result;
+}
+
+std::optional<RenderJob> FindJob(const std::string& id) {
+    if (!gApp) return std::nullopt;
+    for (auto& job : gApp->Jobs()) if (job.id == id) return job;
+    return std::nullopt;
+}
+
+bool SystemUsesDarkTheme() {
+    DWORD value = 1, size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+        value == 0;
+}
+
+bool ResolveDarkTheme(const Config& config) {
+    return config.theme == "dark" || (config.theme == "system" && SystemUsesDarkTheme());
+}
+
+void ApplyTheme() {
+    if (!gApp || !gWindow) return;
+    gDarkTheme = ResolveDarkTheme(gApp->GetConfig());
+    if (gBackgroundBrush) DeleteObject(gBackgroundBrush);
+    if (gSurfaceBrush) DeleteObject(gSurfaceBrush);
+    COLORREF background = gDarkTheme ? RGB(18, 18, 24) : RGB(246, 247, 251);
+    COLORREF surface = gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255);
+    COLORREF text = gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38);
+    gBackgroundBrush = CreateSolidBrush(background);
+    gSurfaceBrush = CreateSolidBrush(surface);
+    for (int id : {ID_NODES, ID_JOBS, ID_CONTRIBUTION_LIST, ID_DETAIL_FRAMES}) {
+        HWND list = id == ID_DETAIL_FRAMES && gDetailWindow
+            ? GetDlgItem(gDetailWindow, id) : GetDlgItem(gWindow, id);
+        if (!list) continue;
+        ListView_SetBkColor(list, surface);
+        ListView_SetTextBkColor(list, surface);
+        ListView_SetTextColor(list, text);
+    }
+    BOOL dark = gDarkTheme;
+    SetWindowTheme(GetDlgItem(gWindow, ID_NODES),
+                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    SetWindowTheme(GetDlgItem(gWindow, ID_JOBS),
+                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    SetWindowTheme(GetDlgItem(gWindow, ID_CONTRIBUTION_LIST),
+                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (dwm) {
+        using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+        auto setAttribute = reinterpret_cast<SetAttribute>(
+            GetProcAddress(dwm, "DwmSetWindowAttribute"));
+        if (setAttribute) {
+            setAttribute(gWindow, 20, &dark, sizeof(dark));
+            if (gDetailWindow) setAttribute(gDetailWindow, 20, &dark, sizeof(dark));
+        }
+        FreeLibrary(dwm);
+    }
+    InvalidateRect(gWindow, nullptr, TRUE);
+    if (gDetailWindow) InvalidateRect(gDetailWindow, nullptr, TRUE);
+}
 
 HWND Item(int id) { return GetDlgItem(gWindow, id); }
 
@@ -94,6 +215,21 @@ HWND Label(const wchar_t* text, int x, int y, int width, int height, int id = 0,
     return AddControl(L"STATIC", text, SS_LEFT, x, y, width, height, id, font);
 }
 
+HWND PageControl(int page, HWND control) {
+    if (page >= 0 && page < static_cast<int>(gPageControls.size()))
+        gPageControls[static_cast<size_t>(page)].push_back(control);
+    return control;
+}
+
+void ShowPage(int page) {
+    gCurrentPage = std::clamp(page, 0, 3);
+    for (size_t index = 0; index < gPageControls.size(); ++index)
+        for (HWND control : gPageControls[index])
+            ShowWindow(control, static_cast<int>(index) == gCurrentPage ? SW_SHOW : SW_HIDE);
+    for (int id : {ID_NAV_DASHBOARD, ID_NAV_TASKS, ID_NAV_CONTRIBUTIONS, ID_NAV_SETTINGS})
+        InvalidateRect(Item(id), nullptr, TRUE);
+}
+
 void AddColumn(HWND list, int index, int width, const wchar_t* title) {
     LVCOLUMNW column{};
     column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -113,6 +249,148 @@ void SetCell(HWND list, int row, int column, const std::wstring& value) {
     } else {
         ListView_SetItemText(list, row, column, const_cast<wchar_t*>(value.c_str()));
     }
+}
+
+HBITMAP LoadPreviewBitmap(const fs::path& path, UINT maxWidth, UINT maxHeight) {
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HBITMAP bitmap = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr)) hr = factory->CreateDecoderFromFilename(
+        path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
+    UINT width = 0, height = 0;
+    if (SUCCEEDED(hr)) hr = frame->GetSize(&width, &height);
+    if (SUCCEEDED(hr) && width && height) {
+        double scale = std::min({1.0, static_cast<double>(maxWidth) / width,
+                                 static_cast<double>(maxHeight) / height});
+        width = std::max<UINT>(1, static_cast<UINT>(width * scale));
+        height = std::max<UINT>(1, static_cast<UINT>(height * scale));
+        hr = factory->CreateBitmapScaler(&scaler);
+        if (SUCCEEDED(hr)) hr = scaler->Initialize(frame, width, height,
+                                                   WICBitmapInterpolationModeFant);
+        if (SUCCEEDED(hr)) hr = factory->CreateFormatConverter(&converter);
+        if (SUCCEEDED(hr)) hr = converter->Initialize(
+            scaler, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+            nullptr, 0, WICBitmapPaletteTypeCustom);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = static_cast<LONG>(width);
+        info.bmiHeader.biHeight = -static_cast<LONG>(height);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* pixels = nullptr;
+        if (SUCCEEDED(hr)) bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS,
+                                                     &pixels, nullptr, 0);
+        if (bitmap) {
+            hr = converter->CopyPixels(nullptr, width * 4, width * height * 4,
+                                       static_cast<BYTE*>(pixels));
+            if (FAILED(hr)) {
+                DeleteObject(bitmap);
+                bitmap = nullptr;
+            }
+        }
+    }
+    if (converter) converter->Release();
+    if (scaler) scaler->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    return bitmap;
+}
+
+void ShowInExplorer(const fs::path& path) {
+    if (path.empty()) return;
+    fs::path target = fs::is_directory(path) ? path : path.parent_path();
+    if (fs::is_regular_file(path)) {
+        std::wstring parameters = L"/select,\"" + path.wstring() + L"\"";
+        ShellExecuteW(gWindow, L"open", L"explorer.exe", parameters.c_str(), nullptr,
+                      SW_SHOWNORMAL);
+    } else if (!target.empty()) {
+        ShellExecuteW(gWindow, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+void RefreshJobDetail(bool preserveSelection = true) {
+    if (!gDetailWindow) return;
+    auto jobValue = FindJob(gDetailJobId);
+    if (!jobValue) {
+        DestroyWindow(gDetailWindow);
+        return;
+    }
+    const auto& job = *jobValue;
+    HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
+    int selectedFrame = -1;
+    if (preserveSelection) {
+        int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+        if (selected >= 0 && selected < static_cast<int>(job.frames.size()))
+            selectedFrame = job.frames[static_cast<size_t>(selected)].frame;
+    }
+    int completed = 0, failed = 0, stopped = 0, active = 0;
+    ListView_DeleteAllItems(list);
+    for (int index = 0; index < static_cast<int>(job.frames.size()); ++index) {
+        const auto& frame = job.frames[static_cast<size_t>(index)];
+        completed += frame.state == TaskState::Completed;
+        failed += frame.state == TaskState::Failed;
+        stopped += frame.state == TaskState::Stopped;
+        active += frame.state == TaskState::Assigned || frame.state == TaskState::Rendering ||
+                  frame.state == TaskState::Dispatching;
+        SetCell(list, index, 0, std::to_wstring(frame.frame));
+        SetCell(list, index, 1, TaskStateLabel(frame.state));
+        SetCell(list, index, 2, Utf8ToWide(frame.assignedNodeName));
+        SetCell(list, index, 3, Utf8ToWide(frame.assignedPackageId));
+        SetCell(list, index, 4, FormatDuration(frame.startedAt, frame.endedAt));
+        SetCell(list, index, 5, FormatTime(frame.startedAt));
+        SetCell(list, index, 6, FormatTime(frame.endedAt));
+        SetCell(list, index, 7, frame.error.empty() ? frame.output.wstring()
+                                                    : Utf8ToWide(frame.error));
+        if (frame.frame == selectedFrame)
+            ListView_SetItemState(list, index, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    if (!preserveSelection && !job.frames.empty())
+        ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+    std::wstring summary = Utf8ToWide(job.name) + L"    总帧数 " +
+        std::to_wstring(job.frames.size()) + L"    已完成 " + std::to_wstring(completed) +
+        L"    渲染中 " + std::to_wstring(active) + L"    错误 " +
+        std::to_wstring(failed) + L"    已停止 " + std::to_wstring(stopped) +
+        L"    提交时间 " + FormatTime(job.createdAt);
+    SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_SUMMARY), summary.c_str());
+}
+
+void UpdateFramePreview() {
+    if (!gDetailWindow) return;
+    auto job = FindJob(gDetailJobId);
+    if (!job) return;
+    HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
+    int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    HWND preview = GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW);
+    if (gPreviewBitmap) {
+        DeleteObject(gPreviewBitmap);
+        gPreviewBitmap = nullptr;
+    }
+    if (selected < 0 || selected >= static_cast<int>(job->frames.size())) {
+        SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
+                       L"选择一帧查看预览");
+        SendMessageW(preview, STM_SETIMAGE, IMAGE_BITMAP, 0);
+        return;
+    }
+    const auto& frame = job->frames[static_cast<size_t>(selected)];
+    if (!frame.output.empty() && fs::is_regular_file(frame.output))
+        gPreviewBitmap = LoadPreviewBitmap(frame.output, 330, 220);
+    SendMessageW(preview, STM_SETIMAGE, IMAGE_BITMAP,
+                 reinterpret_cast<LPARAM>(gPreviewBitmap));
+    std::wstring previewStatus = gPreviewBitmap ? (L"帧 " + std::to_wstring(frame.frame))
+        : fs::is_regular_file(frame.output)
+            ? L"该格式暂无系统预览解码器" : L"该帧尚未生成图像";
+    SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_PREVIEW_STATUS),
+                   previewStatus.c_str());
 }
 
 std::wstring ChooseFile(const wchar_t* filter, const wchar_t* title) {
@@ -153,16 +431,19 @@ void LoadConfigIntoUi() {
     SetText(ID_BLENDER_PATH, config.blenderPath.wstring());
     SetText(ID_CLUSTER_TOKEN, Utf8ToWide(config.inviteCode));
     SetText(ID_MANUAL_ENDPOINT, Utf8ToWide(config.manualPeerEndpoint));
+    int themeSelection = config.theme == "light" ? 1 : config.theme == "dark" ? 2 : 0;
+    SendMessageW(Item(ID_THEME), CB_SETCURSEL, themeSelection, 0);
 }
 
 Config ReadConfigFromUi() {
     Config config = gApp->GetConfig();
     config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
-    config.shareEnabled = SendMessageW(Item(ID_SHARE), BM_GETCHECK, 0, 0) == BST_CHECKED;
     config.activeCpuPercent = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
     config.idleAfterSeconds = std::clamp(IntValue(ID_IDLE_SECONDS, 180), 1, 86400);
     config.blenderPath = Text(Item(ID_BLENDER_PATH));
     config.inviteCode = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
+    int themeSelection = static_cast<int>(SendMessageW(Item(ID_THEME), CB_GETCURSEL, 0, 0));
+    config.theme = themeSelection == 1 ? "light" : themeSelection == 2 ? "dark" : "system";
     return config;
 }
 
@@ -174,6 +455,7 @@ bool SaveSettings() {
         return false;
     }
     Config saved = gApp->GetConfig();
+    ApplyTheme();
     MessageBoxW(gWindow,
                 saved.pairingPending
                     ? L"邀请码已保存。请在“手动连接”中填写一台已加入该集群的电脑 IP 完成配对。"
@@ -250,24 +532,51 @@ void RefreshLists() {
     auto values = gApp->Jobs();
     for (int index = 0; index < static_cast<int>(values.size()); ++index) {
         const auto& job = values[static_cast<size_t>(index)];
-        int completed = 0, failed = 0, active = 0;
+        int completed = 0, failed = 0, stopped = 0, active = 0;
+        std::chrono::system_clock::time_point started{}, ended{};
         for (const auto& frame : job.frames) {
             completed += frame.state == TaskState::Completed;
             failed += frame.state == TaskState::Failed;
+            stopped += frame.state == TaskState::Stopped;
             active += frame.state == TaskState::Assigned || frame.state == TaskState::Rendering ||
                       frame.state == TaskState::Dispatching;
+            if (frame.startedAt.time_since_epoch() != std::chrono::system_clock::duration::zero() &&
+                (started.time_since_epoch() == std::chrono::system_clock::duration::zero() ||
+                 frame.startedAt < started))
+                started = frame.startedAt;
+            if (frame.endedAt > ended) ended = frame.endedAt;
         }
         std::wstring state = completed == static_cast<int>(job.frames.size()) ? L"已完成"
-            : failed + completed == static_cast<int>(job.frames.size()) && failed ? L"有失败"
-            : active ? L"渲染中" : L"等待";
+            : failed ? L"有错误" : stopped ? L"已停止"
+            : active ? L"渲染中" : L"待提交";
         SetCell(jobs, index, 0, Utf8ToWide(job.name));
         SetCell(jobs, index, 1, state);
-        SetCell(jobs, index, 2, std::to_wstring(completed) + L" / " +
+        SetCell(jobs, index, 2, std::to_wstring(job.frames.size()));
+        SetCell(jobs, index, 3, std::to_wstring(completed) + L" / " +
             std::to_wstring(job.frames.size()));
-        SetCell(jobs, index, 3, std::to_wstring(active));
-        SetCell(jobs, index, 4, Utf8ToWide(job.outputFormat));
-        SetCell(jobs, index, 5,
-                (gApp->DataDir() / L"jobs" / Utf8ToWide(job.id) / L"outputs").wstring());
+        SetCell(jobs, index, 4, FormatDuration(started,
+            active ? std::chrono::system_clock::time_point{} : ended));
+        SetCell(jobs, index, 5, FormatTime(started));
+        SetCell(jobs, index, 6, active ? L"-" : FormatTime(ended));
+    }
+    HWND contributions = Item(ID_CONTRIBUTION_LIST);
+    ListView_DeleteAllItems(contributions);
+    auto records = gApp->Contributions();
+    for (int index = 0; index < static_cast<int>(records.size()); ++index) {
+        const auto& record = records[records.size() - 1 - static_cast<size_t>(index)];
+        std::wstring state = record.state == "completed" ? L"已完成"
+            : record.state == "stopped" ? L"活跃后已停止"
+            : record.state == "partial" ? L"部分完成" : L"失败";
+        SetCell(contributions, index, 0, Utf8ToWide(record.jobName));
+        SetCell(contributions, index, 1, Utf8ToWide(record.packageId));
+        SetCell(contributions, index, 2, Utf8ToWide(record.originName));
+        SetCell(contributions, index, 3, FrameNumbers(record.frames));
+        SetCell(contributions, index, 4, FrameNumbers(record.completedFrames));
+        SetCell(contributions, index, 5, state);
+        SetCell(contributions, index, 6, FormatDuration(record.startedAt, record.endedAt));
+        SetCell(contributions, index, 7, FormatTime(record.startedAt));
+        SetCell(contributions, index, 8, FormatTime(record.endedAt));
+        SetCell(contributions, index, 9, Utf8ToWide(record.error));
     }
     SetText(ID_STATUS, std::wstring(config.pairingPending ? L"正在邀请码配对    " : L"") +
         L"在线电脑：" + std::to_wstring(peers.size() + 1) +
@@ -319,75 +628,314 @@ void StartSubmission() {
 }
 
 void BuildUi() {
-    Label(L"RenderMesh", 24, 18, 240, 35, 0, gTitleFont);
-    Label(L"原生 Windows · Blender 帧级渲染农场", 26, 52, 380, 22);
-    Label(L"", 550, 25, 580, 26, ID_STATUS);
+    for (auto& page : gPageControls) page.clear();
+    Label(L"RenderMesh", 24, 20, 180, 32, 0, gTitleFont);
+    Label(L"Blender 渲染网格", 26, 54, 170, 22);
+    AddControl(L"BUTTON", L"允许其他电脑\n使用本机算力", BS_OWNERDRAW,
+               18, 88, 184, 72, ID_SHARE);
+    AddControl(L"BUTTON", L"服务器", BS_OWNERDRAW, 18, 196, 184, 42, ID_NAV_DASHBOARD);
+    AddControl(L"BUTTON", L"渲染任务", BS_OWNERDRAW, 18, 244, 184, 42, ID_NAV_TASKS);
+    AddControl(L"BUTTON", L"本机贡献", BS_OWNERDRAW, 18, 292, 184, 42, ID_NAV_CONTRIBUTIONS);
+    AddControl(L"BUTTON", L"设置", BS_OWNERDRAW, 18, 340, 184, 42, ID_NAV_SETTINGS);
+    Label(L"主色  #4D45E9", 28, 744, 165, 22);
 
-    AddControl(L"BUTTON", L"本机共享算力", BS_GROUPBOX, 20, 82, 360, 248, 0);
-    AddControl(L"BUTTON", L"允许其他电脑使用本机算力", BS_AUTOCHECKBOX, 36, 110, 300, 24,
-               ID_SHARE);
-    Label(L"电脑名称", 36, 145, 100, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 140, 142, 215, 25, ID_NODE_NAME);
-    Label(L"活跃状态 CPU 任务上限", 36, 181, 190, 20);
-    HWND slider = AddControl(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS, 36, 205, 255, 36,
-                             ID_CPU_SLIDER);
+    // 服务器页
+    PageControl(0, Label(L"服务器", 248, 24, 250, 36, 0, gTitleFont));
+    PageControl(0, Label(L"", 250, 68, 980, 28, ID_STATUS));
+    PageControl(0, Label(L"手动连接", 250, 116, 80, 24));
+    PageControl(0, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
+                              334, 112, 235, 28, ID_MANUAL_ENDPOINT));
+    PageControl(0, AddControl(L"BUTTON", L"连接", BS_PUSHBUTTON,
+                              579, 111, 82, 30, ID_CONNECT_MANUAL));
+    PageControl(0, Label(L"填写另一台电脑的局域网 IP:端口，不要填 127.0.0.1",
+                         680, 116, 550, 24, ID_MANUAL_STATUS));
+    HWND nodes = PageControl(0, AddControl(
+        WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        250, 162, 990, 530, ID_NODES));
+    ListView_SetExtendedListViewStyle(nodes,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    AddColumn(nodes, 0, 170, L"电脑"); AddColumn(nodes, 1, 85, L"连接");
+    AddColumn(nodes, 2, 140, L"算力状态"); AddColumn(nodes, 3, 85, L"活动限额");
+    AddColumn(nodes, 4, 75, L"已分配"); AddColumn(nodes, 5, 220, L"CPU 型号");
+    AddColumn(nodes, 6, 240, L"GPU 型号"); AddColumn(nodes, 7, 210, L"地址");
+
+    // 渲染任务页
+    PageControl(1, Label(L"渲染任务", 248, 24, 300, 36, 0, gTitleFont));
+    PageControl(1, Label(L"工程文件", 250, 86, 80, 24));
+    PageControl(1, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
+                              334, 82, 790, 28, ID_SOURCE_PATH));
+    PageControl(1, AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON,
+                              1134, 81, 92, 30, ID_BROWSE_SOURCE));
+    PageControl(1, Label(L"任务名称", 250, 130, 80, 24));
+    PageControl(1, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
+                              334, 126, 300, 28, ID_JOB_NAME));
+    PageControl(1, Label(L"起始帧", 656, 130, 55, 24));
+    PageControl(1, AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER,
+                              714, 126, 65, 28, ID_FRAME_START));
+    PageControl(1, Label(L"结束帧", 795, 130, 55, 24));
+    PageControl(1, AddControl(L"EDIT", L"100", WS_BORDER | ES_NUMBER,
+                              853, 126, 65, 28, ID_FRAME_END));
+    PageControl(1, Label(L"步长", 934, 130, 42, 24));
+    PageControl(1, AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER,
+                              978, 126, 55, 28, ID_FRAME_STEP));
+    PageControl(1, AddControl(L"BUTTON", L"预检并提交渲染", BS_OWNERDRAW,
+                              1049, 124, 177, 34, ID_SUBMIT));
+    PageControl(1, Label(L"输出格式由 Blender 工程决定；提交前检查并打包链接素材、记录插件环境。",
+                         250, 178, 976, 24));
+    PageControl(1, AddControl(L"STATIC", L"等待选择工程", SS_LEFT,
+                              250, 210, 976, 45, ID_PREFLIGHT));
+    PageControl(1, Label(L"任务队列（可见 10 个槽位，超出后滚动）",
+                         250, 274, 440, 26));
+    HWND jobs = PageControl(1, AddControl(
+        WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        250, 304, 976, 350, ID_JOBS));
+    ListView_SetExtendedListViewStyle(jobs,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    AddColumn(jobs, 0, 210, L"任务"); AddColumn(jobs, 1, 95, L"状态");
+    AddColumn(jobs, 2, 75, L"总帧数"); AddColumn(jobs, 3, 95, L"完成");
+    AddColumn(jobs, 4, 100, L"渲染时长"); AddColumn(jobs, 5, 155, L"开始时间");
+    AddColumn(jobs, 6, 155, L"结束时间");
+    PageControl(1, AddControl(L"BUTTON", L"打开任务详情", BS_PUSHBUTTON,
+                              892, 672, 160, 32, ID_JOB_DETAILS));
+    PageControl(1, AddControl(L"BUTTON", L"打开数据目录", BS_PUSHBUTTON,
+                              1062, 672, 164, 32, ID_OPEN_DATA));
+
+    // 本机贡献页
+    PageControl(2, Label(L"本机贡献", 248, 24, 300, 36, 0, gTitleFont));
+    PageControl(2, Label(L"这里只记录本机替其他电脑渲染的任务包和帧，重启后仍保留。",
+                         250, 72, 920, 24));
+    HWND contributionList = PageControl(2, AddControl(
+        WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        250, 112, 976, 580, ID_CONTRIBUTION_LIST));
+    ListView_SetExtendedListViewStyle(contributionList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    AddColumn(contributionList, 0, 180, L"任务");
+    AddColumn(contributionList, 1, 125, L"任务包");
+    AddColumn(contributionList, 2, 150, L"来源电脑");
+    AddColumn(contributionList, 3, 140, L"分配帧");
+    AddColumn(contributionList, 4, 140, L"已贡献帧");
+    AddColumn(contributionList, 5, 105, L"状态");
+    AddColumn(contributionList, 6, 95, L"时长");
+    AddColumn(contributionList, 7, 155, L"开始时间");
+    AddColumn(contributionList, 8, 155, L"结束时间");
+    AddColumn(contributionList, 9, 300, L"日志 / 错误");
+
+    // 设置页
+    PageControl(3, Label(L"设置", 248, 24, 250, 36, 0, gTitleFont));
+    PageControl(3, Label(L"电脑名称", 270, 100, 155, 24));
+    PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
+                              445, 96, 350, 30, ID_NODE_NAME));
+    PageControl(3, Label(L"活跃状态 CPU 任务上限", 270, 154, 190, 24));
+    HWND slider = PageControl(3, AddControl(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS,
+                                            445, 146, 285, 38, ID_CPU_SLIDER));
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
-    Label(L"15%", 300, 208, 55, 24, ID_CPU_VALUE);
-    Label(L"无键鼠输入后启用 GPU（秒）", 36, 248, 220, 20);
-    AddControl(L"EDIT", L"180", WS_BORDER | ES_NUMBER, 260, 245, 95, 25, ID_IDLE_SECONDS);
-    Label(L"Blender 程序", 36, 285, 100, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 140, 282, 150, 25, ID_BLENDER_PATH);
-    AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON, 297, 281, 58, 27, ID_BROWSE_BLENDER);
+    PageControl(3, Label(L"15%", 742, 154, 55, 24, ID_CPU_VALUE));
+    PageControl(3, Label(L"无键鼠输入后启用 GPU（秒）", 270, 208, 240, 24));
+    PageControl(3, AddControl(L"EDIT", L"180", WS_BORDER | ES_NUMBER,
+                              520, 204, 110, 30, ID_IDLE_SECONDS));
+    PageControl(3, Label(L"Blender 程序", 270, 262, 155, 24));
+    PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
+                              445, 258, 650, 30, ID_BLENDER_PATH));
+    PageControl(3, AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON,
+                              1105, 257, 90, 32, ID_BROWSE_BLENDER));
+    PageControl(3, Label(L"六位邀请码", 270, 316, 155, 24));
+    PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
+                              445, 312, 240, 30, ID_CLUSTER_TOKEN));
+    PageControl(3, AddControl(L"BUTTON", L"复制", BS_PUSHBUTTON,
+                              695, 311, 90, 32, ID_COPY_TOKEN));
+    PageControl(3, Label(L"外观", 270, 370, 155, 24));
+    HWND theme = PageControl(3, AddControl(L"COMBOBOX", L"",
+        CBS_DROPDOWNLIST | WS_VSCROLL, 445, 366, 240, 120, ID_THEME));
+    SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"跟随系统"));
+    SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"浅色"));
+    SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"深色"));
+    PageControl(3, Label(L"端口 8391 · 后台日志按天保存在数据目录",
+                         270, 430, 600, 24));
+    PageControl(3, AddControl(L"BUTTON", L"保存设置", BS_OWNERDRAW,
+                              445, 486, 240, 40, ID_SAVE_SETTINGS));
+    ShowPage(gInitialPage);
+}
 
-    AddControl(L"BUTTON", L"集群与保存", BS_GROUPBOX, 20, 342, 360, 148, 0);
-    Label(L"邀请码（所有电脑保持一致）", 36, 372, 260, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER, 36, 396, 240, 25,
-               ID_CLUSTER_TOKEN);
-    AddControl(L"BUTTON", L"复制", BS_PUSHBUTTON, 284, 395, 70, 27, ID_COPY_TOKEN);
-    AddControl(L"BUTTON", L"保存设置", BS_DEFPUSHBUTTON, 36, 444, 318, 30, ID_SAVE_SETTINGS);
+void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
+    RECT rect = item.rcItem;
+    int id = static_cast<int>(item.CtlID);
+    bool share = id == ID_SHARE;
+    bool primary = id == ID_SUBMIT || id == ID_SAVE_SETTINGS;
+    int navPage = id == ID_NAV_DASHBOARD ? 0 : id == ID_NAV_TASKS ? 1
+        : id == ID_NAV_CONTRIBUTIONS ? 2 : id == ID_NAV_SETTINGS ? 3 : -1;
+    bool selected = navPage == gCurrentPage;
+    bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    COLORREF surface = gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255);
+    COLORREF hover = gDarkTheme ? RGB(47, 46, 64) : RGB(235, 234, 255);
+    COLORREF fill = primary || selected ? kAccent : pressed ? hover : surface;
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1,
+        primary || selected ? kAccent : gDarkTheme ? RGB(61, 61, 74) : RGB(222, 224, 232));
+    HGDIOBJ oldBrush = SelectObject(item.hDC, brush);
+    HGDIOBJ oldPen = SelectObject(item.hDC, pen);
+    RoundRect(item.hDC, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
+    SelectObject(item.hDC, oldBrush);
+    SelectObject(item.hDC, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+    SetBkMode(item.hDC, TRANSPARENT);
+    if (share) {
+        Config config = gApp->GetConfig();
+        SetTextColor(item.hDC, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+        RECT label = rect;
+        label.left += 14;
+        label.right -= 72;
+        DrawTextW(item.hDC, L"允许其他电脑\n使用本机算力", -1, &label,
+                  DT_LEFT | DT_VCENTER | DT_WORDBREAK);
+        RECT track{rect.right - 62, rect.top + 22, rect.right - 14, rect.top + 48};
+        HBRUSH trackBrush = CreateSolidBrush(config.shareEnabled ? kAccent
+            : gDarkTheme ? RGB(91, 91, 103) : RGB(186, 188, 198));
+        HGDIOBJ old = SelectObject(item.hDC, trackBrush);
+        HGDIOBJ oldTrackPen = SelectObject(item.hDC, GetStockObject(NULL_PEN));
+        RoundRect(item.hDC, track.left, track.top, track.right, track.bottom, 26, 26);
+        SelectObject(item.hDC, old);
+        DeleteObject(trackBrush);
+        HBRUSH knob = CreateSolidBrush(RGB(255, 255, 255));
+        old = SelectObject(item.hDC, knob);
+        int knobLeft = config.shareEnabled ? track.right - 24 : track.left + 3;
+        Ellipse(item.hDC, knobLeft, track.top + 3, knobLeft + 20, track.top + 23);
+        SelectObject(item.hDC, old);
+        SelectObject(item.hDC, oldTrackPen);
+        DeleteObject(knob);
+        return;
+    }
+    wchar_t text[128]{};
+    GetWindowTextW(item.hwndItem, text, static_cast<int>(std::size(text)));
+    SetTextColor(item.hDC, primary || selected ? RGB(255, 255, 255)
+        : gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+    DrawTextW(item.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
 
-    AddControl(L"BUTTON", L"提交 Blender 渲染", BS_GROUPBOX, 400, 82, 750, 248, 0);
-    Label(L"工程文件", 418, 111, 80, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, 500, 108, 550, 25,
-               ID_SOURCE_PATH);
-    AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON, 1060, 107, 72, 27, ID_BROWSE_SOURCE);
-    Label(L"任务名称", 418, 148, 80, 20);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 500, 145, 250, 25, ID_JOB_NAME);
-    Label(L"起始帧", 770, 148, 55, 20);
-    AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER, 828, 145, 70, 25, ID_FRAME_START);
-    Label(L"结束帧", 912, 148, 55, 20);
-    AddControl(L"EDIT", L"100", WS_BORDER | ES_NUMBER, 970, 145, 70, 25, ID_FRAME_END);
-    Label(L"步长", 1050, 148, 40, 20);
-    AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER, 1090, 145, 42, 25, ID_FRAME_STEP);
-    Label(L"输出格式由 Blender 工程设置决定", 418, 185, 300, 20);
-    AddControl(L"BUTTON", L"预检并分发", BS_DEFPUSHBUTTON, 900, 181, 232, 31, ID_SUBMIT);
-    Label(L"提交前会用 Blender 检查并打包链接素材，记录插件环境；不兼容 Worker 不会接单。",
-          418, 229, 700, 22);
-    AddControl(L"STATIC", L"等待选择工程", SS_LEFT, 418, 258, 714, 55, ID_PREFLIGHT);
+LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_CREATE: {
+            HWND summary = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                22, 18, 1130, 28, window,
+                reinterpret_cast<HMENU>(ID_DETAIL_SUMMARY), GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(summary, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            HWND frames = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                22, 55, 805, 520, window,
+                reinterpret_cast<HMENU>(ID_DETAIL_FRAMES), GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(frames, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            ListView_SetExtendedListViewStyle(frames,
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+            AddColumn(frames, 0, 55, L"帧");
+            AddColumn(frames, 1, 82, L"状态");
+            AddColumn(frames, 2, 135, L"渲染电脑");
+            AddColumn(frames, 3, 115, L"任务包");
+            AddColumn(frames, 4, 85, L"渲染时长");
+            AddColumn(frames, 5, 145, L"开始时间");
+            AddColumn(frames, 6, 145, L"结束时间");
+            AddColumn(frames, 7, 330, L"输出 / 错误");
+            HWND preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+                WS_CHILD | WS_VISIBLE | SS_BITMAP | SS_CENTERIMAGE,
+                845, 55, 330, 230, window,
+                reinterpret_cast<HMENU>(ID_DETAIL_PREVIEW), GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(preview, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            HWND previewStatus = CreateWindowExW(0, L"STATIC", L"选择一帧查看预览",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 845, 289, 330, 20, window,
+                reinterpret_cast<HMENU>(ID_DETAIL_PREVIEW_STATUS),
+                GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(previewStatus, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            auto button = [&](const wchar_t* text, int y, int id) {
+                HWND control = CreateWindowExW(0, L"BUTTON", text,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 845, y, 330, 34, window,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                    GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            };
+            button(L"在资源管理器中显示选中帧", 321, ID_DETAIL_OPEN_OUTPUT);
+            button(L"在资源管理器中显示源 .blend", 365, ID_DETAIL_OPEN_SOURCE);
+            button(L"停止本任务", 421, ID_DETAIL_STOP);
+            SetTimer(window, 2, 1000, nullptr);
+            RefreshJobDetail(false);
+            return 0;
+        }
+        case WM_TIMER:
+            RefreshJobDetail();
+            return 0;
+        case WM_NOTIFY: {
+            auto* header = reinterpret_cast<NMHDR*>(lParam);
+            if (header->idFrom == ID_DETAIL_FRAMES && header->code == LVN_ITEMCHANGED)
+                UpdateFramePreview();
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == ID_DETAIL_OPEN_SOURCE) {
+                if (auto job = FindJob(gDetailJobId))
+                    ShowInExplorer(job->sourceBlend.empty() ? job->preparedBlend : job->sourceBlend);
+            } else if (LOWORD(wParam) == ID_DETAIL_OPEN_OUTPUT) {
+                if (auto job = FindJob(gDetailJobId)) {
+                    int selected = ListView_GetNextItem(
+                        GetDlgItem(window, ID_DETAIL_FRAMES), -1, LVNI_SELECTED);
+                    if (selected >= 0 && selected < static_cast<int>(job->frames.size()))
+                        ShowInExplorer(job->frames[static_cast<size_t>(selected)].output);
+                }
+            } else if (LOWORD(wParam) == ID_DETAIL_STOP) {
+                std::wstring error;
+                if (!gApp->StopJob(gDetailJobId, error))
+                    MessageBoxW(window, error.c_str(), L"RenderMesh", MB_ICONWARNING);
+                RefreshJobDetail();
+            }
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
+        case WM_DESTROY:
+            KillTimer(window, 2);
+            if (gPreviewBitmap) {
+                DeleteObject(gPreviewBitmap);
+                gPreviewBitmap = nullptr;
+            }
+            gDetailWindow = nullptr;
+            gDetailJobId.clear();
+            return 0;
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+            return reinterpret_cast<LRESULT>(gBackgroundBrush);
+        }
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(window, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, gBackgroundBrush
+                ? gBackgroundBrush : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+            return TRUE;
+        }
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
 
-    AddControl(L"BUTTON", L"服务器列表", BS_GROUPBOX, 20, 505, 1130, 180, 0);
-    Label(L"手动连接", 34, 531, 72, 22);
-    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 108, 527, 230, 25,
-               ID_MANUAL_ENDPOINT);
-    AddControl(L"BUTTON", L"连接", BS_PUSHBUTTON, 346, 526, 70, 27, ID_CONNECT_MANUAL);
-    Label(L"填写另一台电脑的局域网 IP:端口（不要填写 127.0.0.1）", 430, 531, 680, 22,
-          ID_MANUAL_STATUS);
-    HWND nodes = AddControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                            34, 560, 1102, 110, ID_NODES);
-    ListView_SetExtendedListViewStyle(nodes, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    AddColumn(nodes, 0, 190, L"电脑"); AddColumn(nodes, 1, 100, L"连接");
-    AddColumn(nodes, 2, 145, L"算力状态"); AddColumn(nodes, 3, 95, L"活动限额");
-    AddColumn(nodes, 4, 90, L"已分配"); AddColumn(nodes, 5, 230, L"CPU 型号");
-    AddColumn(nodes, 6, 260, L"GPU 型号"); AddColumn(nodes, 7, 250, L"地址");
-
-    AddControl(L"BUTTON", L"任务队列", BS_GROUPBOX, 20, 696, 1130, 184, 0);
-    HWND jobs = AddControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                           34, 721, 1102, 122, ID_JOBS);
-    ListView_SetExtendedListViewStyle(jobs, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    AddColumn(jobs, 0, 220, L"任务"); AddColumn(jobs, 1, 95, L"状态");
-    AddColumn(jobs, 2, 100, L"完成帧"); AddColumn(jobs, 3, 85, L"已分配");
-    AddColumn(jobs, 4, 85, L"格式"); AddColumn(jobs, 5, 430, L"结果目录");
-    AddControl(L"BUTTON", L"打开数据目录", BS_PUSHBUTTON, 986, 850, 150, 26, ID_OPEN_DATA);
+void OpenSelectedJobDetail() {
+    HWND jobs = Item(ID_JOBS);
+    int selected = ListView_GetNextItem(jobs, -1, LVNI_SELECTED);
+    auto values = gApp->Jobs();
+    if (selected < 0 || selected >= static_cast<int>(values.size())) {
+        MessageBoxW(gWindow, L"请先选择一个渲染任务。", L"RenderMesh", MB_ICONINFORMATION);
+        return;
+    }
+    gDetailJobId = values[static_cast<size_t>(selected)].id;
+    if (gDetailWindow) {
+        ShowWindow(gDetailWindow, SW_RESTORE);
+        SetForegroundWindow(gDetailWindow);
+        RefreshJobDetail(false);
+        return;
+    }
+    gDetailWindow = CreateWindowExW(
+        WS_EX_APPWINDOW, L"RenderMeshJobDetail", L"RenderMesh · 任务详情",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1220, 650, gWindow, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    ShowWindow(gDetailWindow, SW_SHOW);
+    UpdateWindow(gDetailWindow);
+    ApplyTheme();
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -396,8 +944,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             gWindow = window;
             BuildUi();
             LoadConfigIntoUi();
+            ApplyTheme();
             SetTimer(window, 1, 1000, nullptr);
             RefreshLists();
+            if (gOpenInitialDetail && ListView_GetItemCount(Item(ID_JOBS)) > 0) {
+                ListView_SetItemState(Item(ID_JOBS), 0, LVIS_SELECTED | LVIS_FOCUSED,
+                                      LVIS_SELECTED | LVIS_FOCUSED);
+                OpenSelectedJobDetail();
+            }
             return 0;
         case WM_HSCROLL:
             if (reinterpret_cast<HWND>(lParam) == Item(ID_CPU_SLIDER)) {
@@ -407,6 +961,21 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
+                case ID_SHARE: {
+                    Config config = gApp->GetConfig();
+                    config.shareEnabled = !config.shareEnabled;
+                    std::wstring error;
+                    if (!gApp->UpdateConfig(config, error))
+                        MessageBoxW(window, error.c_str(), L"RenderMesh", MB_ICONWARNING);
+                    LoadConfigIntoUi();
+                    InvalidateRect(Item(ID_SHARE), nullptr, TRUE);
+                    RefreshLists();
+                    break;
+                }
+                case ID_NAV_DASHBOARD: ShowPage(0); break;
+                case ID_NAV_TASKS: ShowPage(1); break;
+                case ID_NAV_CONTRIBUTIONS: ShowPage(2); break;
+                case ID_NAV_SETTINGS: ShowPage(3); break;
                 case ID_BROWSE_BLENDER: {
                     auto path = ChooseFile(L"Blender 程序\0blender.exe\0所有程序\0*.exe\0\0",
                                            L"选择 blender.exe");
@@ -438,8 +1007,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 case ID_OPEN_DATA:
                     ShellExecuteW(window, L"open", gApp->DataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     break;
+                case ID_JOB_DETAILS:
+                    OpenSelectedJobDetail();
+                    break;
             }
             return 0;
+        case WM_DRAWITEM:
+            DrawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+        case WM_NOTIFY: {
+            auto* header = reinterpret_cast<NMHDR*>(lParam);
+            if (header->idFrom == ID_JOBS && header->code == NM_DBLCLK)
+                OpenSelectedJobDetail();
+            return 0;
+        }
         case WM_TIMER:
         case WM_RM_REFRESH:
             RefreshLists();
@@ -462,6 +1043,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             DestroyWindow(window);
             return 0;
+        case WM_SETTINGCHANGE:
+            if (gApp && gApp->GetConfig().theme == "system") ApplyTheme();
+            return 0;
         case WM_DESTROY:
             KillTimer(window, 1);
             PostQuitMessage(0);
@@ -469,7 +1053,29 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetBkMode(dc, TRANSPARENT);
-            return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+            SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+            return reinterpret_cast<LRESULT>(gBackgroundBrush);
+        }
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+            SetBkColor(dc, gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255));
+            return reinterpret_cast<LRESULT>(gSurfaceBrush);
+        }
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(window, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, gBackgroundBrush
+                ? gBackgroundBrush : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+            HPEN pen = CreatePen(PS_SOLID, 1,
+                gDarkTheme ? RGB(50, 50, 62) : RGB(224, 225, 232));
+            HGDIOBJ old = SelectObject(reinterpret_cast<HDC>(wParam), pen);
+            MoveToEx(reinterpret_cast<HDC>(wParam), 220, 0, nullptr);
+            LineTo(reinterpret_cast<HDC>(wParam), 220, client.bottom);
+            SelectObject(reinterpret_cast<HDC>(wParam), old);
+            DeleteObject(pen);
+            return TRUE;
         }
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -488,6 +1094,7 @@ void PrintToParentConsole(const std::wstring& text) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&controls);
     int argumentCount = 0;
@@ -517,12 +1124,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--compatibility" && i + 1 < argumentCount) compatibilitySource = arguments[++i];
         else if (arg == L"--port" && i + 1 < argumentCount) overridePort = _wtoi(arguments[++i]);
         else if (arg == L"--run-seconds" && i + 1 < argumentCount) runSeconds = _wtoi(arguments[++i]);
+        else if (arg == L"--page" && i + 1 < argumentCount)
+            gInitialPage = std::clamp(_wtoi(arguments[++i]), 0, 3);
+        else if (arg == L"--detail") gOpenInitialDetail = true;
     }
     LocalFree(arguments);
     InitializeLogging(dataDir);
     if (selfTest) {
         std::wstring result;
         bool ok = RunSelfTest(result);
+        if (!preflightReport.empty()) {
+            std::error_code ignored;
+            fs::create_directories(preflightReport.parent_path(), ignored);
+            std::ofstream output(preflightReport, std::ios::binary | std::ios::trunc);
+            output << WideToUtf8(result);
+        }
         PrintToParentConsole(result);
         if (!noDialog)
             MessageBoxW(nullptr, result.c_str(),
@@ -671,10 +1287,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&windowClass);
+    WNDCLASSW detailClass = windowClass;
+    detailClass.lpfnWndProc = DetailWindowProc;
+    detailClass.lpszClassName = L"RenderMeshJobDetail";
+    RegisterClassW(&detailClass);
     gWindow = CreateWindowExW(
-        0, windowClass.lpszClassName, L"RenderMesh — Blender 分布式渲染农场",
+        0, windowClass.lpszClassName, L"RenderMesh · Blender 分布式渲染农场",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1185, 930, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 820, nullptr, nullptr, instance, nullptr);
     gApp->SetChangedCallback([] {
         if (gWindow) PostMessageW(gWindow, WM_RM_REFRESH, 0, 0);
     });
@@ -690,5 +1310,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (gPreflight.joinable()) gPreflight.join();
     DeleteObject(gFont);
     DeleteObject(gTitleFont);
+    if (gBackgroundBrush) DeleteObject(gBackgroundBrush);
+    if (gSurfaceBrush) DeleteObject(gSurfaceBrush);
+    CoUninitialize();
     return static_cast<int>(message.wParam);
 }

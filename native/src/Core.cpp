@@ -919,6 +919,9 @@ Config ConfigStore::Load() {
         config.discoveryPort = std::clamp(data.value("discovery_port", 8390), 1024, 65535);
         config.blenderPath = Utf8ToWide(data.value("blender_path", std::string{}));
         config.manualPeerEndpoint = data.value("manual_peer_endpoint", std::string{});
+        config.theme = data.value("theme", "system");
+        if (config.theme != "system" && config.theme != "light" && config.theme != "dark")
+            config.theme = "system";
     } catch (...) {
         fs::path backup = configPath_;
         backup += L".broken";
@@ -942,6 +945,7 @@ bool ConfigStore::Save(const Config& config, std::wstring& error) {
         {"discovery_port", config.discoveryPort},
         {"blender_path", WideToUtf8(config.blenderPath.wstring())},
         {"manual_peer_endpoint", config.manualPeerEndpoint},
+        {"theme", config.theme},
     };
     return WriteTextAtomic(configPath_, data.dump(2), error);
 }
@@ -984,6 +988,7 @@ PreflightReport PreflightBlend(
     int validationFrameStep,
     std::atomic<bool>* stopRequested) {
     PreflightReport report;
+    report.sourceBlend = source;
     fs::path blender = FindBlender(config);
     if (blender.empty()) {
         report.summary = L"未找到 Blender。请先安装 Blender，或在设置中选择 blender.exe。";
@@ -1321,12 +1326,29 @@ bool RenderBlenderPackage(
 bool WriteResultBundle(
     const fs::path& destination,
     const std::vector<RenderArtifact>& artifacts,
-    std::wstring& error) {
+    std::wstring& error,
+    std::atomic<bool>* stopRequested) {
     if (artifacts.empty() || artifacts.size() > 4096) {
         error = L"结果文件包条目数量无效";
         return false;
     }
     fs::create_directories(destination.parent_path());
+    uint64_t requiredBytes = 512ull * 1024 * 1024;
+    for (const auto& artifact : artifacts) {
+        std::error_code ec;
+        uint64_t size = fs::file_size(artifact.source, ec);
+        if (ec || size > UINT64_MAX - requiredBytes) {
+            error = L"无法计算结果文件包所需空间";
+            return false;
+        }
+        requiredBytes += size;
+    }
+    ULARGE_INTEGER freeBytes{};
+    if (!GetDiskFreeSpaceExW(destination.parent_path().c_str(), &freeBytes, nullptr, nullptr) ||
+        freeBytes.QuadPart < requiredBytes) {
+        error = L"结果文件包所在磁盘空间不足";
+        return false;
+    }
     fs::path temporary = destination;
     temporary += L".tmp";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -1341,6 +1363,13 @@ bool WriteResultBundle(
     std::set<std::string> logicalPaths;
     std::vector<char> buffer(1024 * 1024);
     for (const auto& artifact : artifacts) {
+        if (stopRequested && stopRequested->load()) {
+            error = L"结果文件包已取消";
+            output.close();
+            std::error_code ignored;
+            fs::remove(temporary, ignored);
+            return false;
+        }
         std::error_code ec;
         uint64_t size = fs::file_size(artifact.source, ec);
         if (ec || artifact.logicalPath.empty() || artifact.logicalPath.size() > 4096 ||
@@ -1358,6 +1387,7 @@ bool WriteResultBundle(
         std::ifstream input(artifact.source, std::ios::binary);
         uint64_t remaining = size;
         while (input && remaining) {
+            if (stopRequested && stopRequested->load()) break;
             size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
             input.read(buffer.data(), static_cast<std::streamsize>(wanted));
             size_t read = static_cast<size_t>(input.gcount());
@@ -1387,7 +1417,8 @@ bool ExtractResultBundle(
     const fs::path& bundle,
     const fs::path& stagingDirectory,
     std::map<std::string, fs::path>& artifacts,
-    std::wstring& error) {
+    std::wstring& error,
+    std::atomic<bool>* stopRequested) {
     artifacts.clear();
     std::ifstream input(bundle, std::ios::binary);
     char magic[8]{};
@@ -1408,6 +1439,11 @@ bool ExtractResultBundle(
     uint64_t total = 0;
     std::vector<char> buffer(1024 * 1024);
     for (uint32_t index = 0; index < count; ++index) {
+        if (stopRequested && stopRequested->load()) {
+            error = L"结果文件包解包已取消";
+            fs::remove_all(stagingDirectory, ec);
+            return false;
+        }
         uint32_t pathSize = 0;
         uint64_t fileSize = 0;
         input.read(reinterpret_cast<char*>(&pathSize), sizeof(pathSize));
@@ -1437,6 +1473,7 @@ bool ExtractResultBundle(
         std::ofstream output(destination, std::ios::binary | std::ios::trunc);
         uint64_t remaining = fileSize;
         while (input && output && remaining) {
+            if (stopRequested && stopRequested->load()) break;
             size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
             input.read(buffer.data(), static_cast<std::streamsize>(wanted));
             size_t read = static_cast<size_t>(input.gcount());
@@ -1465,12 +1502,13 @@ bool ExtractResultBundle(
 
 std::wstring TaskStateLabel(TaskState state) {
     switch (state) {
-        case TaskState::Pending: return L"等待";
+        case TaskState::Pending: return L"待提交";
         case TaskState::Dispatching: return L"发送中";
         case TaskState::Assigned: return L"已分配";
         case TaskState::Rendering: return L"渲染中";
         case TaskState::Completed: return L"已完成";
         case TaskState::Failed: return L"失败";
+        case TaskState::Stopped: return L"已停止";
     }
     return L"未知";
 }

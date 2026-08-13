@@ -38,6 +38,7 @@ Origin 对打包完成的 `.blend` 计算流式 SHA-256。协议 v2 先以哈希
 %LOCALAPPDATA%\RenderMesh\
   config.json
   jobs.json
+  contributions.json
   logs\RenderMesh-YYYY-MM-DD.log
   tools\preflight.py
   tools\compatibility.py
@@ -52,6 +53,8 @@ Origin 对打包完成的 `.blend` 计算流式 SHA-256。协议 v2 先以哈希
 ```
 
 程序重启时，把未完成的 Assigned/Dispatching/Rendering 帧恢复为 Pending；完成结果和错误记录保留。Worker 在缓存上传、接单和任务结束时刷新 `last-used`；后台只在没有活跃任务时清理最后使用超过七天的工程目录。协议 v2 的逐帧临时目录只保存输出并在回传后删除；协议 v1 的临时工程也按旧逻辑随帧删除。
+
+`jobs.json` 同时记录源 `.blend` 路径、每帧开始/结束时间和 Stopped 状态。`contributions.json` 最多保留 5000 个 Worker 任务包历史，包含来源、分配帧、已回传帧、状态与时间；两者均使用独立临时文件原子替换。
 
 ## Blender 进程边界
 
