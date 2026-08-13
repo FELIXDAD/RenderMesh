@@ -156,7 +156,7 @@ void LoadConfigIntoUi() {
     SetText(ID_MANUAL_ENDPOINT, Utf8ToWide(config.manualPeerEndpoint));
 }
 
-bool SaveSettings() {
+Config ReadConfigFromUi() {
     Config config = gApp->GetConfig();
     config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
     config.shareEnabled = SendMessageW(Item(ID_SHARE), BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -164,6 +164,11 @@ bool SaveSettings() {
     config.idleAfterSeconds = std::max(30, static_cast<int>(IntValue(ID_IDLE_MINUTES, 3) * 60));
     config.blenderPath = Text(Item(ID_BLENDER_PATH));
     config.clusterToken = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
+    return config;
+}
+
+bool SaveSettings() {
+    Config config = ReadConfigFromUi();
     std::wstring error;
     if (!gApp->UpdateConfig(config, error)) {
         MessageBoxW(gWindow, error.c_str(), L"设置未保存", MB_ICONERROR);
@@ -175,13 +180,7 @@ bool SaveSettings() {
 }
 
 void ConnectManualPeer() {
-    Config config = gApp->GetConfig();
-    config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
-    config.shareEnabled = SendMessageW(Item(ID_SHARE), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    config.activeCpuPercent = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
-    config.idleAfterSeconds = std::max(30, static_cast<int>(IntValue(ID_IDLE_MINUTES, 3) * 60));
-    config.blenderPath = Text(Item(ID_BLENDER_PATH));
-    config.clusterToken = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
+    Config config = ReadConfigFromUi();
     std::wstring result;
     if (!gApp->UpdateConfig(config, result)) {
         SetText(ID_MANUAL_STATUS, result);
@@ -202,6 +201,8 @@ void RefreshLists() {
     if (!gApp) return;
     auto peers = gApp->Peers();
     Config config = gApp->GetConfig();
+    std::wstring manualStatus = gApp->ManualPeerStatus();
+    if (!manualStatus.empty()) SetText(ID_MANUAL_STATUS, manualStatus);
     HWND nodes = Item(ID_NODES);
     ListView_DeleteAllItems(nodes);
     int row = 0;

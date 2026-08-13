@@ -130,6 +130,14 @@ struct LocalIPv4Interface {
     std::optional<std::string> broadcast;
 };
 
+std::vector<LocalIPv4Interface> BroadcastCapableInterfaces(
+    const std::vector<LocalIPv4Interface>& interfaces) {
+    std::vector<LocalIPv4Interface> result;
+    for (const auto& network : interfaces)
+        if (network.broadcast) result.push_back(network);
+    return result;
+}
+
 std::vector<LocalIPv4Interface> LocalIPv4Interfaces() {
     ULONG size = 15 * 1024;
     std::vector<unsigned char> storage(size);
@@ -197,6 +205,10 @@ bool ParseIPv4Endpoint(const std::string& value, std::string& address, int& port
     }
 }
 
+bool PeerExplicitlyStoppedTask(const Peer& peer, const std::string& taskId) {
+    return peer.currentTaskKnown ? peer.currentTaskId != taskId : peer.assigned == 0;
+}
+
 httplib::Result PostFile(
     const std::string& host,
     int port,
@@ -262,6 +274,8 @@ struct NodeApp::Impl {
     std::vector<RenderJob> jobs;
     std::mutex callbackMutex;
     std::function<void()> changed;
+    mutable std::mutex manualStatusMutex;
+    std::wstring manualStatus;
     std::mutex workMutex;
     std::condition_variable workCv;
     std::queue<WorkItem> work;
@@ -291,6 +305,11 @@ struct NodeApp::Impl {
     std::string CurrentTaskId() {
         std::scoped_lock lock(currentTaskMutex);
         return currentTaskId;
+    }
+
+    void SetManualStatus(std::wstring value) {
+        std::scoped_lock lock(manualStatusMutex);
+        manualStatus = std::move(value);
     }
 
     void PersistJobs() {
@@ -655,6 +674,7 @@ struct NodeApp::Impl {
     }
 
     bool ProbeManualPeer(const std::string& endpoint, Peer& peer, std::wstring& result) {
+        try {
         std::string address;
         int port = 0;
         if (!ParseIPv4Endpoint(endpoint, address, port)) {
@@ -665,6 +685,7 @@ struct NodeApp::Impl {
         client.set_connection_timeout(2, 0);
         client.set_read_timeout(2, 0);
         client.set_write_timeout(2, 0);
+        client.set_max_timeout(4000);
         auto healthResponse = client.Get("/health");
         if (!healthResponse || healthResponse->status != 200) {
             result = L"无法访问 " + Utf8ToWide(address) + L":" + std::to_wstring(port) +
@@ -709,12 +730,18 @@ struct NodeApp::Impl {
         peer.trusted = true;
         peer.cpuPercent = health.value("cpu", 15);
         peer.assigned = health.value("assigned", 0);
+        peer.currentTaskKnown = health.contains("task_id");
         peer.currentTaskId = health.value("task_id", "");
+        peer.manualRoute = true;
         peer.idleSeconds = health.value("idle", 0.0);
         peer.lastSeen = std::chrono::steady_clock::now();
         result = L"已连接 " + Utf8ToWide(peer.name) + L"（" + Utf8ToWide(address) + L":" +
                  std::to_wstring(port) + L"）";
         return true;
+        } catch (const std::exception&) {
+            result = L"目标返回了无法识别的 RenderMesh 节点信息";
+            return false;
+        }
     }
 
     void ManualPeerLoop() {
@@ -722,14 +749,21 @@ struct NodeApp::Impl {
             std::string endpoint = owner->GetConfig().manualPeerEndpoint;
             if (!endpoint.empty()) {
                 Peer peer;
-                std::wstring ignored;
-                if (ProbeManualPeer(endpoint, peer, ignored)) {
+                std::wstring status;
+                if (ProbeManualPeer(endpoint, peer, status)) {
+                    bool committed = false;
                     {
                         std::scoped_lock lock(stateMutex);
-                        peers[peer.nodeId] = std::move(peer);
+                        if (owner->GetConfig().manualPeerEndpoint == endpoint) {
+                            peers[peer.nodeId] = std::move(peer);
+                            committed = true;
+                        }
                     }
-                    Notify();
+                    if (!committed) continue;
                 }
+                if (owner->GetConfig().manualPeerEndpoint != endpoint) continue;
+                SetManualStatus(std::move(status));
+                Notify();
             }
             for (int step = 0; step < 20 && !stopRequested.load(); ++step) Sleep(100);
         }
@@ -780,19 +814,27 @@ struct NodeApp::Impl {
                 };
                 message["signature"] = DiscoverySignature(config, message);
                 std::string payload = message.dump();
-                std::vector<std::string> targets;
-                for (const auto& network : networks)
-                    if (network.broadcast) targets.push_back(*network.broadcast);
-                std::sort(targets.begin(), targets.end());
-                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-                if (targets.empty()) targets.push_back("255.255.255.255");
-                for (const auto& target : targets) {
+                for (const auto& network : BroadcastCapableInterfaces(networks)) {
+                    SOCKET sendSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                    if (sendSocket == INVALID_SOCKET) continue;
+                    setsockopt(sendSocket, SOL_SOCKET, SO_BROADCAST,
+                               reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+                    sockaddr_in source{};
+                    source.sin_family = AF_INET;
+                    inet_pton(AF_INET, network.address.c_str(), &source.sin_addr);
+                    source.sin_port = 0;
+                    if (bind(sendSocket, reinterpret_cast<sockaddr*>(&source), sizeof(source)) ==
+                        SOCKET_ERROR) {
+                        closesocket(sendSocket);
+                        continue;
+                    }
                     sockaddr_in broadcast{};
                     broadcast.sin_family = AF_INET;
-                    inet_pton(AF_INET, target.c_str(), &broadcast.sin_addr);
+                    inet_pton(AF_INET, network.broadcast->c_str(), &broadcast.sin_addr);
                     broadcast.sin_port = htons(static_cast<u_short>(config.discoveryPort));
-                    sendto(activeSocket, payload.data(), static_cast<int>(payload.size()), 0,
+                    sendto(sendSocket, payload.data(), static_cast<int>(payload.size()), 0,
                            reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
+                    closesocket(sendSocket);
                 }
                 nextBroadcast = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             }
@@ -817,6 +859,7 @@ struct NodeApp::Impl {
                 peer.cpuPercent = message.value("cpu", 15);
                 peer.assigned = message.value("assigned", 0);
                 peer.currentTaskId = message.value("task_id", "");
+                peer.currentTaskKnown = true;
                 peer.idleSeconds = message.value("idle", 0.0);
                 std::string claimedSignature = message.value("signature", "");
                 auto signedAddresses = message.value("addresses", std::vector<std::string>{});
@@ -830,6 +873,12 @@ struct NodeApp::Impl {
                 peer.lastSeen = std::chrono::steady_clock::now();
                 {
                     std::scoped_lock lock(stateMutex);
+                    auto existing = peers.find(peer.nodeId);
+                    if (existing != peers.end() && existing->second.manualRoute) {
+                        peer.address = existing->second.address;
+                        peer.httpPort = existing->second.httpPort;
+                        peer.manualRoute = true;
+                    }
                     peers[peer.nodeId] = std::move(peer);
                 }
                 Notify();
@@ -907,7 +956,7 @@ struct NodeApp::Impl {
                 auto peer = peers.find(frame.assignedNodeId);
                 bool peerGone = peer == peers.end() || nowSteady - peer->second.lastSeen > kPeerTimeout;
                 bool peerNoLongerWorking = !peerGone &&
-                    peer->second.currentTaskId != frame.taskId;
+                    PeerExplicitlyStoppedTask(peer->second, frame.taskId);
                 if (!peerGone && !peerNoLongerWorking) continue;
                 frame.state = TaskState::Pending;
                 frame.error = peerGone ? "worker went offline; frame requeued"
@@ -1258,20 +1307,32 @@ bool NodeApp::UpdateConfig(const Config& config, std::wstring& error) {
 
 bool NodeApp::AddManualPeer(const std::string& endpoint, std::wstring& result) {
     Peer peer;
-    if (!impl_->ProbeManualPeer(endpoint, peer, result)) return false;
+    if (!impl_->ProbeManualPeer(endpoint, peer, result)) {
+        impl_->SetManualStatus(result);
+        impl_->Notify();
+        return false;
+    }
     Config config = GetConfig();
     config.manualPeerEndpoint = peer.address + ":" + std::to_string(peer.httpPort);
     std::wstring saveError;
     if (!UpdateConfig(config, saveError)) {
         result = L"节点验证成功，但无法保存地址：" + saveError;
+        impl_->SetManualStatus(result);
+        impl_->Notify();
         return false;
     }
     {
         std::scoped_lock lock(impl_->stateMutex);
         impl_->peers[peer.nodeId] = std::move(peer);
     }
+    impl_->SetManualStatus(result);
     impl_->Notify();
     return true;
+}
+
+std::wstring NodeApp::ManualPeerStatus() const {
+    std::scoped_lock lock(impl_->manualStatusMutex);
+    return impl_->manualStatus;
 }
 
 std::vector<Peer> NodeApp::Peers() const {
@@ -1391,6 +1452,34 @@ bool RunSelfTest(std::wstring& report) {
             report = L"IPv4 directed-broadcast calculation failed";
             return false;
         }
+        auto routes = BroadcastCapableInterfaces({
+            {"192.168.29.10", std::string("192.168.29.255")},
+            {"192.168.29.20", std::string("192.168.29.255")},
+            {"100.64.1.2", std::nullopt},
+        });
+        if (routes.size() != 2 || routes[0].address == routes[1].address ||
+            routes[0].broadcast != routes[1].broadcast) {
+            report = L"Per-interface broadcast route planning failed";
+            return false;
+        }
+        Peer legacyPeer;
+        legacyPeer.currentTaskKnown = false;
+        legacyPeer.currentTaskId.clear();
+        legacyPeer.assigned = 1;
+        if (PeerExplicitlyStoppedTask(legacyPeer, "long-running-frame")) {
+            report = L"Legacy worker task-state compatibility failed";
+            return false;
+        }
+        legacyPeer.assigned = 0;
+        if (!PeerExplicitlyStoppedTask(legacyPeer, "long-running-frame")) {
+            report = L"Legacy worker stopped-task recovery failed";
+            return false;
+        }
+        legacyPeer.currentTaskKnown = true;
+        if (!PeerExplicitlyStoppedTask(legacyPeer, "long-running-frame")) {
+            report = L"Known worker task-state recovery failed";
+            return false;
+        }
         httplib::Server server;
         fs::path received = root / L"received.bin";
         server.Post("/stream", [&](const httplib::Request&, httplib::Response& response,
@@ -1463,6 +1552,20 @@ bool RunSelfTest(std::wstring& report) {
             std::wstring startError;
             bool started = worker.Start(startError) && origin.Start(startError);
             if (started) {
+                httplib::Server malformedServer;
+                malformedServer.Get("/health", [](const httplib::Request&,
+                                                    httplib::Response& response) {
+                    response.set_content(R"({"node_id":123})", "application/json");
+                });
+                int malformedPort = malformedServer.bind_to_any_port("127.0.0.1");
+                std::thread malformedThread;
+                if (malformedPort > 0)
+                    malformedThread = std::thread([&] { malformedServer.listen_after_bind(); });
+                std::wstring malformedResult;
+                bool malformedRejected = malformedPort > 0 && !origin.AddManualPeer(
+                    "127.0.0.1:" + std::to_string(malformedPort), malformedResult);
+                malformedServer.stop();
+                if (malformedThread.joinable()) malformedThread.join();
                 std::wstring connectResult;
                 bool manuallyConnected = origin.AddManualPeer(
                     "127.0.0.1:" + std::to_string(workerConfig.httpPort), connectResult);
@@ -1481,7 +1584,7 @@ bool RunSelfTest(std::wstring& report) {
                 std::wstring submitError;
                 std::string jobId = origin.SubmitPrepared(
                     "two-node-self-test", preflight, 1, 3, 1, "PNG", submitError);
-                bool clusterOk = manuallyConnected && !jobId.empty();
+                bool clusterOk = malformedRejected && manuallyConnected && !jobId.empty();
                 bool usedRemote = false;
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
                 while (clusterOk && std::chrono::steady_clock::now() < deadline) {

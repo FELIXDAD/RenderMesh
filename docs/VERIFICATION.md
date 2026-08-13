@@ -7,9 +7,11 @@
 `RenderMesh.exe --self-test --no-dialog` 返回 0，覆盖：
 
 - 配置原子保存与重新读取，以及标准向量 HMAC-SHA256；
+- `/23` 等 IPv4 前缀的定向广播地址计算，且每张网卡保留独立源地址；
 - 2 MiB 文件通过真实本机 HTTP 服务流式上传；
 - Windows Job Object 在同一进程树上切换 15% 与 100%；
-- 两个独立 NodeApp 实例通过不同 TCP 端口分发三帧任务并回传三个输出文件；
+- 手动 `IPv4:端口` 先经过 `/health` 与 HMAC 挑战验证并持久化，再由两个独立 NodeApp 实例通过不同 TCP 端口分发三帧任务并回传三个输出文件；
+- 错误类型的节点 JSON 会被拒绝而不会终止后台线程；旧版 Worker 不报告任务 ID 时，`assigned=1` 的长帧不会被误判为掉线，恢复空闲后仍可触发重派；
 - 模拟 Worker 接单后离线，Origin 在租约宽限期后自动把该帧恢复 Pending，并由本机完成；
 - 旧 Worker 使用已经失效的 attempt token 迟到回传时，Origin 返回 409，不会覆盖重派结果。
 

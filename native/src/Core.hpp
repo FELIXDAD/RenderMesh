@@ -158,6 +158,8 @@ struct Peer {
     int cpuPercent = 15;
     int assigned = 0;
     std::string currentTaskId;
+    bool currentTaskKnown = true;
+    bool manualRoute = false;
     double idleSeconds = 0;
     std::chrono::steady_clock::time_point lastSeen;
 };
@@ -206,6 +208,7 @@ public:
     Config GetConfig() const;
     bool UpdateConfig(const Config& config, std::wstring& error);
     bool AddManualPeer(const std::string& endpoint, std::wstring& result);
+    std::wstring ManualPeerStatus() const;
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
     int AssignedCount() const;
