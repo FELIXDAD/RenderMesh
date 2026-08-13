@@ -218,6 +218,16 @@ bool PeerExplicitlyStoppedTask(const Peer& peer, const std::string& taskId) {
     return peer.currentTaskKnown ? peer.currentTaskId != taskId : peer.assigned == 0;
 }
 
+void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
+    if (candidate.protocolVersion != 1 || existing.protocolVersion < 2) return;
+    candidate.protocolVersion = existing.protocolVersion;
+    candidate.name = existing.name;
+    candidate.cpuPercent = existing.cpuPercent;
+    candidate.idleSeconds = existing.idleSeconds;
+    candidate.cpuModel = existing.cpuModel;
+    candidate.gpuModels = existing.gpuModels;
+}
+
 httplib::Result PostFile(
     const std::string& host,
     int port,
@@ -1044,9 +1054,7 @@ struct NodeApp::Impl {
                             existing->second.manualValidatedAt <= kPeerTimeout;
                     if (protocol == 1 && existing != peers.end() &&
                         existing->second.protocolVersion >= 2) {
-                        peer.protocolVersion = existing->second.protocolVersion;
-                        peer.cpuModel = existing->second.cpuModel;
-                        peer.gpuModels = existing->second.gpuModels;
+                        PreserveAuthenticatedV2Metadata(peer, existing->second);
                     }
                     if (manualRouteStillValid) {
                         peer.address = existing->second.address;
@@ -1716,6 +1724,26 @@ bool RunSelfTest(std::wstring& report) {
         if (ConstantTimeEqual(discoveryProof,
                               DiscoverySignature(signatureConfig, discoveryV2))) {
             report = L"Protocol-v2 discovery state was not authenticated";
+            return false;
+        }
+        Peer authenticatedPeer;
+        authenticatedPeer.protocolVersion = 2;
+        authenticatedPeer.name = "SIGNED-NAME";
+        authenticatedPeer.cpuPercent = 17;
+        authenticatedPeer.idleSeconds = 181;
+        authenticatedPeer.cpuModel = "SIGNED-CPU";
+        authenticatedPeer.gpuModels = {"SIGNED-GPU"};
+        Peer legacyUpdate;
+        legacyUpdate.protocolVersion = 1;
+        legacyUpdate.name = "tampered-name";
+        legacyUpdate.cpuPercent = 99;
+        legacyUpdate.idleSeconds = 999;
+        PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
+        if (legacyUpdate.protocolVersion != 2 || legacyUpdate.name != "SIGNED-NAME" ||
+            legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
+            legacyUpdate.cpuModel != "SIGNED-CPU" ||
+            legacyUpdate.gpuModels != std::vector<std::string>{"SIGNED-GPU"}) {
+            report = L"Legacy discovery downgraded authenticated v2 metadata";
             return false;
         }
         if (DirectedBroadcastAddress("192.168.29.75", 23) != "192.168.29.255" ||
