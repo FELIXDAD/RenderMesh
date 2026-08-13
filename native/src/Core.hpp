@@ -88,7 +88,9 @@ PreflightReport PreflightBlend(
     const fs::path& dataDir,
     const fs::path& source,
     const fs::path& prepared,
-    int validationFrame = 1,
+    int validationFrameStart = 1,
+    int validationFrameEnd = 1,
+    int validationFrameStep = 1,
     std::atomic<bool>* stopRequested = nullptr);
 bool CheckWorkerCompatibility(
     const Config& config,

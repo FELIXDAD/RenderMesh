@@ -172,7 +172,8 @@ bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring
 const char* kPreflightScript = R"PY(import bpy, addon_utils, json, os, sys, glob, re, traceback
 
 args = sys.argv[sys.argv.index('--') + 1:]
-prepared, report_path, validation_frame = args[0], args[1], int(args[2])
+prepared, report_path = args[0], args[1]
+validation_start, validation_end, validation_step = map(int, args[2:5])
 warnings = []
 
 def path_key(path):
@@ -330,7 +331,7 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
           'addons': sorted(enabled_addons),
           'missing': [], 'unpacked': [], 'warnings': warnings,
-          'validation_render': False, 'validation_error': ''}
+          'validation_render': False, 'validation_frames': 0, 'validation_error': ''}
 try:
     before = gather()
     report['missing'] = [dict(x, path=missing) for x in before
@@ -349,7 +350,20 @@ try:
         assets_ok = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
         if assets_ok:
             undefined_nodes = []
-            for tree in bpy.data.node_groups:
+            node_trees = list(bpy.data.node_groups)
+            node_trees.extend(material.node_tree for material in bpy.data.materials
+                              if getattr(material, 'node_tree', None))
+            node_trees.extend(world.node_tree for world in bpy.data.worlds
+                              if getattr(world, 'node_tree', None))
+            node_trees.extend(light.node_tree for light in bpy.data.lights
+                              if getattr(light, 'node_tree', None))
+            node_trees.extend(scene.compositing_node_group for scene in bpy.data.scenes
+                              if getattr(scene, 'compositing_node_group', None))
+            seen_trees = set()
+            for tree in node_trees:
+                if tree.as_pointer() in seen_trees:
+                    continue
+                seen_trees.add(tree.as_pointer())
                 for node in tree.nodes:
                     if getattr(node, 'bl_idname', '') == 'NodeUndefined' or node.type == 'UNDEFINED':
                         undefined_nodes.append(f'{tree.name}/{node.name}')
@@ -357,16 +371,19 @@ try:
                 raise RuntimeError('Undefined nodes, likely missing add-on: ' +
                                    ', '.join(undefined_nodes[:12]))
             scene = bpy.context.scene
-            scene.frame_set(validation_frame)
             scene.render.resolution_x = min(max(1, scene.render.resolution_x), 64)
             scene.render.resolution_y = min(max(1, scene.render.resolution_y), 64)
             scene.render.resolution_percentage = 100
             if scene.render.engine == 'CYCLES':
                 scene.cycles.samples = 1
                 scene.cycles.use_denoising = False
-            render_result = bpy.ops.render.render(write_still=False)
-            if 'FINISHED' not in render_result:
-                raise RuntimeError(f'Validation render returned {render_result}')
+            for validation_frame in range(validation_start, validation_end + 1, validation_step):
+                scene.frame_set(validation_frame)
+                render_result = bpy.ops.render.render(write_still=False)
+                if 'FINISHED' not in render_result:
+                    raise RuntimeError(
+                        f'Validation render for frame {validation_frame} returned {render_result}')
+                report['validation_frames'] += 1
             report['validation_render'] = True
             report['pass'] = True
 except Exception:
@@ -637,7 +654,9 @@ PreflightReport PreflightBlend(
     const fs::path& dataDir,
     const fs::path& source,
     const fs::path& prepared,
-    int validationFrame,
+    int validationFrameStart,
+    int validationFrameEnd,
+    int validationFrameStep,
     std::atomic<bool>* stopRequested) {
     PreflightReport report;
     fs::path blender = FindBlender(config);
@@ -660,8 +679,9 @@ PreflightReport PreflightBlend(
     }
     ProcessResult process = RunProcess(
         blender,
-        {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
-         prepared.wstring(), reportPath.wstring(), std::to_wstring(validationFrame)},
+         {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
+         prepared.wstring(), reportPath.wstring(), std::to_wstring(validationFrameStart),
+         std::to_wstring(validationFrameEnd), std::to_wstring(validationFrameStep)},
         log, nullptr, stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
         report.summary = L"Blender 预检失败。请查看：" + log.wstring();

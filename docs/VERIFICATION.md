@@ -28,7 +28,7 @@
 8. 图片序列缺少中间帧 `seq_0002.png`：预检精确报告缺失帧并返回 3；序列完整但 Blender 无法完整 pack 时报告全部 unpacked 路径并阻止分发。
 9. Eevee 工程被识别为 GPU 主路径，远端 Worker 在电脑活跃时拒绝接单；Cycles GPU 同样只在空闲状态运行，并要求 Worker 检测到已启用的非 CPU Cycles 设备。
    本机 Cycles GPU 探测报告 `CUDA:NVIDIA GeForce RTX 5090 D v2` 和 `OPTIX:NVIDIA GeForce RTX 5090 D v2`，兼容性检查返回 0。
-10. 提交前在发起端执行起始帧低分辨率真实渲染；测试工程返回 `validation_render=true`。无相机或插件/节点/引擎执行异常时预检返回 3，不创建任务。
+10. 提交前在发起端对提交范围内每一帧执行低分辨率真实渲染，并检查材质、世界、灯光、合成器和节点组；测试工程返回 `validation_render=true` 和准确的 `validation_frames`。无相机或插件/节点/引擎执行异常时预检返回 3，不创建任务。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

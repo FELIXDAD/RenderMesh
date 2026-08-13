@@ -257,7 +257,7 @@ void StartSubmission() {
         fs::create_directories(work);
         PreflightReport preflight = PreflightBlend(
             gApp->GetConfig(), gApp->DataDir(), source, work / L"prepared.blend",
-            frameStart, &gPreflightStop);
+            frameStart, frameEnd, frameStep, &gPreflightStop);
         std::wstring message = preflight.summary;
         if (preflight.passed) {
             std::wstring error;
@@ -491,7 +491,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         fs::create_directories(preflightPrepared.parent_path());
         fs::create_directories(preflightReport.parent_path());
         PreflightReport result = PreflightBlend(preflightConfig, dataDir, preflightSource,
-                                                preflightPrepared, renderFrame);
+                                                preflightPrepared, renderFrame, renderFrame, 1);
         json output = {
             {"pass", result.passed}, {"version", result.blenderVersion},
             {"render_engine", result.renderEngine},
