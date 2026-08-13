@@ -26,7 +26,8 @@
 6. VSE Image Strip 使用相对素材路径：删除原图后，预检通过 `bpy.utils.blend_paths` 将它报告为 `external` 缺失项并阻止提交。
 7. 无摄像机工程旁预放一个旧 `frame_000099.png`：请求第 1 帧返回失败，不会把旧帧误认为新结果。
 8. 图片序列缺少中间帧 `seq_0002.png`：预检精确报告缺失帧并返回 3；序列完整但 Blender 无法完整 pack 时报告全部 unpacked 路径并阻止分发。
-9. Eevee 工程被识别为非 CPU-safe，远端 Worker 在电脑活跃时拒绝接单；这类 GPU/未知引擎任务只在空闲状态运行。
+9. Eevee 工程被识别为 GPU 主路径，远端 Worker 在电脑活跃时拒绝接单；Cycles GPU 同样只在空闲状态运行，并要求 Worker 检测到已启用的非 CPU Cycles 设备。
+   本机 Cycles GPU 探测报告 `CUDA:NVIDIA GeForce RTX 5090 D v2` 和 `OPTIX:NVIDIA GeForce RTX 5090 D v2`，兼容性检查返回 0。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

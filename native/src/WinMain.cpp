@@ -47,6 +47,7 @@ HFONT gFont = nullptr;
 HFONT gTitleFont = nullptr;
 std::thread gPreflight;
 std::atomic<bool> gPreflightRunning = false;
+std::atomic<bool> gPreflightStop = false;
 
 HWND Item(int id) { return GetDlgItem(gWindow, id); }
 
@@ -164,7 +165,7 @@ bool SaveSettings() {
         MessageBoxW(gWindow, error.c_str(), L"设置未保存", MB_ICONERROR);
         return false;
     }
-    MessageBoxW(gWindow, L"设置已保存。共享开关和 CPU 策略立即生效。", L"RenderMesh",
+    MessageBoxW(gWindow, L"设置已保存。共享开关和空闲策略立即生效。", L"RenderMesh",
                 MB_ICONINFORMATION);
     return true;
 }
@@ -179,7 +180,7 @@ void RefreshLists() {
     SetCell(nodes, row, 0, Utf8ToWide(config.nodeName) + L"（本机）");
     SetCell(nodes, row, 1, L"已信任");
     SetCell(nodes, row, 2, config.shareEnabled
-        ? (IdleSeconds() >= config.idleAfterSeconds ? L"空闲 · 全速" : L"活跃 · 限速")
+        ? (IdleSeconds() >= config.idleAfterSeconds ? L"空闲 · GPU可用" : L"活跃 · GPU等待")
         : L"未共享");
     SetCell(nodes, row, 3, std::to_wstring(config.activeCpuPercent) + L"%");
     SetCell(nodes, row, 4, std::to_wstring(gApp->AssignedCount()));
@@ -190,7 +191,7 @@ void RefreshLists() {
         SetCell(nodes, row, 1, peer.trusted ? L"已信任" : L"邀请码不同");
         SetCell(nodes, row, 2, peer.shareEnabled
             ? (peer.assigned ? L"正在渲染" : peer.idleSeconds >= config.idleAfterSeconds
-                    ? L"空闲 · 全速" : L"活跃 · 限速")
+                    ? L"空闲 · GPU可用" : L"活跃 · GPU等待")
             : L"未共享");
         SetCell(nodes, row, 3, std::to_wstring(peer.cpuPercent) + L"%");
         SetCell(nodes, row, 4, std::to_wstring(peer.assigned));
@@ -250,11 +251,12 @@ void StartSubmission() {
     EnableWindow(Item(ID_SUBMIT), FALSE);
     SetText(ID_PREFLIGHT, L"正在启动 Blender 检查插件和外部素材，并打包临时工程……");
     if (gPreflight.joinable()) gPreflight.join();
+    gPreflightStop = false;
     gPreflight = std::thread([=] {
         fs::path work = gApp->DataDir() / L"preflight" / Utf8ToWide(NewRandomHex(6));
         fs::create_directories(work);
         PreflightReport preflight = PreflightBlend(
-            gApp->GetConfig(), gApp->DataDir(), source, work / L"prepared.blend");
+            gApp->GetConfig(), gApp->DataDir(), source, work / L"prepared.blend", &gPreflightStop);
         std::wstring message = preflight.summary;
         if (preflight.passed) {
             std::wstring error;
@@ -280,12 +282,12 @@ void BuildUi() {
                ID_SHARE);
     Label(L"电脑名称", 36, 145, 100, 20);
     AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 140, 142, 215, 25, ID_NODE_NAME);
-    Label(L"活跃状态 CPU 硬上限", 36, 181, 190, 20);
+    Label(L"活跃状态 CPU 任务上限", 36, 181, 190, 20);
     HWND slider = AddControl(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS, 36, 205, 255, 36,
                              ID_CPU_SLIDER);
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
     Label(L"15%", 300, 208, 55, 24, ID_CPU_VALUE);
-    Label(L"无键鼠输入后全速（分钟）", 36, 248, 210, 20);
+    Label(L"无键鼠输入后启用 GPU（分钟）", 36, 248, 220, 20);
     AddControl(L"EDIT", L"3", WS_BORDER | ES_NUMBER, 260, 245, 95, 25, ID_IDLE_MINUTES);
     Label(L"Blender 程序", 36, 285, 100, 20);
     AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 140, 282, 150, 25, ID_BLENDER_PATH);
@@ -401,9 +403,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         case WM_CLOSE:
             if (gPreflightRunning.load()) {
-                MessageBoxW(window, L"Blender 正在预检工程，请等待完成后再退出。", L"RenderMesh",
-                            MB_ICONINFORMATION);
-                return 0;
+                gPreflightStop = true;
+                EnableWindow(window, FALSE);
+                SetText(ID_PREFLIGHT, L"正在中止 Blender 预检并安全退出……");
+                if (gPreflight.joinable()) gPreflight.join();
+                EnableWindow(window, TRUE);
             }
             DestroyWindow(window);
             return 0;
@@ -491,6 +495,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             {"pass", result.passed}, {"version", result.blenderVersion},
             {"render_engine", result.renderEngine},
             {"cpu_safe_while_active", result.cpuSafeWhileActive},
+            {"requires_gpu", result.requiresGpu},
             {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
         };
@@ -536,6 +541,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             compatibilityConfig, dataDir, compatibilitySource,
             manifest.value("version", std::string{}),
             manifest.value("render_engine", std::string{}),
+            manifest.value("requires_gpu", false),
             manifest.value("addons", std::vector<std::string>{}),
             compatibilityStop, summary);
         PrintToParentConsole(summary);

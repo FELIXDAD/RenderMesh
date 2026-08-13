@@ -73,6 +73,7 @@ struct PreflightReport {
     std::string blenderVersion;
     std::string renderEngine;
     bool cpuSafeWhileActive = false;
+    bool requiresGpu = false;
     std::vector<std::string> addons;
     std::vector<DependencyItem> missing;
     std::vector<DependencyItem> unpacked;
@@ -86,13 +87,15 @@ PreflightReport PreflightBlend(
     const Config& config,
     const fs::path& dataDir,
     const fs::path& source,
-    const fs::path& prepared);
+    const fs::path& prepared,
+    std::atomic<bool>* stopRequested = nullptr);
 bool CheckWorkerCompatibility(
     const Config& config,
     const fs::path& dataDir,
     const fs::path& blend,
     const std::string& expectedVersion,
     const std::string& expectedEngine,
+    bool requiresGpu,
     const std::vector<std::string>& requiredAddons,
     std::atomic<bool>& stopRequested,
     std::wstring& summary);
@@ -132,6 +135,7 @@ struct RenderJob {
     std::string blenderVersion;
     std::string renderEngine;
     bool cpuSafeWhileActive = false;
+    bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
     std::vector<FrameTask> frames;
     std::chrono::system_clock::time_point createdAt;
@@ -161,6 +165,7 @@ struct WorkItem {
     std::string blenderVersion;
     std::string renderEngine;
     bool cpuSafeWhileActive = false;
+    bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
     std::string attemptToken;
     bool remote = false;

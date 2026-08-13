@@ -327,6 +327,7 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'render_engine': engine,
           'cpu_safe_while_active': (engine == 'CYCLES' and cycles_device == 'CPU' and
                                     not uses_optix_denoiser and not uses_compositor),
+          'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
           'addons': sorted(enabled_addons),
           'missing': [], 'unpacked': [], 'warnings': warnings}
 try:
@@ -391,6 +392,17 @@ except Exception:
     result['engine_available'] = False
 result['render_engine'] = engine
 result['pass'] = result['pass'] and result['engine_available']
+result['gpu_devices'] = []
+if engine == 'CYCLES' and manifest.get('requires_gpu', False):
+    try:
+        cycles_preferences = bpy.context.preferences.addons['cycles'].preferences
+        cycles_preferences.get_devices()
+        result['gpu_devices'] = sorted({f'{device.type}:{device.name}'
+                                        for device in cycles_preferences.devices
+                                        if device.type != 'CPU' and device.use})
+    except Exception:
+        result['gpu_devices'] = []
+    result['pass'] = result['pass'] and bool(result['gpu_devices'])
 with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 )PY";
@@ -600,7 +612,8 @@ PreflightReport PreflightBlend(
     const Config& config,
     const fs::path& dataDir,
     const fs::path& source,
-    const fs::path& prepared) {
+    const fs::path& prepared,
+    std::atomic<bool>* stopRequested) {
     PreflightReport report;
     fs::path blender = FindBlender(config);
     if (blender.empty()) {
@@ -624,7 +637,7 @@ PreflightReport PreflightBlend(
         blender,
         {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
          prepared.wstring(), reportPath.wstring()},
-        log);
+        log, nullptr, stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
         report.summary = L"Blender 预检失败。请查看：" + log.wstring();
         if (!process.error.empty()) report.summary += L"\n" + process.error;
@@ -636,6 +649,7 @@ PreflightReport PreflightBlend(
         report.blenderVersion = data.value("version", std::string{});
         report.renderEngine = data.value("render_engine", std::string{});
         report.cpuSafeWhileActive = data.value("cpu_safe_while_active", false);
+        report.requiresGpu = data.value("requires_gpu", false);
         report.addons = data.value("addons", std::vector<std::string>{});
         report.warnings = data.value("warnings", std::vector<std::string>{});
         auto parseDependencies = [](const json& values) {
@@ -672,6 +686,7 @@ bool CheckWorkerCompatibility(
     const fs::path& blend,
     const std::string& expectedVersion,
     const std::string& expectedEngine,
+    bool requiresGpu,
     const std::vector<std::string>& requiredAddons,
     std::atomic<bool>& stopRequested,
     std::wstring& summary) {
@@ -693,6 +708,7 @@ bool CheckWorkerCompatibility(
     {
         std::ofstream output(manifest, std::ios::binary | std::ios::trunc);
         output << json{{"version", expectedVersion}, {"render_engine", expectedEngine},
+                       {"requires_gpu", requiresGpu},
                        {"addons", requiredAddons}}.dump(2);
     }
     ProcessResult process = RunProcess(
@@ -709,6 +725,7 @@ bool CheckWorkerCompatibility(
         std::string version = data.value("version", std::string{});
         auto missing = data.value("missing_addons", std::vector<std::string>{});
         bool engineAvailable = data.value("engine_available", expectedEngine.empty());
+        auto gpuDevices = data.value("gpu_devices", std::vector<std::string>{});
         if (version != expectedVersion) {
             summary = L"Blender 版本不一致：需要 " + Utf8ToWide(expectedVersion) + L"，本机 " +
                 Utf8ToWide(version);
@@ -722,6 +739,10 @@ bool CheckWorkerCompatibility(
         }
         if (!engineAvailable) {
             summary = L"缺少渲染引擎：" + Utf8ToWide(expectedEngine);
+            return false;
+        }
+        if (requiresGpu && expectedEngine == "CYCLES" && gpuDevices.empty()) {
+            summary = L"Worker 没有已启用的 Cycles GPU 渲染设备";
             return false;
         }
         summary = L"Worker 环境兼容";

@@ -136,20 +136,25 @@ httplib::Result PostFile(
     int port,
     const std::string& route,
     const httplib::Headers& headers,
-    const fs::path& file) {
+    const fs::path& file,
+    std::atomic<bool>* stopRequested = nullptr) {
     std::error_code ec;
     size_t total = static_cast<size_t>(fs::file_size(file, ec));
     httplib::Client client(host, port);
     client.set_connection_timeout(3, 0);
-    client.set_read_timeout(600, 0);
-    client.set_write_timeout(600, 0);
-    auto provider = [file](size_t offset, size_t length, httplib::DataSink& sink) {
+    // Bounded socket waits keep application shutdown responsive even if a peer
+    // accepts a connection and then stalls indefinitely.
+    client.set_read_timeout(5, 0);
+    client.set_write_timeout(5, 0);
+    auto provider = [file, stopRequested](size_t offset, size_t length, httplib::DataSink& sink) {
+        if (stopRequested && stopRequested->load()) return false;
         std::ifstream input(file, std::ios::binary);
         if (!input) return false;
         input.seekg(static_cast<std::streamoff>(offset));
         std::vector<char> buffer(std::min<size_t>(length, 1024 * 1024));
         size_t remaining = length;
         while (remaining > 0 && input) {
+            if (stopRequested && stopRequested->load()) return false;
             size_t wanted = std::min(buffer.size(), remaining);
             input.read(buffer.data(), static_cast<std::streamsize>(wanted));
             size_t read = static_cast<size_t>(input.gcount());
@@ -236,6 +241,7 @@ struct NodeApp::Impl {
                     {"format", job.outputFormat}, {"version", job.blenderVersion},
                     {"render_engine", job.renderEngine},
                     {"cpu_safe_while_active", job.cpuSafeWhileActive},
+                    {"requires_gpu", job.requiresGpu},
                     {"addons", job.requiredAddons}, {"frames", frames},
                 });
             }
@@ -270,6 +276,7 @@ struct NodeApp::Impl {
                 job.blenderVersion = row.value("version", "");
                 job.renderEngine = row.value("render_engine", "");
                 job.cpuSafeWhileActive = row.value("cpu_safe_while_active", false);
+                job.requiresGpu = row.value("requires_gpu", false);
                 job.requiredAddons = row.value("addons", std::vector<std::string>{});
                 for (const auto& value : row.value("frames", json::array())) {
                     FrameTask frame;
@@ -342,6 +349,7 @@ struct NodeApp::Impl {
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string renderEngine = request.get_header_value("X-RM-Engine");
                 bool cpuSafeWhileActive = request.get_header_value("X-RM-CPU-Safe") == "1";
+                bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
                 std::string attemptToken = request.get_header_value("X-RM-Attempt");
                 auto addons = HeaderStringList(request, "X-RM-Addons");
                 if (!SafeId(taskId) || !SafeId(jobId) || frame < 1 || frame > 1000000 || originPort < 1024 ||
@@ -413,7 +421,7 @@ struct NodeApp::Impl {
                 }
                 if (!owner->mockRenderer_)
                     compatible = CheckWorkerCompatibility(
-                        config, owner->DataDir(), blend, version, renderEngine, addons,
+                        config, owner->DataDir(), blend, version, renderEngine, requiresGpu, addons,
                         *effectiveStop, compatibility);
                 compatibilityStop = true;
                 if (compatibilityGuard.joinable()) compatibilityGuard.join();
@@ -436,6 +444,7 @@ struct NodeApp::Impl {
                 item.blenderVersion = version;
                 item.renderEngine = renderEngine;
                 item.cpuSafeWhileActive = cpuSafeWhileActive;
+                item.requiresGpu = requiresGpu;
                 item.requiredAddons = std::move(addons);
                 item.attemptToken = attemptToken;
                 item.remote = true;
@@ -694,12 +703,13 @@ struct NodeApp::Impl {
             {"X-RM-Format", job.outputFormat}, {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Engine", job.renderEngine},
             {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
             {"X-RM-Attempt", attemptToken},
             {"X-RM-Addons", json(job.requiredAddons).dump()},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
         auto result = PostFile(peer.address, peer.httpPort, "/v1/task", headers,
-                               job.preparedBlend);
+                               job.preparedBlend, &stopRequested);
         if (!result) {
             error = "network error: " + httplib::to_string(result.error());
             return false;
@@ -832,6 +842,7 @@ struct NodeApp::Impl {
                 item.blenderVersion = jobCopy.blenderVersion;
                 item.renderEngine = jobCopy.renderEngine;
                 item.cpuSafeWhileActive = jobCopy.cpuSafeWhileActive;
+                item.requiresGpu = jobCopy.requiresGpu;
                 item.requiredAddons = jobCopy.requiredAddons;
                 {
                     std::scoped_lock workLock(workMutex);
@@ -882,7 +893,8 @@ struct NodeApp::Impl {
             if (attempt) std::this_thread::sleep_for(std::chrono::seconds(attempt * 2));
             httplib::Result result;
             if (success && !retry) {
-                result = PostFile(item.originAddress, item.originPort, "/v1/result", headers, output);
+                result = PostFile(item.originAddress, item.originPort, "/v1/result", headers,
+                                  output, &stopRequested);
             } else {
                 httplib::Client client(item.originAddress, item.originPort);
                 client.set_connection_timeout(3, 0);
@@ -1134,6 +1146,7 @@ std::string NodeApp::SubmitPrepared(
     job.blenderVersion = report.blenderVersion;
     job.renderEngine = report.renderEngine;
     job.cpuSafeWhileActive = report.cpuSafeWhileActive;
+    job.requiresGpu = report.requiresGpu;
     job.requiredAddons = report.addons;
     job.createdAt = std::chrono::system_clock::now();
     for (int frame = frameStart; frame <= frameEnd; frame += frameStep) {

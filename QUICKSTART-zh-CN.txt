@@ -14,9 +14,9 @@ RenderMesh 0.1.0（Windows x64）
 
 默认策略：
 - 共享算力：关闭
-- Cycles CPU 任务在用户活跃时硬上限：15%
-- 连续 3 分钟无键盘/鼠标输入：CPU 100%
-- GPU/未知引擎：只在空闲时运行，键鼠恢复后自动中止并重派
+- Eevee / Cycles GPU：连续 3 分钟无键鼠输入后才运行，键鼠恢复后自动中止并重派
+- Cycles GPU：Worker 必须检测到已启用的非 CPU Cycles 设备，否则拒绝任务
+- 极少数 Cycles CPU：用户活跃时硬上限 15%，空闲时 100%
 
 数据和结果：%LOCALAPPDATA%\RenderMesh
 端口：UDP 8390（发现），TCP 8391（任务/结果）
