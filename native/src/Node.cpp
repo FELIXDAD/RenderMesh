@@ -125,7 +125,10 @@ std::string DiscoverySignature(const Config& config, const json& message) {
         message.value("task_id", "") + "|" +
         json(message.value("addresses", std::vector<std::string>{})).dump();
     if (message.value("protocol", 1) >= 2) {
-        signedValue += "|" + message.value("cpu_model", "") + "|" +
+        signedValue += "|" + message.value("name", "") + "|" +
+            std::to_string(message.value("cpu", 0)) + "|" +
+            std::to_string(message.value("idle", 0)) + "|" +
+            message.value("cpu_model", "") + "|" +
             json(message.value("gpu_models", std::vector<std::string>{})).dump();
     }
     return HmacSha256(config.clusterToken, signedValue);
@@ -476,7 +479,7 @@ struct NodeApp::Impl {
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             Config config = owner->GetConfig();
             response.set_content(
-                json{{"status", "ok"}, {"node_id", config.nodeId},
+                json{{"status", "ok"}, {"protocol", 2}, {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
                      {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
@@ -854,6 +857,7 @@ struct NodeApp::Impl {
             return false;
         }
         peer.nodeId = nodeId;
+        peer.protocolVersion = health.value("protocol", 1);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -1002,6 +1006,7 @@ struct NodeApp::Impl {
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
+                peer.protocolVersion = protocol;
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -1037,6 +1042,12 @@ struct NodeApp::Impl {
                         configuredEndpoint == existingEndpoint &&
                         std::chrono::steady_clock::now() -
                             existing->second.manualValidatedAt <= kPeerTimeout;
+                    if (protocol == 1 && existing != peers.end() &&
+                        existing->second.protocolVersion >= 2) {
+                        peer.protocolVersion = existing->second.protocolVersion;
+                        peer.cpuModel = existing->second.cpuModel;
+                        peer.gpuModels = existing->second.gpuModels;
+                    }
                     if (manualRouteStillValid) {
                         peer.address = existing->second.address;
                         peer.httpPort = existing->second.httpPort;
@@ -1688,6 +1699,23 @@ bool RunSelfTest(std::wstring& report) {
         if (HmacSha256("key", "The quick brown fox jumps over the lazy dog") !=
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") {
             report = L"HMAC-SHA256 自检失败";
+            return false;
+        }
+        Config signatureConfig;
+        signatureConfig.clusterToken = "legacy-token-123";
+        json discoveryV2 = {
+            {"protocol", 2}, {"node_id", "signed-node"}, {"nonce", "0011223344556677"},
+            {"port", 8391}, {"share", true}, {"assigned", 0}, {"task_id", ""},
+            {"addresses", std::vector<std::string>{"192.168.1.10"}},
+            {"name", "WORKSTATION"}, {"cpu", 15}, {"idle", 180},
+            {"cpu_model", "Test CPU"},
+            {"gpu_models", std::vector<std::string>{"Test GPU"}},
+        };
+        std::string discoveryProof = DiscoverySignature(signatureConfig, discoveryV2);
+        discoveryV2["idle"] = 181;
+        if (ConstantTimeEqual(discoveryProof,
+                              DiscoverySignature(signatureConfig, discoveryV2))) {
+            report = L"Protocol-v2 discovery state was not authenticated";
             return false;
         }
         if (DirectedBroadcastAddress("192.168.29.75", 23) != "192.168.29.255" ||

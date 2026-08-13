@@ -170,6 +170,7 @@ struct RenderJob {
 };
 
 struct Peer {
+    int protocolVersion = 1;
     std::string nodeId;
     std::string name;
     std::string address;
