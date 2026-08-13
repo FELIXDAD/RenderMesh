@@ -173,6 +173,7 @@ struct RenderJob {
 
 struct Peer {
     int protocolVersion = 1;
+    bool supportsProjectCache = false;
     std::string nodeId;
     std::string name;
     std::string address;

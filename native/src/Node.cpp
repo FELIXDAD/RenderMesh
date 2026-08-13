@@ -107,7 +107,10 @@ bool StreamRequestToFile(
 
 bool HasTransferCapacity(const httplib::Request& request, const fs::path& directory) {
     std::string value = request.get_header_value("Content-Length");
-    if (value.empty()) return true;  // The streaming hard limit still applies.
+    // A preflight disk-space guarantee is impossible for an unbounded chunked
+    // body. RenderMesh clients always send a known file size, so reject other
+    // transfer forms before accepting bytes.
+    if (value.empty()) return false;
     uint64_t requested = 0;
     try {
         requested = std::stoull(value);
@@ -138,6 +141,8 @@ std::string DiscoverySignature(const Config& config, const json& message) {
             message.value("cpu_model", "") + "|" +
             json(message.value("gpu_models", std::vector<std::string>{})).dump();
     }
+    if (message.value("protocol", 1) >= 3)
+        signedValue += "|" + std::string(message.value("project_cache", false) ? "1" : "0");
     return HmacSha256(config.clusterToken, signedValue);
 }
 
@@ -228,6 +233,7 @@ bool PeerExplicitlyStoppedTask(const Peer& peer, const std::string& taskId) {
 void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     if (candidate.protocolVersion != 1 || existing.protocolVersion < 2) return;
     candidate.protocolVersion = existing.protocolVersion;
+    candidate.supportsProjectCache = existing.supportsProjectCache;
     candidate.name = existing.name;
     candidate.cpuPercent = existing.cpuPercent;
     candidate.idleSeconds = existing.idleSeconds;
@@ -337,14 +343,15 @@ httplib::Result PostFile(
     const std::string& route,
     const httplib::Headers& headers,
     const fs::path& file,
-    std::atomic<bool>* stopRequested = nullptr) {
+    std::atomic<bool>* stopRequested = nullptr,
+    time_t responseTimeoutSeconds = 5) {
     std::error_code ec;
     size_t total = static_cast<size_t>(fs::file_size(file, ec));
     httplib::Client client(host, port);
     client.set_connection_timeout(3, 0);
     // Bounded socket waits keep application shutdown responsive even if a peer
     // accepts a connection and then stalls indefinitely.
-    client.set_read_timeout(5, 0);
+    client.set_read_timeout(responseTimeoutSeconds, 0);
     client.set_write_timeout(5, 0);
     auto provider = [file, stopRequested](size_t offset, size_t length, httplib::DataSink& sink) {
         if (stopRequested && stopRequested->load()) return false;
@@ -364,7 +371,26 @@ httplib::Result PostFile(
         }
         return remaining == 0;
     };
-    return client.Post(route, headers, total, provider, "application/octet-stream");
+    std::mutex cancellationMutex;
+    std::condition_variable cancellationChanged;
+    bool finished = false;
+    std::thread cancellationThread;
+    if (stopRequested) {
+        cancellationThread = std::thread([&] {
+            std::unique_lock lock(cancellationMutex);
+            while (!finished && !stopRequested->load())
+                cancellationChanged.wait_for(lock, std::chrono::milliseconds(100));
+            if (!finished) client.stop();
+        });
+    }
+    auto result = client.Post(route, headers, total, provider, "application/octet-stream");
+    {
+        std::scoped_lock lock(cancellationMutex);
+        finished = true;
+    }
+    cancellationChanged.notify_all();
+    if (cancellationThread.joinable()) cancellationThread.join();
+    return result;
 }
 
 std::string FrameExtension(const std::string& format) {
@@ -610,7 +636,8 @@ struct NodeApp::Impl {
         server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
             Config config = owner->GetConfig();
             response.set_content(
-                json{{"status", "ok"}, {"protocol", 2}, {"node_id", config.nodeId},
+                json{{"status", "ok"}, {"protocol", 3}, {"project_cache", true},
+                     {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
                      {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
@@ -1232,6 +1259,7 @@ struct NodeApp::Impl {
         }
         peer.nodeId = nodeId;
         peer.protocolVersion = health.value("protocol", 1);
+        peer.supportsProjectCache = health.value("project_cache", false);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -1318,8 +1346,9 @@ struct NodeApp::Impl {
                     localAddresses.push_back(network.address);
                 std::vector<std::string> payloads;
                 if (!config.pairingPending && config.clusterToken.size() >= 16) {
-                    json messageV2 = {
-                        {"protocol", 2}, {"node_id", config.nodeId}, {"name", config.nodeName},
+                    json messageV3 = {
+                        {"protocol", 3}, {"project_cache", true},
+                        {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
                         {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
@@ -1327,9 +1356,9 @@ struct NodeApp::Impl {
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
-                    messageV2["signature"] = DiscoverySignature(config, messageV2);
-                    payloads.push_back(messageV2.dump());
-                    // Keep a v1 beacon during the protocol-v2 rollout so an older
+                    messageV3["signature"] = DiscoverySignature(config, messageV3);
+                    payloads.push_back(messageV3.dump());
+                    // Keep a v1 beacon during the protocol-v3 rollout so an older
                     // installed node can still discover this endpoint.
                     json messageV1 = {
                         {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
@@ -1376,11 +1405,12 @@ struct NodeApp::Impl {
             try {
                 json message = json::parse(std::string(buffer, received));
                 int protocol = message.value("protocol", 0);
-                if (protocol != 1 && protocol != 2) continue;
+                if (protocol != 1 && protocol != 2 && protocol != 3) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
                 peer.protocolVersion = protocol;
+                peer.supportsProjectCache = message.value("project_cache", false);
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -1480,7 +1510,7 @@ struct NodeApp::Impl {
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
         httplib::Result result;
-        if (peer.protocolVersion >= 2 && SafeSha256(job.projectHash)) {
+        if (peer.supportsProjectCache && SafeSha256(job.projectHash)) {
             httplib::Client cacheClient(peer.address, peer.httpPort);
             cacheClient.set_connection_timeout(3, 0);
             cacheClient.set_read_timeout(5, 0);
@@ -1494,7 +1524,12 @@ struct NodeApp::Impl {
             };
             auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
                                           cacheStatusHeaders);
-            if (!status || status->status == 404) {
+            if (!status) {
+                error = "retry: project cache query failed: " +
+                    httplib::to_string(status.error());
+                return false;
+            }
+            if (status->status == 404) {
                 httplib::Headers cacheHeaders = {
                     {"X-RM-Token", config.clusterToken},
                     {"X-RM-Project", job.projectHash},
@@ -1505,7 +1540,7 @@ struct NodeApp::Impl {
                     {"X-RM-Addons", json(job.requiredAddons).dump()},
                 };
                 auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", cacheHeaders,
-                                       job.preparedBlend, &stopRequested);
+                                       job.preparedBlend, &stopRequested, 3600);
                 if (!upload || (upload->status != 200 && upload->status != 201)) {
                     error = upload && !upload->body.empty() ? upload->body
                         : "project cache upload failed";
@@ -1592,6 +1627,7 @@ struct NodeApp::Impl {
                 continue;
             }
             bool handled = false;
+            bool deferredRemote = false;
             auto peer = AvailablePeer();
             if (peer) {
                 std::string dispatchError;
@@ -1627,7 +1663,9 @@ struct NodeApp::Impl {
                         auto& frame = jobs[jobIndex].frames[frameIndex];
                         if (frame.state == TaskState::Assigned &&
                             frame.attemptToken == attemptToken) {
-                            frame.state = TaskState::Dispatching;
+                            deferredRemote = dispatchError.starts_with("retry:");
+                            frame.state = deferredRemote ? TaskState::Pending
+                                                         : TaskState::Dispatching;
                             frame.assignedNodeId.clear();
                             frame.assignedNodeName.clear();
                             frame.assignedAt = {};
@@ -1640,6 +1678,10 @@ struct NodeApp::Impl {
                             handled = true;
                         }
                     }
+                }
+                if (deferredRemote) {
+                    handled = true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 }
             }
             int expectedAssigned = 0;
@@ -2169,8 +2211,19 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Protocol-v2 discovery state was not authenticated";
             return false;
         }
+        json discoveryV3 = discoveryV2;
+        discoveryV3["protocol"] = 3;
+        discoveryV3["project_cache"] = true;
+        std::string discoveryV3Proof = DiscoverySignature(signatureConfig, discoveryV3);
+        discoveryV3["project_cache"] = false;
+        if (ConstantTimeEqual(discoveryV3Proof,
+                              DiscoverySignature(signatureConfig, discoveryV3))) {
+            report = L"Protocol-v3 cache capability was not authenticated";
+            return false;
+        }
         Peer authenticatedPeer;
-        authenticatedPeer.protocolVersion = 2;
+        authenticatedPeer.protocolVersion = 3;
+        authenticatedPeer.supportsProjectCache = true;
         authenticatedPeer.name = "SIGNED-NAME";
         authenticatedPeer.cpuPercent = 17;
         authenticatedPeer.idleSeconds = 181;
@@ -2182,7 +2235,8 @@ bool RunSelfTest(std::wstring& report) {
         legacyUpdate.cpuPercent = 99;
         legacyUpdate.idleSeconds = 999;
         PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
-        if (legacyUpdate.protocolVersion != 2 || legacyUpdate.name != "SIGNED-NAME" ||
+        if (legacyUpdate.protocolVersion != 3 || !legacyUpdate.supportsProjectCache ||
+            legacyUpdate.name != "SIGNED-NAME" ||
             legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
             legacyUpdate.cpuModel != "SIGNED-CPU" ||
             legacyUpdate.gpuModels != std::vector<std::string>{"SIGNED-GPU"}) {

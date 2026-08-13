@@ -621,7 +621,9 @@ std::string Sha256File(const fs::path& path) {
                       reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
     std::vector<unsigned char> object(objectSize);
     bool ok = BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) == 0;
-    std::array<char, 1024 * 1024> buffer{};
+    // Windows GUI threads commonly have a 1 MiB stack. Keep the streaming
+    // buffer on the heap so hashing a project cannot exhaust that stack.
+    std::vector<char> buffer(256 * 1024);
     while (ok && input) {
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         std::streamsize count = input.gcount();
