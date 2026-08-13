@@ -33,6 +33,7 @@ std::wstring Utf8ToWide(const std::string& value);
 std::wstring LastErrorMessage(DWORD code = GetLastError());
 std::string NewRandomHex(size_t bytes);
 std::string Sha256Prefix(const std::string& value, size_t chars = 16);
+std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
 fs::path DefaultDataDirectory();
 double IdleSeconds();
@@ -70,6 +71,8 @@ struct DependencyItem {
 struct PreflightReport {
     bool passed = false;
     std::string blenderVersion;
+    std::string renderEngine;
+    bool cpuSafeWhileActive = false;
     std::vector<std::string> addons;
     std::vector<DependencyItem> missing;
     std::vector<DependencyItem> unpacked;
@@ -89,7 +92,9 @@ bool CheckWorkerCompatibility(
     const fs::path& dataDir,
     const fs::path& blend,
     const std::string& expectedVersion,
+    const std::string& expectedEngine,
     const std::vector<std::string>& requiredAddons,
+    std::atomic<bool>& stopRequested,
     std::wstring& summary);
 bool RenderBlenderFrame(
     const Config& config,
@@ -114,6 +119,7 @@ struct FrameTask {
     std::string assignedNodeName;
     std::chrono::steady_clock::time_point assignedAt{};
     int dispatchAttempts = 0;
+    std::string attemptToken;
     fs::path output;
     std::string error;
 };
@@ -124,6 +130,8 @@ struct RenderJob {
     fs::path preparedBlend;
     std::string outputFormat = "PNG";
     std::string blenderVersion;
+    std::string renderEngine;
+    bool cpuSafeWhileActive = false;
     std::vector<std::string> requiredAddons;
     std::vector<FrameTask> frames;
     std::chrono::system_clock::time_point createdAt;
@@ -151,7 +159,10 @@ struct WorkItem {
     fs::path outputDir;
     std::string outputFormat;
     std::string blenderVersion;
+    std::string renderEngine;
+    bool cpuSafeWhileActive = false;
     std::vector<std::string> requiredAddons;
+    std::string attemptToken;
     bool remote = false;
     std::string originAddress;
     int originPort = 8391;

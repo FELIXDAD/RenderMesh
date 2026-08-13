@@ -489,6 +489,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                                                 preflightPrepared);
         json output = {
             {"pass", result.passed}, {"version", result.blenderVersion},
+            {"render_engine", result.renderEngine},
+            {"cpu_safe_while_active", result.cpuSafeWhileActive},
             {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
         };
@@ -529,10 +531,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         json manifest = json::parse(manifestFile, nullptr, false);
         if (manifest.is_discarded()) return 5;
         std::wstring summary;
+        std::atomic<bool> compatibilityStop = false;
         bool ok = CheckWorkerCompatibility(
             compatibilityConfig, dataDir, compatibilitySource,
             manifest.value("version", std::string{}),
-            manifest.value("addons", std::vector<std::string>{}), summary);
+            manifest.value("render_engine", std::string{}),
+            manifest.value("addons", std::vector<std::string>{}),
+            compatibilityStop, summary);
         PrintToParentConsole(summary);
         return ok ? 0 : 5;
     }

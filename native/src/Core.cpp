@@ -121,7 +121,8 @@ ProcessResult RunProcess(
                 result.error = L"任务因应用退出而中止";
                 break;
             }
-            DWORD wait = WaitForSingleObject(process.hProcess, renderPolicy ? 500 : INFINITE);
+            DWORD wait = WaitForSingleObject(
+                process.hProcess, (renderPolicy || stopRequested) ? 500 : INFINITE);
             if (wait == WAIT_OBJECT_0) break;
             if (wait == WAIT_FAILED) {
                 result.error = LastErrorMessage();
@@ -168,18 +169,100 @@ bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring
     return true;
 }
 
-const char* kPreflightScript = R"PY(import bpy, addon_utils, json, os, sys, glob, traceback
+const char* kPreflightScript = R"PY(import bpy, addon_utils, json, os, sys, glob, re, traceback
 
 args = sys.argv[sys.argv.index('--') + 1:]
 prepared, report_path = args[0], args[1]
 warnings = []
 
-def real_exists(path):
+def path_key(path):
+    return os.path.normcase(os.path.normpath(bpy.path.abspath(path)))
+
+runtime_roots = []
+for resource_kind in ('SYSTEM', 'LOCAL'):
+    try:
+        value = bpy.utils.resource_path(resource_kind)
+        if value:
+            runtime_roots.append(path_key(value))
+    except Exception:
+        pass
+
+def is_runtime_resource(path):
+    key = path_key(path)
+    for root in runtime_roots:
+        try:
+            if os.path.commonpath([key, root]) == root:
+                return True
+        except ValueError:
+            pass
+    return False
+
+def expected_paths(path, item=None):
     if not path:
-        return True
+        return []
     path = bpy.path.abspath(path)
-    patterns = [path.replace('<UDIM>', '*').replace('####', '*')]
-    return any(os.path.exists(p) or glob.glob(p) for p in patterns)
+    if '<UDIM>' in path:
+        if item is not None:
+            expected = sorted({getattr(tile, 'number', None)
+                               for tile in getattr(item, 'tiles', [])})
+            expected = [tile for tile in expected if tile]
+            if expected:
+                return [path.replace('<UDIM>', str(tile)) for tile in expected]
+        tiles = sorted(glob.glob(path.replace('<UDIM>', '*')))
+        return tiles or [path]
+    if '####' in path:
+        duration = max(1, int(getattr(item, 'frame_duration', 1)))
+        return [path.replace('####', f'{frame:04d}') for frame in range(1, duration + 1)]
+    if item is not None and getattr(item, 'source', '') == 'SEQUENCE':
+        match = re.search(r'(\d+)(?=\.[^.]+$)', path)
+        if match:
+            width = len(match.group(1))
+            start = int(match.group(1))
+            expression = re.compile(
+                '^' + re.escape(path[:match.start(1)]) + r'(\d{' + str(width) + '})' +
+                re.escape(path[match.end(1):]) + '$', re.IGNORECASE)
+            discovered = []
+            for candidate in glob.glob(path[:match.start(1)] + '*' + path[match.end(1):]):
+                found = expression.match(candidate)
+                if found:
+                    discovered.append(int(found.group(1)))
+            for packed in list(getattr(item, 'packed_files', []) or []):
+                packed_path = bpy.path.abspath(getattr(packed, 'filepath', '') or '')
+                found = expression.match(packed_path)
+                if found:
+                    discovered.append(int(found.group(1)))
+            duration = max(1, int(getattr(item, 'frame_duration', 1)))
+            if discovered:
+                duration = max(duration, max(discovered) - start + 1)
+            return [path[:match.start(1)] + f'{start + index:0{width}d}' + path[match.end(1):]
+                    for index in range(duration)]
+    return [path]
+
+def packed_path_keys(item, candidates):
+    keys = set()
+    packed_files = list(getattr(item, 'packed_files', []) or [])
+    for packed in packed_files:
+        filepath = getattr(packed, 'filepath', '') or ''
+        if filepath:
+            keys.add(path_key(filepath))
+        tile_number = int(getattr(packed, 'tile_number', 0) or 0)
+        if tile_number:
+            for candidate in candidates:
+                if str(tile_number) in os.path.basename(candidate):
+                    keys.add(path_key(candidate))
+    # packed_file represents the sole source for ordinary, non-sequence images.
+    if getattr(item, 'packed_file', None) and len(candidates) == 1:
+        keys.add(path_key(candidates[0]))
+    return keys
+
+def dependency_state(path, item=None):
+    candidates = expected_paths(path, item)
+    packed = packed_path_keys(item, candidates) if item is not None else set()
+    missing = [candidate for candidate in candidates
+               if path_key(candidate) not in packed and not os.path.exists(candidate)]
+    unpacked = [candidate for candidate in candidates
+                if path_key(candidate) not in packed and os.path.exists(candidate)]
+    return candidates, missing, unpacked
 
 def gather():
     rows = []
@@ -194,11 +277,13 @@ def gather():
             path = getattr(item, 'filepath', '') or ''
             if not path or path in {'<builtin>', '<generated>'}:
                 continue
-            packed = bool(getattr(item, 'packed_file', None) or getattr(item, 'packed_files', None))
+            candidates, missing, unpacked = dependency_state(path, item)
+            packed = bool(candidates) and not missing and not unpacked
             rows.append({
                 'kind': kind, 'owner': getattr(item, 'name', ''),
                 'path': bpy.path.abspath(path), 'packed': packed,
-                'exists': real_exists(path),
+                'exists': not missing, 'missing_paths': missing,
+                'unpacked_paths': unpacked,
             })
     known = {os.path.normcase(os.path.normpath(x['path'])) for x in rows}
     try:
@@ -206,21 +291,48 @@ def gather():
         # live in one of the common datablock collections above. packed=True
         # means already-packed paths are skipped.
         for path in bpy.utils.blend_paths(absolute=True, packed=True, local=False):
+            # Files shipped inside this exact Blender runtime are guaranteed by
+            # the already-enforced major.minor version match and are not project
+            # assets (for example Essentials brush libraries).
+            if is_runtime_resource(path):
+                continue
             key = os.path.normcase(os.path.normpath(path))
             if key not in known:
+                _, missing, unpacked = dependency_state(path)
                 rows.append({'kind': 'external', 'owner': '', 'path': path,
-                             'packed': False, 'exists': real_exists(path)})
+                             'packed': False, 'exists': not missing,
+                             'missing_paths': missing,
+                             'unpacked_paths': unpacked})
                 known.add(key)
     except Exception as exc:
         warnings.append(f'blend_paths: {exc}')
     return rows
 
+engine = bpy.context.scene.render.engine
+cycles_device = getattr(bpy.context.scene.cycles, 'device', 'CPU') if engine == 'CYCLES' else ''
+addon_versions = {}
+for module in addon_utils.modules(refresh=True):
+    version = getattr(module, 'bl_info', {}).get('version', ())
+    addon_versions[module.__name__] = '.'.join(str(part) for part in version) or 'unknown'
+enabled_addons = []
+for addon in bpy.context.preferences.addons:
+    name = addon.module
+    enabled_addons.append(name + '@' + addon_versions.get(name, 'unknown'))
+
+uses_optix_denoiser = (engine == 'CYCLES' and
+                       bool(getattr(bpy.context.scene.cycles, 'use_denoising', False)) and
+                       getattr(bpy.context.scene.cycles, 'denoiser', '') == 'OPTIX')
+uses_compositor = getattr(bpy.context.scene, 'compositing_node_group', None) is not None
 report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
-          'addons': sorted(a.module for a in bpy.context.preferences.addons),
+          'render_engine': engine,
+          'cpu_safe_while_active': (engine == 'CYCLES' and cycles_device == 'CPU' and
+                                    not uses_optix_denoiser and not uses_compositor),
+          'addons': sorted(enabled_addons),
           'missing': [], 'unpacked': [], 'warnings': warnings}
 try:
     before = gather()
-    report['missing'] = [x for x in before if not x['exists'] and not x['packed']]
+    report['missing'] = [dict(x, path=missing) for x in before
+                         for missing in x.get('missing_paths', [])]
     if not report['missing']:
         try:
             bpy.ops.file.pack_all()
@@ -228,8 +340,10 @@ try:
             warnings.append(f'pack_all: {exc}')
         bpy.ops.wm.save_as_mainfile(filepath=prepared, copy=True)
         after = gather()
-        report['missing'] = [x for x in after if not x['exists'] and not x['packed']]
-        report['unpacked'] = [x for x in after if x['exists'] and not x['packed']]
+        report['missing'] = [dict(x, path=missing) for x in after
+                             for missing in x.get('missing_paths', [])]
+        report['unpacked'] = [dict(x, path=unpacked) for x in after
+                              for unpacked in x.get('unpacked_paths', [])]
         report['pass'] = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
 except Exception:
     warnings.append(traceback.format_exc())
@@ -243,19 +357,40 @@ manifest_path, report_path = args[0], args[1]
 with open(manifest_path, 'r', encoding='utf-8') as f:
     manifest = json.load(f)
 available = set()
+available_versions = {}
 for module in addon_utils.modules(refresh=True):
     available.add(module.__name__)
     available.add(module.__name__.split('.')[0])
+    version = getattr(module, 'bl_info', {}).get('version', ())
+    available_versions[module.__name__] = '.'.join(str(part) for part in version) or 'unknown'
 enabled = set(addon.module for addon in bpy.context.preferences.addons)
-missing_installed = [name for name in manifest.get('addons', [])
+requirements = []
+for value in manifest.get('addons', []):
+    name, separator, version = value.rpartition('@')
+    requirements.append((name if separator else value, version if separator else ''))
+missing_installed = [name for name, version in requirements
                      if name not in available and name.split('.')[0] not in available]
-missing_enabled = [name for name in manifest.get('addons', [])
+missing_enabled = [name for name, version in requirements
                    if name not in enabled]
-missing = sorted(set(missing_installed + missing_enabled))
+version_mismatch = [f'{name} (need {version}, have {available_versions.get(name, "unknown")})'
+                    for name, version in requirements
+                    if version and version != 'unknown' and name in available_versions and
+                    available_versions[name] != version]
+missing = sorted(set(missing_installed + missing_enabled + version_mismatch))
 version = f'{bpy.app.version[0]}.{bpy.app.version[1]}'
 result = {'pass': version == manifest.get('version') and not missing,
           'version': version, 'missing_addons': missing,
-          'missing_installed': missing_installed, 'missing_enabled': missing_enabled}
+          'missing_installed': missing_installed, 'missing_enabled': missing_enabled,
+          'version_mismatch': version_mismatch}
+engine = manifest.get('render_engine', '')
+try:
+    if engine:
+        bpy.context.scene.render.engine = engine
+    result['engine_available'] = True
+except Exception:
+    result['engine_available'] = False
+result['render_engine'] = engine
+result['pass'] = result['pass'] and result['engine_available']
 with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
 )PY";
@@ -328,6 +463,32 @@ std::string Sha256Prefix(const std::string& value, size_t chars) {
     output << std::hex << std::setfill('0');
     for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
     return output.str().substr(0, chars);
+}
+
+std::string HmacSha256(const std::string& key, const std::string& value) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0, resultSize = 0;
+    std::array<unsigned char, 32> digest{};
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+        return {};
+    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                      reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
+    std::vector<unsigned char> object(objectSize);
+    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize,
+                         reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+                         static_cast<ULONG>(key.size()), 0) == 0) {
+        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                       static_cast<ULONG>(value.size()), 0);
+        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    }
+    if (hash) BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
+    return output.str();
 }
 
 fs::path ExecutableDirectory() {
@@ -473,6 +634,8 @@ PreflightReport PreflightBlend(
         json data = json::parse(ReadText(reportPath));
         report.passed = data.value("pass", false);
         report.blenderVersion = data.value("version", std::string{});
+        report.renderEngine = data.value("render_engine", std::string{});
+        report.cpuSafeWhileActive = data.value("cpu_safe_while_active", false);
         report.addons = data.value("addons", std::vector<std::string>{});
         report.warnings = data.value("warnings", std::vector<std::string>{});
         auto parseDependencies = [](const json& values) {
@@ -508,7 +671,9 @@ bool CheckWorkerCompatibility(
     const fs::path& dataDir,
     const fs::path& blend,
     const std::string& expectedVersion,
+    const std::string& expectedEngine,
     const std::vector<std::string>& requiredAddons,
+    std::atomic<bool>& stopRequested,
     std::wstring& summary) {
     fs::path blender = FindBlender(config);
     if (blender.empty()) {
@@ -527,13 +692,14 @@ bool CheckWorkerCompatibility(
     }
     {
         std::ofstream output(manifest, std::ios::binary | std::ios::trunc);
-        output << json{{"version", expectedVersion}, {"addons", requiredAddons}}.dump(2);
+        output << json{{"version", expectedVersion}, {"render_engine", expectedEngine},
+                       {"addons", requiredAddons}}.dump(2);
     }
     ProcessResult process = RunProcess(
         blender,
         {L"--background", L"--disable-autoexec", blend.wstring(), L"--python", script.wstring(),
          L"--", manifest.wstring(), report.wstring()},
-        log);
+        log, &config, &stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(report)) {
         summary = L"Worker 环境检查失败：" + log.wstring();
         return false;
@@ -542,6 +708,7 @@ bool CheckWorkerCompatibility(
         json data = json::parse(ReadText(report));
         std::string version = data.value("version", std::string{});
         auto missing = data.value("missing_addons", std::vector<std::string>{});
+        bool engineAvailable = data.value("engine_available", expectedEngine.empty());
         if (version != expectedVersion) {
             summary = L"Blender 版本不一致：需要 " + Utf8ToWide(expectedVersion) + L"，本机 " +
                 Utf8ToWide(version);
@@ -551,6 +718,10 @@ bool CheckWorkerCompatibility(
             summary = L"缺少插件：";
             for (size_t i = 0; i < std::min<size_t>(missing.size(), 8); ++i)
                 summary += (i ? L"、" : L"") + Utf8ToWide(missing[i]);
+            return false;
+        }
+        if (!engineAvailable) {
+            summary = L"缺少渲染引擎：" + Utf8ToWide(expectedEngine);
             return false;
         }
         summary = L"Worker 环境兼容";
