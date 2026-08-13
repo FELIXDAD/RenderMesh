@@ -44,7 +44,7 @@ $output = Join-Path $buildDir 'RenderMesh.exe'
 $link = @(
     '-municode','-mwindows','-static','-static-libgcc','-static-libstdc++',
     '-Wl,--gc-sections','-Wl,--subsystem,windows','-o',$output,
-    '-lws2_32','-lcomctl32','-lcomdlg32','-lshell32','-lole32','-lbcrypt','-luuid'
+    '-lws2_32','-liphlpapi','-lcomctl32','-lcomdlg32','-lshell32','-lole32','-lbcrypt','-luuid'
 )
 if ($Configuration -eq 'Release') { $link += '-s' }
 

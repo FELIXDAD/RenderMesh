@@ -37,6 +37,9 @@ std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
 fs::path DefaultDataDirectory();
 double IdleSeconds();
+std::optional<std::string> DirectedBroadcastAddress(
+    const std::string& address, unsigned long prefixLength);
+std::wstring LocalEndpointSummary(int port);
 
 struct Config {
     std::string nodeId;
@@ -48,6 +51,7 @@ struct Config {
     int httpPort = 8391;
     int discoveryPort = 8390;
     fs::path blenderPath;
+    std::string manualPeerEndpoint;
 };
 
 class ConfigStore {
@@ -201,6 +205,7 @@ public:
 
     Config GetConfig() const;
     bool UpdateConfig(const Config& config, std::wstring& error);
+    bool AddManualPeer(const std::string& endpoint, std::wstring& result);
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
     int AssignedCount() const;

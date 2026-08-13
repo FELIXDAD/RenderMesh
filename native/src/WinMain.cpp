@@ -39,6 +39,9 @@ enum ControlId {
     ID_JOBS,
     ID_STATUS,
     ID_OPEN_DATA,
+    ID_MANUAL_ENDPOINT,
+    ID_CONNECT_MANUAL,
+    ID_MANUAL_STATUS,
 };
 
 std::unique_ptr<NodeApp> gApp;
@@ -150,6 +153,7 @@ void LoadConfigIntoUi() {
     SetText(ID_IDLE_MINUTES, std::to_wstring(config.idleAfterSeconds / 60.0));
     SetText(ID_BLENDER_PATH, config.blenderPath.wstring());
     SetText(ID_CLUSTER_TOKEN, Utf8ToWide(config.clusterToken));
+    SetText(ID_MANUAL_ENDPOINT, Utf8ToWide(config.manualPeerEndpoint));
 }
 
 bool SaveSettings() {
@@ -170,6 +174,30 @@ bool SaveSettings() {
     return true;
 }
 
+void ConnectManualPeer() {
+    Config config = gApp->GetConfig();
+    config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
+    config.shareEnabled = SendMessageW(Item(ID_SHARE), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    config.activeCpuPercent = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
+    config.idleAfterSeconds = std::max(30, static_cast<int>(IntValue(ID_IDLE_MINUTES, 3) * 60));
+    config.blenderPath = Text(Item(ID_BLENDER_PATH));
+    config.clusterToken = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
+    std::wstring result;
+    if (!gApp->UpdateConfig(config, result)) {
+        SetText(ID_MANUAL_STATUS, result);
+        MessageBoxW(gWindow, result.c_str(), L"设置无效", MB_ICONERROR);
+        return;
+    }
+    bool connected = gApp->AddManualPeer(
+        WideToUtf8(Text(Item(ID_MANUAL_ENDPOINT))), result);
+    SetText(ID_MANUAL_STATUS, result);
+    if (connected) {
+        SetText(ID_MANUAL_ENDPOINT, Utf8ToWide(gApp->GetConfig().manualPeerEndpoint));
+    } else {
+        MessageBoxW(gWindow, result.c_str(), L"手动连接失败", MB_ICONWARNING);
+    }
+}
+
 void RefreshLists() {
     if (!gApp) return;
     auto peers = gApp->Peers();
@@ -184,7 +212,7 @@ void RefreshLists() {
         : L"未共享");
     SetCell(nodes, row, 3, std::to_wstring(config.activeCpuPercent) + L"%");
     SetCell(nodes, row, 4, std::to_wstring(gApp->AssignedCount()));
-    SetCell(nodes, row, 5, L"127.0.0.1:" + std::to_wstring(config.httpPort));
+    SetCell(nodes, row, 5, LocalEndpointSummary(config.httpPort));
     for (const auto& peer : peers) {
         ++row;
         SetCell(nodes, row, 0, Utf8ToWide(peer.name));
@@ -326,8 +354,14 @@ void BuildUi() {
     AddControl(L"STATIC", L"等待选择工程", SS_LEFT, 418, 258, 714, 55, ID_PREFLIGHT);
 
     AddControl(L"BUTTON", L"服务器列表", BS_GROUPBOX, 20, 505, 1130, 180, 0);
+    Label(L"手动连接", 34, 531, 72, 22);
+    AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, 108, 527, 230, 25,
+               ID_MANUAL_ENDPOINT);
+    AddControl(L"BUTTON", L"连接", BS_PUSHBUTTON, 346, 526, 70, 27, ID_CONNECT_MANUAL);
+    Label(L"填写另一台电脑的局域网 IP:端口（不要填写 127.0.0.1）", 430, 531, 680, 22,
+          ID_MANUAL_STATUS);
     HWND nodes = AddControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                            34, 530, 1102, 140, ID_NODES);
+                            34, 560, 1102, 110, ID_NODES);
     ListView_SetExtendedListViewStyle(nodes, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     AddColumn(nodes, 0, 190, L"电脑"); AddColumn(nodes, 1, 100, L"连接");
     AddColumn(nodes, 2, 145, L"算力状态"); AddColumn(nodes, 3, 95, L"活动限额");
@@ -381,6 +415,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     break;
                 case ID_SAVE_SETTINGS:
                     SaveSettings();
+                    break;
+                case ID_CONNECT_MANUAL:
+                    ConnectManualPeer();
                     break;
                 case ID_SUBMIT:
                     StartSubmission();

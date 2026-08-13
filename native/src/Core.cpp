@@ -597,6 +597,7 @@ Config ConfigStore::Load() {
         config.httpPort = std::clamp(data.value("http_port", 8391), 1024, 65535);
         config.discoveryPort = std::clamp(data.value("discovery_port", 8390), 1024, 65535);
         config.blenderPath = Utf8ToWide(data.value("blender_path", std::string{}));
+        config.manualPeerEndpoint = data.value("manual_peer_endpoint", std::string{});
     } catch (...) {
         fs::path backup = configPath_;
         backup += L".broken";
@@ -617,6 +618,7 @@ bool ConfigStore::Save(const Config& config, std::wstring& error) {
         {"http_port", config.httpPort},
         {"discovery_port", config.discoveryPort},
         {"blender_path", WideToUtf8(config.blenderPath.wstring())},
+        {"manual_peer_endpoint", config.manualPeerEndpoint},
     };
     return WriteTextAtomic(configPath_, data.dump(2), error);
 }

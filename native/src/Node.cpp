@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 
 #include "Core.hpp"
 #include "../third_party/httplib.h"
@@ -9,6 +10,20 @@
 #include <regex>
 
 namespace rm {
+
+std::optional<std::string> DirectedBroadcastAddress(
+    const std::string& address, unsigned long prefixLength) {
+    if (prefixLength >= 31) return std::nullopt;
+    in_addr parsed{};
+    if (inet_pton(AF_INET, address.c_str(), &parsed) != 1) return std::nullopt;
+    uint32_t hostAddress = ntohl(parsed.s_addr);
+    uint32_t mask = prefixLength == 0 ? 0 : 0xffffffffu << (32 - prefixLength);
+    in_addr broadcast{};
+    broadcast.s_addr = htonl(hostAddress | ~mask);
+    char text[INET_ADDRSTRLEN]{};
+    if (!inet_ntop(AF_INET, &broadcast, text, sizeof(text))) return std::nullopt;
+    return std::string(text);
+}
 
 namespace {
 
@@ -110,25 +125,76 @@ std::string DiscoverySignature(const Config& config, const json& message) {
         json(message.value("addresses", std::vector<std::string>{})).dump());
 }
 
+struct LocalIPv4Interface {
+    std::string address;
+    std::optional<std::string> broadcast;
+};
+
+std::vector<LocalIPv4Interface> LocalIPv4Interfaces() {
+    ULONG size = 15 * 1024;
+    std::vector<unsigned char> storage(size);
+    auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data());
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                  GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size);
+    if (status == ERROR_BUFFER_OVERFLOW) {
+        storage.resize(size);
+        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data());
+        status = GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size);
+    }
+    std::vector<LocalIPv4Interface> interfaces;
+    if (status != NO_ERROR) return interfaces;
+    for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp ||
+            adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        for (auto* unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+            if (!unicast->Address.lpSockaddr ||
+                unicast->Address.lpSockaddr->sa_family != AF_INET)
+                continue;
+            auto* socketAddress = reinterpret_cast<sockaddr_in*>(unicast->Address.lpSockaddr);
+            char text[INET_ADDRSTRLEN]{};
+            if (!inet_ntop(AF_INET, &socketAddress->sin_addr, text, sizeof(text))) continue;
+            std::string address(text);
+            if (address.rfind("169.254.", 0) == 0) continue;
+            interfaces.push_back({address,
+                DirectedBroadcastAddress(address, unicast->OnLinkPrefixLength)});
+        }
+    }
+    std::sort(interfaces.begin(), interfaces.end(),
+              [](const auto& left, const auto& right) { return left.address < right.address; });
+    interfaces.erase(std::unique(interfaces.begin(), interfaces.end(),
+        [](const auto& left, const auto& right) { return left.address == right.address; }),
+        interfaces.end());
+    return interfaces;
+}
+
 std::vector<std::string> LocalIPv4Addresses() {
     std::vector<std::string> addresses;
-    char hostname[256]{};
-    if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) return addresses;
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* values = nullptr;
-    if (getaddrinfo(hostname, nullptr, &hints, &values) != 0) return addresses;
-    for (addrinfo* value = values; value; value = value->ai_next) {
-        auto* address = reinterpret_cast<sockaddr_in*>(value->ai_addr);
-        char text[INET_ADDRSTRLEN]{};
-        if (inet_ntop(AF_INET, &address->sin_addr, text, sizeof(text)))
-            addresses.emplace_back(text);
-    }
-    freeaddrinfo(values);
-    std::sort(addresses.begin(), addresses.end());
-    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+    for (const auto& value : LocalIPv4Interfaces()) addresses.push_back(value.address);
     return addresses;
+}
+
+bool ParseIPv4Endpoint(const std::string& value, std::string& address, int& port) {
+    std::string normalized = value;
+    const std::string fullWidthColon = "\xef\xbc\x9a";
+    for (size_t position = normalized.find(fullWidthColon); position != std::string::npos;
+         position = normalized.find(fullWidthColon))
+        normalized.replace(position, fullWidthColon.size(), ":");
+    normalized.erase(std::remove_if(normalized.begin(), normalized.end(),
+        [](unsigned char ch) { return std::isspace(ch); }), normalized.end());
+    size_t colon = normalized.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= normalized.size()) return false;
+    address = normalized.substr(0, colon);
+    in_addr parsed{};
+    if (inet_pton(AF_INET, address.c_str(), &parsed) != 1) return false;
+    try {
+        size_t consumed = 0;
+        port = std::stoi(normalized.substr(colon + 1), &consumed);
+        return consumed == normalized.size() - colon - 1 && port >= 1024 && port <= 65535;
+    } catch (...) {
+        return false;
+    }
 }
 
 httplib::Result PostFile(
@@ -173,6 +239,17 @@ std::string FrameExtension(const std::string& format) {
 
 }  // namespace
 
+std::wstring LocalEndpointSummary(int port) {
+    auto addresses = LocalIPv4Addresses();
+    if (addresses.empty()) return L"127.0.0.1:" + std::to_wstring(port);
+    std::wstring summary;
+    for (const auto& address : addresses) {
+        if (!summary.empty()) summary += L" / ";
+        summary += Utf8ToWide(address) + L":" + std::to_wstring(port);
+    }
+    return summary;
+}
+
 struct NodeApp::Impl {
     explicit Impl(NodeApp* app, std::chrono::milliseconds grace)
         : owner(app), assignmentGrace(grace) {}
@@ -196,6 +273,7 @@ struct NodeApp::Impl {
     std::atomic<SOCKET> discoverySocket{INVALID_SOCKET};
     std::thread serverThread;
     std::thread discoveryThread;
+    std::thread manualPeerThread;
     std::thread schedulerThread;
     std::thread workerThread;
 
@@ -306,7 +384,9 @@ struct NodeApp::Impl {
             Config config = owner->GetConfig();
             response.set_content(
                 json{{"status", "ok"}, {"node_id", config.nodeId},
-                     {"share", config.shareEnabled}, {"assigned", workerAssigned.load()}}
+                     {"name", config.nodeName}, {"share", config.shareEnabled},
+                     {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
+                     {"task_id", CurrentTaskId()}, {"idle", static_cast<int>(IdleSeconds())}}
                     .dump(),
                 "application/json");
         });
@@ -574,6 +654,87 @@ struct NodeApp::Impl {
             });
     }
 
+    bool ProbeManualPeer(const std::string& endpoint, Peer& peer, std::wstring& result) {
+        std::string address;
+        int port = 0;
+        if (!ParseIPv4Endpoint(endpoint, address, port)) {
+            result = L"请输入局域网 IPv4 地址和端口，例如 192.168.28.28:8391";
+            return false;
+        }
+        httplib::Client client(address, port);
+        client.set_connection_timeout(2, 0);
+        client.set_read_timeout(2, 0);
+        client.set_write_timeout(2, 0);
+        auto healthResponse = client.Get("/health");
+        if (!healthResponse || healthResponse->status != 200) {
+            result = L"无法访问 " + Utf8ToWide(address) + L":" + std::to_wstring(port) +
+                     L"；请检查对方软件、防火墙和局域网地址";
+            return false;
+        }
+        json health = json::parse(healthResponse->body, nullptr, false);
+        Config config = owner->GetConfig();
+        if (health.is_discarded() || !health.is_object()) {
+            result = L"目标响应不是有效的 RenderMesh 节点";
+            return false;
+        }
+        std::string nodeId = health.value("node_id", "");
+        if (!SafeId(nodeId)) {
+            result = L"目标响应不是有效的 RenderMesh 节点";
+            return false;
+        }
+        if (nodeId == config.nodeId) {
+            result = L"该地址指向本机。请输入另一台电脑的局域网 IP，而不是 127.0.0.1";
+            return false;
+        }
+        std::string challenge = NewRandomHex(16);
+        auto proofResponse = client.Get("/v1/prove?challenge=" + challenge);
+        if (!proofResponse || proofResponse->status != 200) {
+            result = L"目标未能完成邀请码验证";
+            return false;
+        }
+        json proof = json::parse(proofResponse->body, nullptr, false);
+        std::string expected = HmacSha256(config.clusterToken,
+            "worker-proof|" + nodeId + "|" + challenge);
+        if (proof.is_discarded() || proof.value("node_id", "") != nodeId ||
+            !ConstantTimeEqual(proof.value("proof", ""), expected)) {
+            result = L"连接被拒绝：两台电脑的邀请码不一致";
+            return false;
+        }
+        peer.nodeId = nodeId;
+        peer.name = health.value("name", "");
+        if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
+        peer.address = address;
+        peer.httpPort = port;
+        peer.shareEnabled = health.value("share", false);
+        peer.trusted = true;
+        peer.cpuPercent = health.value("cpu", 15);
+        peer.assigned = health.value("assigned", 0);
+        peer.currentTaskId = health.value("task_id", "");
+        peer.idleSeconds = health.value("idle", 0.0);
+        peer.lastSeen = std::chrono::steady_clock::now();
+        result = L"已连接 " + Utf8ToWide(peer.name) + L"（" + Utf8ToWide(address) + L":" +
+                 std::to_wstring(port) + L"）";
+        return true;
+    }
+
+    void ManualPeerLoop() {
+        while (!stopRequested.load()) {
+            std::string endpoint = owner->GetConfig().manualPeerEndpoint;
+            if (!endpoint.empty()) {
+                Peer peer;
+                std::wstring ignored;
+                if (ProbeManualPeer(endpoint, peer, ignored)) {
+                    {
+                        std::scoped_lock lock(stateMutex);
+                        peers[peer.nodeId] = std::move(peer);
+                    }
+                    Notify();
+                }
+            }
+            for (int step = 0; step < 20 && !stopRequested.load(); ++step) Sleep(100);
+        }
+    }
+
     void DiscoveryLoop() {
         Config initial = owner->GetConfig();
         SOCKET activeSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -604,10 +765,14 @@ struct NodeApp::Impl {
         while (!stopRequested.load()) {
             Config config = owner->GetConfig();
             if (std::chrono::steady_clock::now() >= nextBroadcast) {
+                auto networks = LocalIPv4Interfaces();
+                std::vector<std::string> localAddresses;
+                for (const auto& network : networks)
+                    localAddresses.push_back(network.address);
                 json message = {
                     {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
                     {"nonce", NewRandomHex(8)},
-                    {"addresses", LocalIPv4Addresses()},
+                    {"addresses", localAddresses},
                     {"port", config.httpPort}, {"share", config.shareEnabled},
                     {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
                     {"task_id", CurrentTaskId()},
@@ -615,12 +780,20 @@ struct NodeApp::Impl {
                 };
                 message["signature"] = DiscoverySignature(config, message);
                 std::string payload = message.dump();
-                sockaddr_in broadcast{};
-                broadcast.sin_family = AF_INET;
-                broadcast.sin_addr.s_addr = INADDR_BROADCAST;
-                broadcast.sin_port = htons(static_cast<u_short>(config.discoveryPort));
-                sendto(activeSocket, payload.data(), static_cast<int>(payload.size()), 0,
-                       reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
+                std::vector<std::string> targets;
+                for (const auto& network : networks)
+                    if (network.broadcast) targets.push_back(*network.broadcast);
+                std::sort(targets.begin(), targets.end());
+                targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+                if (targets.empty()) targets.push_back("255.255.255.255");
+                for (const auto& target : targets) {
+                    sockaddr_in broadcast{};
+                    broadcast.sin_family = AF_INET;
+                    inet_pton(AF_INET, target.c_str(), &broadcast.sin_addr);
+                    broadcast.sin_port = htons(static_cast<u_short>(config.discoveryPort));
+                    sendto(activeSocket, payload.data(), static_cast<int>(payload.size()), 0,
+                           reinterpret_cast<sockaddr*>(&broadcast), sizeof(broadcast));
+                }
                 nextBroadcast = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             }
             char buffer[8192];
@@ -1038,6 +1211,7 @@ bool NodeApp::Start(std::wstring& error) {
     }
     impl_->serverThread = std::thread([this] { impl_->server.listen_after_bind(); });
     impl_->discoveryThread = std::thread([this] { impl_->DiscoveryLoop(); });
+    impl_->manualPeerThread = std::thread([this] { impl_->ManualPeerLoop(); });
     impl_->schedulerThread = std::thread([this] { impl_->SchedulerLoop(); });
     impl_->workerThread = std::thread([this] { impl_->WorkerLoop(); });
     return true;
@@ -1050,6 +1224,7 @@ void NodeApp::Stop() {
     impl_->workCv.notify_all();
     if (impl_->serverThread.joinable()) impl_->serverThread.join();
     if (impl_->discoveryThread.joinable()) impl_->discoveryThread.join();
+    if (impl_->manualPeerThread.joinable()) impl_->manualPeerThread.join();
     if (impl_->schedulerThread.joinable()) impl_->schedulerThread.join();
     if (impl_->workerThread.joinable()) impl_->workerThread.join();
     WSACleanup();
@@ -1076,6 +1251,24 @@ bool NodeApp::UpdateConfig(const Config& config, std::wstring& error) {
     {
         std::scoped_lock lock(configMutex_);
         config_ = config;
+    }
+    impl_->Notify();
+    return true;
+}
+
+bool NodeApp::AddManualPeer(const std::string& endpoint, std::wstring& result) {
+    Peer peer;
+    if (!impl_->ProbeManualPeer(endpoint, peer, result)) return false;
+    Config config = GetConfig();
+    config.manualPeerEndpoint = peer.address + ":" + std::to_string(peer.httpPort);
+    std::wstring saveError;
+    if (!UpdateConfig(config, saveError)) {
+        result = L"节点验证成功，但无法保存地址：" + saveError;
+        return false;
+    }
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        impl_->peers[peer.nodeId] = std::move(peer);
     }
     impl_->Notify();
     return true;
@@ -1177,14 +1370,25 @@ bool RunSelfTest(std::wstring& report) {
         Config config = store.Load();
         config.nodeName = "SELFTEST";
         config.activeCpuPercent = 17;
+        config.manualPeerEndpoint = "192.168.28.28:8391";
         std::wstring error;
-        if (!store.Save(config, error) || store.Load().activeCpuPercent != 17) {
+        Config persisted;
+        if (!store.Save(config, error) ||
+            (persisted = store.Load()).activeCpuPercent != 17 ||
+            persisted.manualPeerEndpoint != config.manualPeerEndpoint) {
             report = L"配置持久化失败：" + error;
             return false;
         }
         if (HmacSha256("key", "The quick brown fox jumps over the lazy dog") !=
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") {
             report = L"HMAC-SHA256 自检失败";
+            return false;
+        }
+        if (DirectedBroadcastAddress("192.168.29.75", 23) != "192.168.29.255" ||
+            DirectedBroadcastAddress("10.20.30.40", 24) != "10.20.30.255" ||
+            DirectedBroadcastAddress("100.64.1.2", 32).has_value() ||
+            DirectedBroadcastAddress("not-an-ip", 24).has_value()) {
+            report = L"IPv4 directed-broadcast calculation failed";
             return false;
         }
         httplib::Server server;
@@ -1259,14 +1463,9 @@ bool RunSelfTest(std::wstring& report) {
             std::wstring startError;
             bool started = worker.Start(startError) && origin.Start(startError);
             if (started) {
-                Peer testPeer;
-                testPeer.nodeId = workerConfig.nodeId;
-                testPeer.name = workerConfig.nodeName;
-                testPeer.address = "127.0.0.1";
-                testPeer.httpPort = workerConfig.httpPort;
-                testPeer.shareEnabled = true;
-                testPeer.trusted = true;
-                origin.InjectPeerForTest(std::move(testPeer));
+                std::wstring connectResult;
+                bool manuallyConnected = origin.AddManualPeer(
+                    "127.0.0.1:" + std::to_string(workerConfig.httpPort), connectResult);
 
                 fs::path prepared = root / L"prepared.blend";
                 {
@@ -1282,7 +1481,7 @@ bool RunSelfTest(std::wstring& report) {
                 std::wstring submitError;
                 std::string jobId = origin.SubmitPrepared(
                     "two-node-self-test", preflight, 1, 3, 1, "PNG", submitError);
-                bool clusterOk = !jobId.empty();
+                bool clusterOk = manuallyConnected && !jobId.empty();
                 bool usedRemote = false;
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
                 while (clusterOk && std::chrono::steady_clock::now() < deadline) {
