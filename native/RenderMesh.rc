@@ -4,8 +4,8 @@
 101 ICON "assets\\RenderMesh.ico"
 
 1 VERSIONINFO
- FILEVERSION 0,2,9,0
- PRODUCTVERSION 0,2,9,0
+ FILEVERSION 0,2,10,0
+ PRODUCTVERSION 0,2,10,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -15,11 +15,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "RenderMesh"
       VALUE "FileDescription", "RenderMesh Blender 分布式渲染农场"
-      VALUE "FileVersion", "0.2.9"
+      VALUE "FileVersion", "0.2.10"
       VALUE "InternalName", "RenderMesh.exe"
       VALUE "OriginalFilename", "RenderMesh.exe"
       VALUE "ProductName", "RenderMesh"
-      VALUE "ProductVersion", "0.2.9"
+      VALUE "ProductVersion", "0.2.10"
     END
   END
   BLOCK "VarFileInfo"

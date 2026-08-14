@@ -483,6 +483,7 @@ report_path = args[0]
 scene = bpy.context.scene
 report = {
     'pass': True,
+    'scene_name': scene.name,
     'frame_start': int(scene.frame_start),
     'frame_end': int(scene.frame_end),
     'frame_step': int(scene.frame_step),
@@ -676,6 +677,7 @@ primary_outputs = {str(frame): bpy.path.abspath(original_scene.render.frame_path
                    for frame in range(validation_start, validation_end + 1, validation_step)}
 compositor_outputs = discover_compositor_outputs(original_scene)
 report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
+          'scene_name': original_scene.name,
           'render_engine': engine,
           'render_format': bpy.context.scene.render.image_settings.file_format,
           'file_extension': bpy.context.scene.render.file_extension,
@@ -688,6 +690,7 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'compositor_outputs': compositor_outputs,
           'missing': [], 'unpacked': [], 'warnings': warnings,
           'validation_render': False, 'validation_frames': 0, 'validation_error': ''}
+active_frame = None
 try:
     before = gather()
     report['missing'] = [dict(x, path=missing) for x in before
@@ -951,6 +954,8 @@ try:
     for index, frame in enumerate(frames):
         if index and os.path.exists(stop_path):
             break
+        active_frame = int(frame)
+        print(f'RENDERMESH_FRAME_BEGIN {active_frame}', flush=True)
         scene.frame_set(int(frame))
         before = file_state(primary_dir)
         before.update(file_state(compositor_root))
@@ -994,13 +999,103 @@ try:
                     f'for frame {frame}')
         artifacts[str(int(frame))] = frame_artifacts
         completed.append(int(frame))
+        print(f'RENDERMESH_FRAME_END {active_frame} completed', flush=True)
         persist()
+        active_frame = None
 except Exception:
     error = traceback.format_exc()
+    if active_frame is not None:
+        print(f'RENDERMESH_FRAME_END {active_frame} failed', flush=True)
     persist()
     raise
 persist()
 )PY";
+
+constexpr size_t kMaxFrameLogBytes = 4 * 1024 * 1024;
+
+std::string SanitizeBlenderLog(std::string_view value) {
+    std::string clean;
+    clean.reserve(std::min(value.size(), kMaxFrameLogBytes));
+    for (size_t index = 0; index < value.size(); ++index) {
+        unsigned char ch = static_cast<unsigned char>(value[index]);
+        if (ch == 0x1b) {
+            if (index + 1 < value.size() && value[index + 1] == '[') {
+                index += 2;
+                while (index < value.size()) {
+                    unsigned char code = static_cast<unsigned char>(value[index]);
+                    if (code >= 0x40 && code <= 0x7e) break;
+                    ++index;
+                }
+            }
+            continue;
+        }
+        if (ch == '\r' || ch == '\n' || ch == '\t' || ch >= 0x20)
+            clean.push_back(static_cast<char>(ch));
+    }
+    if (clean.size() <= kMaxFrameLogBytes) return clean;
+    constexpr size_t headBytes = 256 * 1024;
+    constexpr std::string_view notice =
+        "\n\n--- RenderMesh: log exceeded 4 MiB; middle section omitted ---\n\n";
+    const size_t tailBytes = kMaxFrameLogBytes - headBytes - notice.size();
+    return clean.substr(0, headBytes) + std::string(notice) +
+        clean.substr(clean.size() - tailBytes);
+}
+
+bool WriteFrameLogFile(const fs::path& destination, const std::string& contents) {
+    std::string previous;
+    {
+        std::ifstream old(destination, std::ios::binary);
+        if (old) previous.assign(std::istreambuf_iterator<char>(old), {});
+    }
+    if (previous == contents) return false;
+    std::error_code ignored;
+    fs::create_directories(destination.parent_path(), ignored);
+    fs::path temporary = destination;
+    temporary += L".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        output.flush();
+        if (!output) {
+            fs::remove(temporary, ignored);
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        fs::remove(temporary, ignored);
+        return false;
+    }
+    return true;
+}
+
+bool UpdateFrameLogSnapshot(
+    const fs::path& packageLog, const fs::path& destination,
+    int frame, bool& complete) {
+    complete = false;
+    std::ifstream input(packageLog, std::ios::binary);
+    if (!input) return false;
+    std::string contents((std::istreambuf_iterator<char>(input)), {});
+    const std::string beginMarker = "RENDERMESH_FRAME_BEGIN " + std::to_string(frame);
+    const std::string endMarker = "RENDERMESH_FRAME_END " + std::to_string(frame) + " ";
+    const size_t begin = contents.find(beginMarker);
+    if (begin == std::string::npos) return false;
+    size_t contentStart = contents.find('\n', begin);
+    contentStart = contentStart == std::string::npos ? contents.size() : contentStart + 1;
+    const size_t end = contents.find(endMarker, contentStart);
+    complete = end != std::string::npos;
+    const size_t segmentEnd = complete ? end : contents.size();
+    std::string segment;
+    if (begin == contents.find("RENDERMESH_FRAME_BEGIN "))
+        segment.append(contents, 0, begin);
+    if (segmentEnd > contentStart)
+        segment.append(contents, contentStart, segmentEnd - contentStart);
+    segment = SanitizeBlenderLog(segment);
+    const std::string heading = "RenderMesh Blender log - frame " +
+        std::to_string(frame) + (complete ? " - complete\n\n" : " - rendering\n\n");
+    segment.insert(0, heading);
+    return WriteFrameLogFile(destination, segment);
+}
 
 }  // namespace
 
@@ -1472,6 +1567,7 @@ BlendInspection InspectBlend(
     }
     try {
         json data = json::parse(ReadText(reportPath));
+        inspection.sceneName = data.value("scene_name", std::string{});
         inspection.frameStart = data.value("frame_start", 0);
         inspection.frameEnd = data.value("frame_end", 0);
         inspection.frameStep = data.value("frame_step", 0);
@@ -1594,6 +1690,7 @@ PreflightReport PreflightBlend(
     try {
         json data = json::parse(ReadText(reportPath));
         report.passed = data.value("pass", false);
+        report.sceneName = data.value("scene_name", std::string{});
         report.blenderVersion = data.value("version", std::string{});
         report.renderEngine = data.value("render_engine", std::string{});
         report.outputFormat = data.value("render_format", std::string{});
@@ -1822,9 +1919,12 @@ bool RenderBlenderPackage(
     std::atomic<bool>& finishCurrentThenStop,
     const std::vector<OutputTarget>& compositorOutputs,
     const FrameCompletedCallback& frameCompleted,
+    const FrameLogCallback& frameLogUpdated,
     std::map<int, std::vector<RenderArtifact>>& completed,
+    std::map<int, fs::path>& frameLogs,
     std::wstring& error) {
     completed.clear();
+    frameLogs.clear();
     if (frames.empty() || frames.size() > 5 ||
         !std::all_of(frames.begin(), frames.end(), [](int frame) {
             return frame >= kBlenderFrameMin && frame <= kBlenderFrameMax;
@@ -1886,6 +1986,17 @@ bool RenderBlenderPackage(
         outputTargets.push_back(OutputTargetLocatorMetadata(target));
     auto collectProgress = [&](bool reportErrors) {
         try {
+            for (int frame : frames) {
+                fs::path frameLog = outputDir /
+                    (L"frame-" + std::to_wstring(frame) + L".log");
+                bool logComplete = false;
+                if (UpdateFrameLogSnapshot(log, frameLog, frame, logComplete)) {
+                    frameLogs[frame] = frameLog;
+                    if (frameLogUpdated) frameLogUpdated(frame, frameLog, logComplete);
+                } else if (fs::is_regular_file(frameLog)) {
+                    frameLogs[frame] = frameLog;
+                }
+            }
             if (!fs::is_regular_file(manifest)) return;
             json progress = json::parse(ReadText(manifest));
             json artifactRows = progress.value("artifacts", json::object());
@@ -1929,6 +2040,18 @@ bool RenderBlenderPackage(
     processFinished = true;
     if (stopMarkerThread.joinable()) stopMarkerThread.join();
     collectProgress(true);
+    if (frameLogs.empty() && !frames.empty() && fs::is_regular_file(log)) {
+        std::ifstream input(log, std::ios::binary);
+        std::string contents((std::istreambuf_iterator<char>(input)), {});
+        contents = "RenderMesh Blender log - frame " + std::to_string(frames.front()) +
+            " - process output\n\n" + SanitizeBlenderLog(contents);
+        fs::path fallback = outputDir /
+            (L"frame-" + std::to_wstring(frames.front()) + L".log");
+        if (WriteFrameLogFile(fallback, contents)) {
+            frameLogs[frames.front()] = fallback;
+            if (frameLogUpdated) frameLogUpdated(frames.front(), fallback, true);
+        }
+    }
 
     try {
         if (fs::is_regular_file(manifest)) {
@@ -2019,14 +2142,51 @@ bool RunBlenderReadinessSelfTest(std::wstring& report) {
         bootstrap.find("os.replace(temporary, ready_path)") == std::string::npos ||
         bootstrap.find("RENDERMESH_BLENDER_READY") == std::string::npos ||
         kInspectBlendScript.find("discover_compositor_outputs(scene)") == std::string::npos ||
+        kInspectBlendScript.find("'scene_name': scene.name") == std::string::npos ||
         kPreflightScript.find("'frame_start': int(original_scene.frame_start)") ==
             std::string::npos ||
+        kPreflightScript.find("'scene_name': original_scene.name") == std::string::npos ||
         std::string(kBatchRenderScript).find("node_at_path") == std::string::npos ||
         std::string(kBatchRenderScript).find("produced no file") == std::string::npos ||
+        std::string(kBatchRenderScript).find("RENDERMESH_FRAME_BEGIN") == std::string::npos ||
+        std::string(kBatchRenderScript).find("RENDERMESH_FRAME_END") == std::string::npos ||
         !strictGpuSelection(kPreflightScript) ||
         !strictGpuSelection(kCompatibilityScript) ||
         !strictGpuSelection(kBatchRenderScript)) {
         report = L"Blender first-run readiness launch contract self-test failed";
+        return false;
+    }
+    fs::path frameLogRoot = fs::temp_directory_path() /
+        Utf8ToWide("RenderMesh-frame-log-self-test-" + NewRandomHex(8));
+    fs::create_directories(frameLogRoot);
+    fs::path packageLog = frameLogRoot / L"render-package.log";
+    {
+        std::ofstream output(packageLog, std::ios::binary | std::ios::trunc);
+        output << "Blender 5.0 startup\nRENDERMESH_FRAME_BEGIN 1\n"
+               << "Fra:1 | Rendering 1 / 64\n\x1b[31mwarning\x1b[0m\n"
+               << "RENDERMESH_FRAME_END 1 completed\n"
+               << "RENDERMESH_FRAME_BEGIN 2\nFra:2 | Rendering 64 / 64\n"
+               << "RENDERMESH_FRAME_END 2 completed\n";
+    }
+    bool firstComplete = false;
+    bool secondComplete = false;
+    fs::path firstLog = frameLogRoot / L"frame-1.log";
+    fs::path secondLog = frameLogRoot / L"frame-2.log";
+    bool firstChanged = UpdateFrameLogSnapshot(packageLog, firstLog, 1, firstComplete);
+    bool secondChanged = UpdateFrameLogSnapshot(packageLog, secondLog, 2, secondComplete);
+    std::ifstream firstInput(firstLog, std::ios::binary);
+    std::string firstText((std::istreambuf_iterator<char>(firstInput)), {});
+    std::ifstream secondInput(secondLog, std::ios::binary);
+    std::string secondText((std::istreambuf_iterator<char>(secondInput)), {});
+    bool unchanged = !UpdateFrameLogSnapshot(packageLog, firstLog, 1, firstComplete);
+    std::error_code ignored;
+    fs::remove_all(frameLogRoot, ignored);
+    if (!firstChanged || !secondChanged || !firstComplete || !secondComplete || !unchanged ||
+        firstText.find("Blender 5.0 startup") == std::string::npos ||
+        firstText.find("Fra:1") == std::string::npos || firstText.find("\x1b") != std::string::npos ||
+        secondText.find("Fra:2") == std::string::npos ||
+        secondText.find("Blender 5.0 startup") != std::string::npos) {
+        report = L"Per-frame Blender log extraction self-test failed";
         return false;
     }
     return true;

@@ -13,9 +13,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cwctype>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
 
 namespace {
@@ -30,6 +33,7 @@ constexpr UINT WM_RM_JOB_OPERATION = WM_APP + 5;
 constexpr UINT_PTR TIMER_HEARTBEAT = 1;
 constexpr UINT_PTR TIMER_BURST_REFRESH = 3;
 constexpr UINT_PTR TIMER_UI_TEST_REPORT = 4;
+constexpr UINT_PTR TIMER_FRAME_LOG = 5;
 constexpr UINT IDLE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr int UI_TEST_BURST_NOTIFICATIONS = 100;
 constexpr int IDI_RENDERMESH = 101;
@@ -80,6 +84,12 @@ enum ControlId {
     ID_DETAIL_OPEN_OUTPUT,
     ID_DETAIL_STOP,
     ID_DETAIL_PREVIEW_STATUS,
+    ID_LOG_SUMMARY = 350,
+    ID_LOG_VIEW,
+    ID_LOG_SEARCH,
+    ID_LOG_FIND,
+    ID_LOG_COPY,
+    ID_LOG_OPEN,
     ID_JOB_PRIORITY = 400,
     ID_JOB_SAVE_AS,
     ID_JOB_OPEN_OUTPUT,
@@ -103,8 +113,18 @@ std::atomic<bool> gInspectionStop = false;
 std::atomic<uint64_t> gInspectionGeneration = 0;
 std::thread gJobOperation;
 std::atomic<bool> gJobOperationRunning = false;
+std::atomic<bool> gJobOperationCancel = false;
+std::atomic<bool> gUiShuttingDown = false;
+std::mutex gJobOperationResultMutex;
+struct JobOperationResult;
+JobOperationResult* gPendingJobOperationResult = nullptr;
 HWND gDetailWindow = nullptr;
 std::string gDetailJobId;
+HWND gFrameLogWindow = nullptr;
+std::string gFrameLogJobId;
+std::string gFrameLogTaskId;
+std::wstring gFrameLogDisplayedText;
+HFONT gLogFont = nullptr;
 HBITMAP gPreviewBitmap = nullptr;
 std::thread gPreviewThread;
 std::atomic<bool> gPreviewStop = false;
@@ -433,11 +453,13 @@ void ApplyTheme() {
         if (setAttribute) {
             setAttribute(gWindow, 20, &dark, sizeof(dark));
             if (gDetailWindow) setAttribute(gDetailWindow, 20, &dark, sizeof(dark));
+            if (gFrameLogWindow) setAttribute(gFrameLogWindow, 20, &dark, sizeof(dark));
         }
         FreeLibrary(dwm);
     }
     InvalidateRect(gWindow, nullptr, TRUE);
     if (gDetailWindow) InvalidateRect(gDetailWindow, nullptr, TRUE);
+    if (gFrameLogWindow) InvalidateRect(gFrameLogWindow, nullptr, TRUE);
 }
 
 HWND Item(int id) { return GetDlgItem(gWindow, id); }
@@ -1049,15 +1071,20 @@ void StartSaveJobAs(const RenderJob& job) {
     if (destination.empty()) return;
     if (gJobOperation.joinable()) gJobOperation.join();
     gJobOperationRunning = true;
+    gJobOperationCancel = false;
     const std::string jobId = job.id;
     gJobOperation = std::thread([jobId, destination] {
         auto* result = new JobOperationResult;
-        result->ok = gApp->SaveJobAs(jobId, destination, result->message);
+        result->ok = gApp->SaveJobAs(
+            jobId, destination, result->message, &gJobOperationCancel);
         if (result->ok) result->message = L"作业序列已另存完成。";
         gJobOperationRunning = false;
-        if (!PostMessageW(gWindow, WM_RM_JOB_OPERATION, 0,
-                          reinterpret_cast<LPARAM>(result)))
-            delete result;
+        {
+            std::scoped_lock lock(gJobOperationResultMutex);
+            delete gPendingJobOperationResult;
+            gPendingJobOperationResult = result;
+        }
+        if (!gUiShuttingDown.load()) PostMessageW(gWindow, WM_RM_JOB_OPERATION, 0, 0);
     });
 }
 
@@ -1091,10 +1118,11 @@ void ExecuteJobContextCommand(UINT command, const RenderJob& job) {
             CopyText(Utf8ToWide(job.id));
             break;
         case ID_JOB_COPY_NAME:
-            CopyText(Utf8ToWide(job.name));
+            CopyText(Utf8ToWide(job.sceneName.empty() ? job.name : job.sceneName));
             break;
         case ID_JOB_COPY_BOTH:
-            CopyText(Utf8ToWide(job.id + "  " + job.name));
+            CopyText(Utf8ToWide(job.id + "  " +
+                (job.sceneName.empty() ? job.name : job.sceneName)));
             break;
         case ID_JOB_DELETE: {
             const std::wstring prompt = L"删除作业“" + Utf8ToWide(job.name) +
@@ -1132,7 +1160,8 @@ void ShowJobContextMenu(POINT screenPoint) {
                 frame.state == TaskState::Assigned ||
                 frame.state == TaskState::Rendering;
         });
-    const bool hasCompleted = std::any_of(job->frames.begin(), job->frames.end(),
+    const bool hasCompleted = !job->frames.empty() &&
+        std::all_of(job->frames.begin(), job->frames.end(),
         [](const FrameTask& frame) {
             return frame.state == TaskState::Completed && !frame.output.empty();
         });
@@ -1265,7 +1294,7 @@ void RefreshLists() {
 
     if (gCurrentPage == 0) {
         const auto peers = gApp->Peers();
-        const auto jobs = gApp->Jobs();
+        const JobAggregate jobStats = gApp->JobStats();
         const HardwareInfo hardware = gApp->Hardware();
         const int idleSeconds = static_cast<int>(IdleSeconds());
         const int assigned = gApp->AssignedCount();
@@ -1336,16 +1365,9 @@ void RefreshLists() {
         nextDashboard.idleSeconds = idleSeconds;
         nextDashboard.blenderReady = !FindBlender(config).empty();
         nextDashboard.sharing = config.shareEnabled;
-        for (const auto& job : jobs) {
-            bool jobActive = false;
-            for (const auto& frame : job.frames) {
-                ++nextDashboard.totalFrames;
-                nextDashboard.completedFrames += frame.state == TaskState::Completed;
-                jobActive = jobActive || frame.state == TaskState::Assigned ||
-                    frame.state == TaskState::Dispatching || frame.state == TaskState::Rendering;
-            }
-            nextDashboard.activeJobs += jobActive;
-        }
+        nextDashboard.totalFrames = jobStats.totalFrames;
+        nextDashboard.completedFrames = jobStats.completedFrames;
+        nextDashboard.activeJobs = jobStats.activeJobs;
         if (!(nextDashboard == gDashboardView)) {
             gDashboardView = nextDashboard;
             RECT client{};
@@ -2231,6 +2253,282 @@ void WriteUiMetricsReport() {
     output << metrics.dump(2);
 }
 
+std::optional<std::pair<RenderJob, FrameTask>> SelectedDetailFrame() {
+    if (!gDetailWindow) return std::nullopt;
+    auto job = FindJob(gDetailJobId);
+    if (!job) return std::nullopt;
+    HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
+    int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    if (selected < 0 || selected >= static_cast<int>(gFrameRows.Rows().size()))
+        return std::nullopt;
+    const auto& key = gFrameRows.Rows()[static_cast<size_t>(selected)].key;
+    auto frame = std::find_if(job->frames.begin(), job->frames.end(),
+        [&](const FrameTask& value) {
+            return Utf8ToWide(value.taskId.empty()
+                ? job->id + ":" + std::to_string(value.frame) : value.taskId) == key;
+        });
+    if (frame == job->frames.end()) return std::nullopt;
+    return std::pair{*job, *frame};
+}
+
+std::wstring LineNumberedLog(const std::string& utf8) {
+    std::wstring text = Utf8ToWide(utf8);
+    if (text.empty() && !utf8.empty()) return L"日志不是有效的 UTF-8 文本。";
+    std::wstringstream output;
+    size_t line = 1;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find(L'\n', start);
+        std::wstring_view value(text.data() + start,
+            (end == std::wstring::npos ? text.size() : end) - start);
+        if (!value.empty() && value.back() == L'\r') value.remove_suffix(1);
+        output << std::setw(5) << line++ << L"  " << value;
+        if (end == std::wstring::npos) break;
+        output << L"\r\n";
+        start = end + 1;
+    }
+    return output.str();
+}
+
+void LayoutFrameLogWindow(HWND window) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int margin = 20;
+    const int searchWidth = 230;
+    const int buttonWidth = 112;
+    if (HWND summary = GetDlgItem(window, ID_LOG_SUMMARY))
+        MoveWindow(summary, margin, 16, client.right - margin * 2, 28, TRUE);
+    int actionsY = 52;
+    if (HWND search = GetDlgItem(window, ID_LOG_SEARCH))
+        MoveWindow(search, margin, actionsY, searchWidth, 34, TRUE);
+    if (HWND find = GetDlgItem(window, ID_LOG_FIND))
+        MoveWindow(find, margin + searchWidth + 8, actionsY, buttonWidth, 34, TRUE);
+    if (HWND copy = GetDlgItem(window, ID_LOG_COPY))
+        MoveWindow(copy, client.right - margin - buttonWidth * 2 - 8,
+                   actionsY, buttonWidth, 34, TRUE);
+    if (HWND open = GetDlgItem(window, ID_LOG_OPEN))
+        MoveWindow(open, client.right - margin - buttonWidth,
+                   actionsY, buttonWidth, 34, TRUE);
+    if (HWND log = GetDlgItem(window, ID_LOG_VIEW))
+        MoveWindow(log, margin, 98,
+                   std::max(100, static_cast<int>(client.right) - margin * 2),
+                   std::max(100, static_cast<int>(client.bottom) - 118), TRUE);
+}
+
+void RefreshFrameLogWindow() {
+    if (!gFrameLogWindow) return;
+    auto job = FindJob(gFrameLogJobId);
+    if (!job) {
+        SetWindowTextIfChanged(GetDlgItem(gFrameLogWindow, ID_LOG_SUMMARY),
+                               L"任务已不存在");
+        return;
+    }
+    auto frame = std::find_if(job->frames.begin(), job->frames.end(),
+        [&](const FrameTask& value) { return value.taskId == gFrameLogTaskId; });
+    if (frame == job->frames.end()) return;
+    std::wstring summary = Utf8ToWide(job->name) + L"    帧 " +
+        std::to_wstring(frame->frame) + L"    " + TaskStateLabel(frame->state) +
+        L"    渲染电脑 " + (frame->assignedNodeName.empty()
+            ? L"-" : Utf8ToWide(frame->assignedNodeName)) +
+        L"    渲染时长 " + FormatDuration(frame->startedAt, frame->endedAt) +
+        L"    开始 " + FormatTime(frame->startedAt) +
+        L"    结束 " + FormatTime(frame->endedAt);
+    SetWindowTextIfChanged(GetDlgItem(gFrameLogWindow, ID_LOG_SUMMARY), summary);
+    std::wstring title = L"RenderMesh · 帧 " + std::to_wstring(frame->frame) +
+        L" · Blender 日志";
+    SetWindowTextIfChanged(gFrameLogWindow, title);
+    std::wstring next;
+    if (!frame->log.empty() && fs::is_regular_file(frame->log)) {
+        std::ifstream input(frame->log, std::ios::binary);
+        std::string raw((std::istreambuf_iterator<char>(input)), {});
+        next = LineNumberedLog(raw);
+    } else if (frame->state == TaskState::Pending || frame->state == TaskState::Dispatching) {
+        next = L"该帧尚未开始渲染，因此还没有 Blender 日志。";
+    } else if (frame->state == TaskState::Assigned || frame->state == TaskState::Rendering) {
+        next = L"正在等待渲染电脑回传该帧的 Blender 日志……";
+    } else {
+        next = L"该帧没有可用的 Blender 日志。旧版渲染节点不会回传单帧日志。";
+        if (!frame->error.empty()) next += L"\r\n\r\n错误：" + Utf8ToWide(frame->error);
+    }
+    if (next == gFrameLogDisplayedText) return;
+    HWND view = GetDlgItem(gFrameLogWindow, ID_LOG_VIEW);
+    int firstVisible = static_cast<int>(SendMessageW(view, EM_GETFIRSTVISIBLELINE, 0, 0));
+    int lineCount = static_cast<int>(SendMessageW(view, EM_GETLINECOUNT, 0, 0));
+    bool followTail = firstVisible >= std::max(0, lineCount - 20);
+    SendMessageW(view, WM_SETREDRAW, FALSE, 0);
+    SetWindowTextW(view, next.c_str());
+    if (followTail) {
+        SendMessageW(view, EM_SETSEL, next.size(), next.size());
+        SendMessageW(view, EM_SCROLLCARET, 0, 0);
+    } else {
+        int current = static_cast<int>(SendMessageW(view, EM_GETFIRSTVISIBLELINE, 0, 0));
+        SendMessageW(view, EM_LINESCROLL, 0, firstVisible - current);
+        SendMessageW(view, EM_SETSEL, 0, 0);
+    }
+    SendMessageW(view, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(view, nullptr, TRUE);
+    gFrameLogDisplayedText = std::move(next);
+}
+
+void FindNextInFrameLog() {
+    if (!gFrameLogWindow) return;
+    std::wstring needle = Text(GetDlgItem(gFrameLogWindow, ID_LOG_SEARCH));
+    if (needle.empty()) return;
+    std::wstring haystack = gFrameLogDisplayedText;
+    std::transform(needle.begin(), needle.end(), needle.begin(), towlower);
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(), towlower);
+    HWND view = GetDlgItem(gFrameLogWindow, ID_LOG_VIEW);
+    DWORD start = 0, end = 0;
+    SendMessageW(view, EM_GETSEL, reinterpret_cast<WPARAM>(&start),
+                 reinterpret_cast<LPARAM>(&end));
+    size_t found = haystack.find(needle, end);
+    if (found == std::wstring::npos) found = haystack.find(needle);
+    if (found == std::wstring::npos) {
+        MessageBeep(MB_ICONINFORMATION);
+        return;
+    }
+    SendMessageW(view, EM_SETSEL, found, found + needle.size());
+    SendMessageW(view, EM_SCROLLCARET, 0, 0);
+    SetFocus(view);
+}
+
+LRESULT CALLBACK FrameLogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_CREATE: {
+            gFrameLogWindow = window;
+            HWND summary = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                20, 16, 1000, 28, window, reinterpret_cast<HMENU>(ID_LOG_SUMMARY),
+                GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(summary, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            HWND search = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                20, 52, 230, 34, window, reinterpret_cast<HMENU>(ID_LOG_SEARCH),
+                GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(search, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+            SendMessageW(search, EM_SETCUEBANNER, TRUE,
+                         reinterpret_cast<LPARAM>(L"搜索日志"));
+            auto button = [&](const wchar_t* label, int id) {
+                HWND control = CreateWindowExW(0, L"BUTTON", label,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                    0, 0, 112, 34, window,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                    GetModuleHandleW(nullptr), nullptr);
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+                ConfigureOwnerButton(control);
+            };
+            button(L"查找下一个", ID_LOG_FIND);
+            button(L"复制全部", ID_LOG_COPY);
+            button(L"显示日志文件", ID_LOG_OPEN);
+            HWND view = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                    ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
+                20, 98, 1000, 540, window, reinterpret_cast<HMENU>(ID_LOG_VIEW),
+                GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(view, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(gLogFont ? gLogFont : gFont), TRUE);
+            SendMessageW(view, EM_SETLIMITTEXT, 8 * 1024 * 1024, 0);
+            LayoutFrameLogWindow(window);
+            SetTimer(window, TIMER_FRAME_LOG, 750, nullptr);
+            RefreshFrameLogWindow();
+            return 0;
+        }
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED) LayoutFrameLogWindow(window);
+            return 0;
+        case WM_GETMINMAXINFO:
+            reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {820, 520};
+            return 0;
+        case WM_TIMER:
+            if (wParam == TIMER_FRAME_LOG) RefreshFrameLogWindow();
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == ID_LOG_FIND) {
+                FindNextInFrameLog();
+            } else if (LOWORD(wParam) == ID_LOG_COPY) {
+                HWND view = GetDlgItem(window, ID_LOG_VIEW);
+                DWORD start = 0, end = 0;
+                SendMessageW(view, EM_GETSEL, reinterpret_cast<WPARAM>(&start),
+                             reinterpret_cast<LPARAM>(&end));
+                SendMessageW(view, EM_SETSEL, 0, -1);
+                SendMessageW(view, WM_COPY, 0, 0);
+                SendMessageW(view, EM_SETSEL, start, end);
+            } else if (LOWORD(wParam) == ID_LOG_OPEN) {
+                auto job = FindJob(gFrameLogJobId);
+                if (job) {
+                    auto frame = std::find_if(job->frames.begin(), job->frames.end(),
+                        [&](const FrameTask& value) {
+                            return value.taskId == gFrameLogTaskId;
+                        });
+                    if (frame != job->frames.end() && !frame->log.empty())
+                        ShowInExplorer(frame->log);
+                }
+            }
+            return 0;
+        case WM_DRAWITEM:
+            DrawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+        case WM_CTLCOLOREDIT: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, gDarkTheme ? RGB(232, 234, 244) : RGB(31, 31, 38));
+            SetBkColor(dc, gDarkTheme ? RGB(19, 20, 27) : RGB(255, 255, 255));
+            return reinterpret_cast<LRESULT>(gSurfaceBrush);
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            if (GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == ID_LOG_VIEW) {
+                SetBkMode(dc, OPAQUE);
+                SetTextColor(dc, gDarkTheme ? RGB(232, 234, 244) : RGB(31, 31, 38));
+                SetBkColor(dc, gDarkTheme ? RGB(19, 20, 27) : RGB(255, 255, 255));
+                return reinterpret_cast<LRESULT>(gSurfaceBrush);
+            }
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+            return reinterpret_cast<LRESULT>(gBackgroundBrush);
+        }
+        case WM_ERASEBKGND: {
+            RECT client{};
+            GetClientRect(window, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, gBackgroundBrush
+                ? gBackgroundBrush : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+            return TRUE;
+        }
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
+        case WM_DESTROY:
+            KillTimer(window, TIMER_FRAME_LOG);
+            gFrameLogWindow = nullptr;
+            gFrameLogJobId.clear();
+            gFrameLogTaskId.clear();
+            gFrameLogDisplayedText.clear();
+            return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenSelectedFrameLog() {
+    auto selected = SelectedDetailFrame();
+    if (!selected) return;
+    gFrameLogJobId = selected->first.id;
+    gFrameLogTaskId = selected->second.taskId;
+    gFrameLogDisplayedText.clear();
+    if (gFrameLogWindow) {
+        ShowWindow(gFrameLogWindow, SW_RESTORE);
+        SetForegroundWindow(gFrameLogWindow);
+        RefreshFrameLogWindow();
+        return;
+    }
+    gFrameLogWindow = CreateWindowExW(
+        WS_EX_APPWINDOW, L"RenderMeshFrameLog", L"RenderMesh · Blender 日志",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_MAXIMIZEBOX | WS_SIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1120, 720, gDetailWindow, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    ShowWindow(gFrameLogWindow, SW_SHOW);
+    UpdateWindow(gFrameLogWindow);
+    ApplyTheme();
+}
+
 LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
@@ -2294,6 +2592,8 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             if (!gRefreshingJobDetail && header->idFrom == ID_DETAIL_FRAMES &&
                 header->code == LVN_ITEMCHANGED)
                 UpdateFramePreview();
+            if (header->idFrom == ID_DETAIL_FRAMES && header->code == NM_DBLCLK)
+                OpenSelectedFrameLog();
             return 0;
         }
         case WM_RM_PREVIEW_READY: {
@@ -2344,6 +2644,7 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            if (gFrameLogWindow) DestroyWindow(gFrameLogWindow);
             StopPreviewGeneration();
             gPreviewSource.clear();
             gPreviewTaskId.clear();
@@ -2580,8 +2881,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         case WM_RM_JOB_OPERATION: {
-            std::unique_ptr<JobOperationResult> result(
-                reinterpret_cast<JobOperationResult*>(lParam));
+            std::unique_ptr<JobOperationResult> result;
+            {
+                std::scoped_lock lock(gJobOperationResultMutex);
+                result.reset(gPendingJobOperationResult);
+                gPendingJobOperationResult = nullptr;
+            }
             if (gJobOperation.joinable()) gJobOperation.join();
             if (result)
                 MessageBoxW(window, result->message.c_str(), L"RenderMesh",
@@ -2589,6 +2894,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         case WM_CLOSE:
+            gJobOperationCancel = true;
             if (gInspectionRunning.load() || gInspection.joinable()) {
                 SetText(ID_PREFLIGHT, L"正在中止工程读取并安全退出…");
                 StopBlendInspection();
@@ -2610,7 +2916,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             KillTimer(window, TIMER_HEARTBEAT);
             KillTimer(window, TIMER_BURST_REFRESH);
             KillTimer(window, TIMER_UI_TEST_REPORT);
+            gUiShuttingDown = true;
             if (gJobOperation.joinable()) gJobOperation.join();
+            {
+                std::scoped_lock lock(gJobOperationResultMutex);
+                delete gPendingJobOperationResult;
+                gPendingJobOperationResult = nullptr;
+            }
             gWindow = nullptr;
             PostQuitMessage(0);
             return 0;
@@ -2824,10 +3136,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             }
             std::atomic<bool> finishCurrentThenStop = false;
             std::map<int, std::vector<RenderArtifact>> artifacts;
+            std::map<int, fs::path> frameLogs;
             ok = !manifest.is_discarded() && RenderBlenderPackage(
                 renderConfig, renderSource, renderOutputDir, {renderFrame}, renderFormat,
                 manifest.value("file_extension", ".png"), false, stopRequested,
-                finishCurrentThenStop, targets, {}, artifacts, renderError);
+                finishCurrentThenStop, targets, {}, {}, artifacts, frameLogs, renderError);
             if (ok && artifacts.contains(renderFrame)) {
                 auto primary = std::find_if(
                     artifacts[renderFrame].begin(), artifacts[renderFrame].end(),
@@ -2891,6 +3204,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     gTitleFont = CreateFontW(-28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+    gLogFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
@@ -2904,6 +3220,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     detailClass.lpfnWndProc = DetailWindowProc;
     detailClass.lpszClassName = L"RenderMeshJobDetail";
     RegisterClassW(&detailClass);
+    WNDCLASSW logClass = windowClass;
+    logClass.lpfnWndProc = FrameLogWindowProc;
+    logClass.lpszClassName = L"RenderMeshFrameLog";
+    RegisterClassW(&logClass);
     gWindow = CreateWindowExW(
         0, windowClass.lpszClassName, L"RenderMesh · Blender 分布式渲染农场",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
@@ -2929,6 +3249,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (gRowHeightImages) ImageList_Destroy(gRowHeightImages);
     DeleteObject(gFont);
     DeleteObject(gTitleFont);
+    DeleteObject(gLogFont);
     if (gBackgroundBrush) DeleteObject(gBackgroundBrush);
     if (gSurfaceBrush) DeleteObject(gSurfaceBrush);
     CoUninitialize();

@@ -83,6 +83,10 @@ blender --background --disable-autoexec source.blend
 
 协议 v7 在既有发现心跳中增加并签名 Worker 当前作业名、帧包、完成数和渲染阶段。服务器页因此可以在“已分配”列显示每台电脑正在渲染的作业和帧进度，不传输工程绝对路径。手动连接会用随机 challenge 对同一份活动快照单独做 HMAC 验证，不能把一次认证证明拼接到被篡改的 `/health` 数据；活动期间以 300ms 合并轮询，空闲时回到 1 秒。旧节点继续退化为仅显示“正在渲染”。
 
+## 单帧 Blender 日志
+
+一个任务包仍只启动一次 Blender 并连续渲染最多五帧。批处理脚本在每帧前后向同一 stdout/stderr 写入边界标记，Core 从 `render-package.log` 切出最多 4 MiB 的单帧纯文本日志；首帧同时保留 Blender 启动和工程加载输出。Worker 通过带集群令牌、task ID 和 attempt token 的 `/v1/frame-log` 原子回传日志快照，Origin 在接收前后都复核租约，旧 Worker 忽略 `X-RM-Frame-Logs` 后仍可正常渲染。日志路径随帧元数据写入 SQLite，和该任务的托管数据一起按七天策略清理。
+
 ## 作业历史、优先级与清理
 
 任务元数据存入静态嵌入 SQLite 的 `jobs.db`，旧 `jobs.json` 首次启动时自动导入并留下 `.pre-sqlite-backup`。SQLite 使用 WAL 事务，禁用扩展加载和 DQS，仍保持单 EXE。任务历史不按数量截断，列表按提交时间倒序显示；调度按优先级降序、同优先级提交时间升序选择下一任务包，不抢占正在渲染的帧。

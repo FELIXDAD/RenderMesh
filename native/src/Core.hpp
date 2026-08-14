@@ -116,9 +116,12 @@ struct RenderArtifact {
 
 using FrameCompletedCallback =
     std::function<void(int, const std::vector<RenderArtifact>&)>;
+using FrameLogCallback =
+    std::function<void(int, const fs::path&, bool)>;
 
 struct PreflightReport {
     bool passed = false;
+    std::string sceneName;
     std::string blenderVersion;
     std::string renderEngine;
     std::string outputFormat;
@@ -139,6 +142,7 @@ struct PreflightReport {
 
 struct BlendInspection {
     bool passed = false;
+    std::string sceneName;
     int frameStart = 1;
     int frameEnd = 1;
     int frameStep = 1;
@@ -199,7 +203,9 @@ bool RenderBlenderPackage(
     std::atomic<bool>& finishCurrentThenStop,
     const std::vector<OutputTarget>& compositorOutputs,
     const FrameCompletedCallback& frameCompleted,
+    const FrameLogCallback& frameLogUpdated,
     std::map<int, std::vector<RenderArtifact>>& completed,
+    std::map<int, fs::path>& frameLogs,
     std::wstring& error);
 bool ValidateFramePackageCompletion(
     size_t requestedFrames,
@@ -234,6 +240,7 @@ struct FrameTask {
     int dispatchAttempts = 0;
     std::string attemptToken;
     fs::path output;
+    fs::path log;
     std::map<std::string, fs::path> artifacts;
     std::string error;
     std::chrono::system_clock::time_point startedAt{};
@@ -243,6 +250,7 @@ struct FrameTask {
 struct RenderJob {
     std::string id;
     std::string name;
+    std::string sceneName;
     fs::path sourceBlend;
     fs::path preparedBlend;
     std::string projectHash;
@@ -259,6 +267,12 @@ struct RenderJob {
     std::chrono::system_clock::time_point finishedAt{};
     std::chrono::system_clock::time_point artifactsPurgedAt{};
     int priority = 0;
+};
+
+struct JobAggregate {
+    int activeJobs = 0;
+    int totalFrames = 0;
+    int completedFrames = 0;
 };
 
 struct ContributionRecord {
@@ -335,6 +349,7 @@ struct WorkItem {
     std::vector<OutputTarget> compositorOutputs;
     bool remote = false;
     bool resultBundles = false;
+    bool frameLogs = false;
     std::string originName;
     std::string originAddress;
     int originPort = 8391;
@@ -356,12 +371,13 @@ public:
     std::wstring ManualPeerStatus() const;
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
+    JobAggregate JobStats() const;
     std::optional<RenderJob> FindJob(const std::string& jobId) const;
     std::vector<ContributionRecord> Contributions() const;
     bool StopJob(const std::string& jobId, std::wstring& error);
     bool SetJobPriority(const std::string& jobId, bool prioritised, std::wstring& error);
     bool SaveJobAs(const std::string& jobId, const fs::path& destination,
-                   std::wstring& error) const;
+                   std::wstring& error, std::atomic<bool>* cancel = nullptr) const;
     bool DeleteJob(const std::string& jobId, std::wstring& error);
     HardwareInfo Hardware() const;
     int AssignedCount() const;
