@@ -11,4 +11,4 @@ Source: user requirements in the originating Codex task.
 7. Initially support Blender cluster rendering.
 8. Deliver a lightweight C++ or C# Windows desktop EXE; recipients should only need to unzip and run it, with no runtime/dependency installation.
 9. Check whether Blender is installed before use.
-10. Before distributing a project, inspect required plugins and linked/relative-path assets so a missing plugin or asset cannot be treated as a render-compatible worker/project.
+10. Before distributing a project, inspect and pack linked/relative-path assets, then run a real low-resolution validation render. Do not block workers by comparing installed, enabled, or versioned add-on inventories; they create false incompatibilities and are not a reliable project-dependency manifest.

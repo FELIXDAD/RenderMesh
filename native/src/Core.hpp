@@ -111,7 +111,6 @@ struct PreflightReport {
     std::string outputFormat;
     std::string outputExtension;
     bool requiresGpu = false;
-    std::vector<std::string> addons;
     std::vector<DependencyItem> missing;
     std::vector<DependencyItem> unpacked;
     std::vector<std::string> warnings;
@@ -146,7 +145,6 @@ bool CheckWorkerCompatibility(
     const std::string& expectedVersion,
     const std::string& expectedEngine,
     bool requiresGpu,
-    const std::vector<std::string>& requiredAddons,
     std::atomic<bool>& stopRequested,
     std::wstring& summary);
 bool RenderBlenderFrame(
@@ -215,7 +213,6 @@ struct RenderJob {
     std::string blenderVersion;
     std::string renderEngine;
     bool requiresGpu = false;
-    std::vector<std::string> requiredAddons;
     std::map<int, fs::path> primaryOutputs;
     std::vector<OutputTarget> compositorOutputs;
     std::vector<FrameTask> frames;
@@ -281,7 +278,6 @@ struct WorkItem {
     std::string blenderVersion;
     std::string renderEngine;
     bool requiresGpu = false;
-    std::vector<std::string> requiredAddons;
     std::string attemptToken;
     std::vector<OutputTarget> compositorOutputs;
     bool remote = false;

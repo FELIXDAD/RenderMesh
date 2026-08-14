@@ -85,14 +85,6 @@ int HeaderInt(const httplib::Request& request, const char* name, int fallback = 
     }
 }
 
-std::vector<std::string> HeaderStringList(const httplib::Request& request, const char* name) {
-    try {
-        return json::parse(request.get_header_value(name)).get<std::vector<std::string>>();
-    } catch (...) {
-        return {};
-    }
-}
-
 bool HeaderOutputTargets(
     const httplib::Request& request, const char* name,
     std::vector<OutputTarget>& targets) {
@@ -414,7 +406,7 @@ bool CacheEntryValid(const fs::path& dataDir, const std::string& hash) {
 
 bool CacheMetadataMatches(
     const fs::path& dataDir, const std::string& hash, const std::string& version,
-    const std::string& engine, bool requiresGpu, const std::vector<std::string>& addons) {
+    const std::string& engine, bool requiresGpu) {
     if (!CacheEntryValid(dataDir, hash)) return false;
     try {
         std::ifstream input(ProjectCacheDirectory(dataDir, hash) / L"cache-entry.json",
@@ -422,8 +414,7 @@ bool CacheMetadataMatches(
         json value = json::parse(input);
         return value.value("blender_version", "") == version &&
             value.value("render_engine", "") == engine &&
-            value.value("requires_gpu", false) == requiresGpu &&
-            value.value("addons", std::vector<std::string>{}) == addons;
+            value.value("requires_gpu", false) == requiresGpu;
     } catch (...) {
         return false;
     }
@@ -431,16 +422,14 @@ bool CacheMetadataMatches(
 
 bool WriteCacheMetadata(
     const fs::path& dataDir, const std::string& hash, const std::string& version,
-    const std::string& engine, bool requiresGpu, const std::vector<std::string>& addons,
-    std::wstring& error) {
+    const std::string& engine, bool requiresGpu, std::wstring& error) {
     fs::path destination = ProjectCacheDirectory(dataDir, hash) / L"cache-entry.json";
     fs::path temporary = destination;
     temporary += L".tmp";
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         output << json{{"project_hash", hash}, {"blender_version", version},
-                       {"render_engine", engine}, {"requires_gpu", requiresGpu},
-                       {"addons", addons}}.dump(2);
+                       {"render_engine", engine}, {"requires_gpu", requiresGpu}}.dump(2);
         output.flush();
         if (!output) {
             error = L"无法写入工程缓存元数据";
@@ -872,7 +861,7 @@ struct NodeApp::Impl {
                     {"requires_gpu", job.requiresGpu},
                     {"primary_outputs", primaryOutputs},
                     {"compositor_outputs", compositorOutputs},
-                    {"addons", job.requiredAddons}, {"frames", frames},
+                    {"frames", frames},
                     {"created_at", UnixMilliseconds(job.createdAt)},
                 });
             }
@@ -902,7 +891,6 @@ struct NodeApp::Impl {
                 job.blenderVersion = row.value("version", "");
                 job.renderEngine = row.value("render_engine", "");
                 job.requiresGpu = row.value("requires_gpu", false);
-                job.requiredAddons = row.value("addons", std::vector<std::string>{});
                 json primaryOutputRows = row.value("primary_outputs", json::object());
                 for (const auto& [frameText, pathValue] : primaryOutputRows.items()) {
                     try {
@@ -1154,14 +1142,12 @@ struct NodeApp::Impl {
             std::string version = request.get_header_value("X-RM-Blender");
             std::string engine = request.get_header_value("X-RM-Engine");
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
-            auto addons = HeaderStringList(request, "X-RM-Addons");
             if (!SafeSha256(hash) || version.empty() || engine.empty()) {
                 response.status = 422;
                 return;
             }
             std::scoped_lock lock(cacheMutex);
-            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
-                                      requiresGpu, addons)) {
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine, requiresGpu)) {
                 response.status = 404;
                 return;
             }
@@ -1188,7 +1174,6 @@ struct NodeApp::Impl {
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string engine = request.get_header_value("X-RM-Engine");
                 bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
-                auto addons = HeaderStringList(request, "X-RM-Addons");
                 if (!SafeSha256(hash) || version.empty() || engine.empty()) {
                     response.status = 422;
                     return;
@@ -1205,8 +1190,7 @@ struct NodeApp::Impl {
                     return;
                 }
                 std::unique_lock cacheLock(cacheMutex);
-                if (CacheMetadataMatches(owner->DataDir(), hash, version, engine,
-                                         requiresGpu, addons)) {
+                if (CacheMetadataMatches(owner->DataDir(), hash, version, engine, requiresGpu)) {
                     TouchCacheEntry(owner->DataDir(), hash);
                     response.status = 200;
                     response.set_content("already cached", "text/plain");
@@ -1277,7 +1261,7 @@ struct NodeApp::Impl {
                     });
                 }
                 bool compatible = owner->mockRenderer_ || CheckWorkerCompatibility(
-                    config, owner->DataDir(), blend, version, engine, requiresGpu, addons,
+                    config, owner->DataDir(), blend, version, engine, requiresGpu,
                     *effectiveStop, compatibility);
                 compatibilityStop = true;
                 if (compatibilityGuard.joinable()) compatibilityGuard.join();
@@ -1292,7 +1276,7 @@ struct NodeApp::Impl {
                     return;
                 }
                 if (!WriteCacheMetadata(owner->DataDir(), hash, version, engine,
-                                        requiresGpu, addons, receiveError)) {
+                                        requiresGpu, receiveError)) {
                     response.status = 500;
                     response.set_content(WideToUtf8(receiveError), "text/plain; charset=utf-8");
                     return;
@@ -1329,7 +1313,6 @@ struct NodeApp::Impl {
             std::string engine = request.get_header_value("X-RM-Engine");
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
             std::string attemptToken = request.get_header_value("X-RM-Attempt");
-            auto addons = HeaderStringList(request, "X-RM-Addons");
             if (!SafeId(taskId) || !SafeId(jobId) || !SafeSha256(hash) || frame < 1 ||
                 frame > 1000000 || originPort < 1024 || originPort > 65535 ||
                 !SafeId(attemptToken) || format.empty() ||
@@ -1349,8 +1332,7 @@ struct NodeApp::Impl {
                 return;
             }
             std::unique_lock cacheLock(cacheMutex);
-            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
-                                      requiresGpu, addons)) {
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine, requiresGpu)) {
                 response.status = 404;
                 response.set_content("project cache miss", "text/plain");
                 return;
@@ -1382,7 +1364,6 @@ struct NodeApp::Impl {
             item.blenderVersion = version;
             item.renderEngine = engine;
             item.requiresGpu = requiresGpu;
-            item.requiredAddons = std::move(addons);
             item.attemptToken = attemptToken;
             item.remote = true;
             item.originName = originName.empty() ? request.remote_addr : std::move(originName);
@@ -1425,7 +1406,6 @@ struct NodeApp::Impl {
             std::string version = request.get_header_value("X-RM-Blender");
             std::string engine = request.get_header_value("X-RM-Engine");
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
-            auto addons = HeaderStringList(request, "X-RM-Addons");
             std::vector<OutputTarget> compositorOutputs;
             if (!HeaderOutputTargets(request, "X-RM-Compositor", compositorOutputs)) {
                 response.status = 422;
@@ -1475,8 +1455,7 @@ struct NodeApp::Impl {
                 return;
             }
             std::unique_lock cacheLock(cacheMutex);
-            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine,
-                                      requiresGpu, addons)) {
+            if (!CacheMetadataMatches(owner->DataDir(), hash, version, engine, requiresGpu)) {
                 response.status = 404;
                 response.set_content("project cache miss", "text/plain");
                 return;
@@ -1511,7 +1490,6 @@ struct NodeApp::Impl {
             item.blenderVersion = version;
             item.renderEngine = engine;
             item.requiresGpu = requiresGpu;
-            item.requiredAddons = std::move(addons);
             item.compositorOutputs = std::move(compositorOutputs);
             item.remote = true;
             item.resultBundles = request.get_header_value("X-RM-Result-Bundles") == "1";
@@ -1580,7 +1558,6 @@ struct NodeApp::Impl {
                 std::string renderEngine = request.get_header_value("X-RM-Engine");
                 bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
                 std::string attemptToken = request.get_header_value("X-RM-Attempt");
-                auto addons = HeaderStringList(request, "X-RM-Addons");
                 if (!SafeId(taskId) || !SafeId(jobId) || frame < 1 || frame > 1000000 || originPort < 1024 ||
                     originPort > 65535 ||
                     !SafeId(attemptToken) || format.empty() ||
@@ -1659,7 +1636,7 @@ struct NodeApp::Impl {
                 }
                 if (!owner->mockRenderer_)
                     compatible = CheckWorkerCompatibility(
-                        config, owner->DataDir(), blend, version, renderEngine, requiresGpu, addons,
+                        config, owner->DataDir(), blend, version, renderEngine, requiresGpu,
                         *effectiveStop, compatibility);
                 compatibilityStop = true;
                 if (compatibilityGuard.joinable()) compatibilityGuard.join();
@@ -1685,7 +1662,6 @@ struct NodeApp::Impl {
                 item.blenderVersion = version;
                 item.renderEngine = renderEngine;
                 item.requiresGpu = requiresGpu;
-                item.requiredAddons = std::move(addons);
                 item.attemptToken = attemptToken;
                 item.remote = true;
                 item.originName = originName.empty() ? request.remote_addr : std::move(originName);
@@ -2187,7 +2163,9 @@ struct NodeApp::Impl {
             {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Engine", job.renderEngine},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
-            {"X-RM-Addons", json(job.requiredAddons).dump()},
+            // Protocol-v6 compatibility: older workers still parse this header,
+            // but an empty list prevents legacy strict add-on matching.
+            {"X-RM-Addons", "[]"},
         };
         auto status = cacheClient.Get("/v2/cache/status?hash=" + job.projectHash,
                                       statusHeaders);
@@ -2215,7 +2193,7 @@ struct NodeApp::Impl {
             {"X-RM-Engine", job.renderEngine},
             {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
-            {"X-RM-Addons", json(job.requiredAddons).dump()},
+            {"X-RM-Addons", "[]"},
         };
         auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", uploadHeaders,
                                job.preparedBlend, &stopRequested, 3600, jobCancelled);
@@ -2263,7 +2241,7 @@ struct NodeApp::Impl {
             {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
             {"X-RM-Attempt", attemptToken},
-            {"X-RM-Addons", json(job.requiredAddons).dump()},
+            {"X-RM-Addons", "[]"},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
         httplib::Result result;
@@ -2333,7 +2311,7 @@ struct NodeApp::Impl {
             {"X-RM-Blender", job.blenderVersion}, {"X-RM-Engine", job.renderEngine},
             {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
-            {"X-RM-Addons", json(job.requiredAddons).dump()},
+            {"X-RM-Addons", "[]"},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
         };
         auto result = PostEmpty(peer.address, peer.httpPort, "/v3/package", headers,
@@ -2578,7 +2556,6 @@ struct NodeApp::Impl {
                 item.blenderVersion = jobCopy.blenderVersion;
                 item.renderEngine = jobCopy.renderEngine;
                 item.requiresGpu = jobCopy.requiresGpu;
-                item.requiredAddons = jobCopy.requiredAddons;
                 item.compositorOutputs = jobCopy.compositorOutputs;
                 std::error_code markerError;
                 fs::remove(item.outputDir / L"stop-after-current", markerError);
@@ -3186,7 +3163,6 @@ std::string NodeApp::SubmitPrepared(
     job.blenderVersion = report.blenderVersion;
     job.renderEngine = report.renderEngine;
     job.requiresGpu = report.requiresGpu;
-    job.requiredAddons = report.addons;
     job.primaryOutputs = report.primaryOutputs;
     job.compositorOutputs = report.compositorOutputs;
     job.createdAt = std::chrono::system_clock::now();
@@ -3374,6 +3350,27 @@ bool RunSelfTest(std::wstring& report) {
         if (!CacheEntryValid(root, staleHash) ||
             CleanupExpiredProjectCaches(root, cacheNow) != 1 || fs::exists(staleCache)) {
             report = L"Seven-day project cache cleanup self-test failed";
+            return false;
+        }
+        const std::string compatibilityHash(64, 'b');
+        fs::path compatibilityCache = ProjectCacheDirectory(root, compatibilityHash);
+        fs::create_directories(compatibilityCache);
+        std::ofstream(compatibilityCache / L"source.blend", std::ios::binary) << "cached";
+        std::wstring compatibilityMetadataError;
+        if (!WriteCacheMetadata(root, compatibilityHash, "5.2", "CYCLES", true,
+                                compatibilityMetadataError)) {
+            report = L"Disabled add-on compatibility review self-test setup failed";
+            return false;
+        }
+        {
+            fs::path metadata = compatibilityCache / L"cache-entry.json";
+            json legacyMetadata = json::parse(std::ifstream(metadata, std::ios::binary));
+            legacyMetadata["addons"] = {"legacy_missing_addon@999.0"};
+            std::ofstream(metadata, std::ios::binary | std::ios::trunc)
+                << legacyMetadata.dump(2);
+        }
+        if (!CacheMetadataMatches(root, compatibilityHash, "5.2", "CYCLES", true)) {
+            report = L"Disabled add-on compatibility review self-test failed";
             return false;
         }
         Config signatureConfig;

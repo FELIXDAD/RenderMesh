@@ -705,7 +705,7 @@ void StartSubmission() {
         return;
     }
     EnableWindow(Item(ID_SUBMIT), FALSE);
-    SetText(ID_PREFLIGHT, L"正在启动 Blender 检查插件和外部素材，并打包临时工程……");
+    SetText(ID_PREFLIGHT, L"正在启动 Blender 检查外部素材，并打包临时工程……");
     if (gPreflight.joinable()) gPreflight.join();
     gPreflightStop = false;
     gPreflight = std::thread([=] {
@@ -782,7 +782,7 @@ void BuildUi() {
                               978, 126, 55, 28, ID_FRAME_STEP));
     PageControl(1, AddControl(L"BUTTON", L"预检并提交渲染", BS_OWNERDRAW,
                               1049, 124, 177, 34, ID_SUBMIT));
-    PageControl(1, Label(L"输出格式由 Blender 工程决定；提交前检查并打包链接素材、记录插件环境。",
+    PageControl(1, Label(L"输出格式由 Blender 工程决定；提交前检查并打包链接素材，同时执行低分辨率验证渲染。",
                          250, 178, 976, 24));
     PageControl(1, AddControl(L"STATIC", L"等待选择工程", SS_LEFT,
                               250, 210, 976, 45, ID_PREFLIGHT));
@@ -1336,7 +1336,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             {"render_format", result.outputFormat},
             {"file_extension", result.outputExtension},
             {"requires_gpu", result.requiresGpu},
-            {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
+            {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
         };
         output["primary_outputs"] = json::object();
@@ -1419,7 +1419,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             manifest.value("version", std::string{}),
             manifest.value("render_engine", std::string{}),
             manifest.value("requires_gpu", false),
-            manifest.value("addons", std::vector<std::string>{}),
             compatibilityStop, summary);
         PrintToParentConsole(summary);
         return ok ? 0 : 5;

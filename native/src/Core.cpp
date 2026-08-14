@@ -281,7 +281,7 @@ bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring
     return true;
 }
 
-const char* kPreflightScript = R"PY(import bpy, addon_utils, json, os, sys, glob, re, traceback
+const char* kPreflightScript = R"PY(import bpy, json, os, sys, glob, re, traceback
 
 args = sys.argv[sys.argv.index('--') + 1:]
 prepared, report_path = args[0], args[1]
@@ -435,14 +435,6 @@ def gather():
 
 engine = bpy.context.scene.render.engine
 cycles_device = getattr(bpy.context.scene.cycles, 'device', 'CPU') if engine == 'CYCLES' else ''
-addon_versions = {}
-for module in addon_utils.modules(refresh=True):
-    version = getattr(module, 'bl_info', {}).get('version', ())
-    addon_versions[module.__name__] = '.'.join(str(part) for part in version) or 'unknown'
-enabled_addons = []
-for addon in bpy.context.preferences.addons:
-    name = addon.module
-    enabled_addons.append(name + '@' + addon_versions.get(name, 'unknown'))
 
 original_scene = bpy.context.scene
 primary_outputs = {str(frame): bpy.path.abspath(original_scene.render.frame_path(frame=frame))
@@ -464,7 +456,6 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'file_extension': bpy.context.scene.render.file_extension,
           'use_file_extension': bpy.context.scene.render.use_file_extension,
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
-          'addons': sorted(enabled_addons),
           'primary_outputs': primary_outputs,
           'compositor_outputs': compositor_outputs,
           'missing': [], 'unpacked': [], 'warnings': warnings,
@@ -534,37 +525,13 @@ with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(report, f, ensure_ascii=False, indent=2)
 )PY";
 
-const char* kCompatibilityScript = R"PY(import bpy, addon_utils, json, sys
+const char* kCompatibilityScript = R"PY(import bpy, json, sys
 args = sys.argv[sys.argv.index('--') + 1:]
 manifest_path, report_path = args[0], args[1]
 with open(manifest_path, 'r', encoding='utf-8') as f:
     manifest = json.load(f)
-available = set()
-available_versions = {}
-for module in addon_utils.modules(refresh=True):
-    available.add(module.__name__)
-    available.add(module.__name__.split('.')[0])
-    version = getattr(module, 'bl_info', {}).get('version', ())
-    available_versions[module.__name__] = '.'.join(str(part) for part in version) or 'unknown'
-enabled = set(addon.module for addon in bpy.context.preferences.addons)
-requirements = []
-for value in manifest.get('addons', []):
-    name, separator, version = value.rpartition('@')
-    requirements.append((name if separator else value, version if separator else ''))
-missing_installed = [name for name, version in requirements
-                     if name not in available and name.split('.')[0] not in available]
-missing_enabled = [name for name, version in requirements
-                   if name not in enabled]
-version_mismatch = [f'{name} (need {version}, have {available_versions.get(name, "unknown")})'
-                    for name, version in requirements
-                    if version and version != 'unknown' and name in available_versions and
-                    available_versions[name] != version]
-missing = sorted(set(missing_installed + missing_enabled + version_mismatch))
 version = f'{bpy.app.version[0]}.{bpy.app.version[1]}'
-result = {'pass': version == manifest.get('version') and not missing,
-          'version': version, 'missing_addons': missing,
-          'missing_installed': missing_installed, 'missing_enabled': missing_enabled,
-          'version_mismatch': version_mismatch}
+result = {'pass': version == manifest.get('version'), 'version': version}
 engine = manifest.get('render_engine', '')
 try:
     if engine:
@@ -1176,7 +1143,6 @@ PreflightReport PreflightBlend(
             report.warnings.push_back("The project output format has no safe file extension");
         }
         report.requiresGpu = data.value("requires_gpu", false);
-        report.addons = data.value("addons", std::vector<std::string>{});
         json primaryOutputRows = data.value("primary_outputs", json::object());
         for (const auto& [frameText, pathValue] : primaryOutputRows.items()) {
             try {
@@ -1210,8 +1176,7 @@ PreflightReport PreflightBlend(
         report.preparedBlend = prepared;
         if (report.passed) {
             report.summary = L"预检通过：素材已打包，Blender " +
-                Utf8ToWide(report.blenderVersion) + L"，插件环境 " +
-                std::to_wstring(report.addons.size()) + L" 项，输出格式 " +
+                Utf8ToWide(report.blenderVersion) + L"，输出格式 " +
                 Utf8ToWide(report.outputFormat) + L"。";
         } else {
             report.summary = L"预检未通过：缺失 " + std::to_wstring(report.missing.size()) +
@@ -1236,7 +1201,6 @@ bool CheckWorkerCompatibility(
     const std::string& expectedVersion,
     const std::string& expectedEngine,
     bool requiresGpu,
-    const std::vector<std::string>& requiredAddons,
     std::atomic<bool>& stopRequested,
     std::wstring& summary) {
     fs::path blender = FindBlender(config);
@@ -1257,11 +1221,12 @@ bool CheckWorkerCompatibility(
     {
         std::ofstream output(manifest, std::ios::binary | std::ios::trunc);
         output << json{{"version", expectedVersion}, {"render_engine", expectedEngine},
-                       {"requires_gpu", requiresGpu},
-                       {"addons", requiredAddons}}.dump(2);
+                       {"requires_gpu", requiresGpu}}.dump(2);
     }
-    // Compatibility only depends on the worker's Blender installation, enabled
-    // add-ons and GPU devices. Do not open the submitted project here: an older
+    // Compatibility only depends on the worker's Blender installation, render
+    // engine and GPU devices. Add-on inventories are intentionally ignored because
+    // enabled origin add-ons are not equivalent to project dependencies. Do not
+    // open the submitted project here: an older
     // Blender may abort before the script can produce the actionable version
     // mismatch report, and loading the full scene wastes memory before dispatch.
     ProcessResult process = RunProcess(
@@ -1282,18 +1247,11 @@ bool CheckWorkerCompatibility(
     try {
         json data = json::parse(ReadText(report));
         std::string version = data.value("version", std::string{});
-        auto missing = data.value("missing_addons", std::vector<std::string>{});
         bool engineAvailable = data.value("engine_available", expectedEngine.empty());
         auto gpuDevices = data.value("gpu_devices", std::vector<std::string>{});
         if (version != expectedVersion) {
             summary = L"Blender 版本不一致：需要 " + Utf8ToWide(expectedVersion) + L"，本机 " +
                 Utf8ToWide(version);
-            return false;
-        }
-        if (!missing.empty()) {
-            summary = L"缺少插件：";
-            for (size_t i = 0; i < std::min<size_t>(missing.size(), 8); ++i)
-                summary += (i ? L"、" : L"") + Utf8ToWide(missing[i]);
             return false;
         }
         if (!engineAvailable) {
