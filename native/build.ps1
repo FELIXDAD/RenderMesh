@@ -37,6 +37,7 @@ if ($Configuration -eq 'Release') {
 $sources = @(
     (Join-Path $nativeRoot 'src\Core.cpp'),
     (Join-Path $nativeRoot 'src\Node.cpp'),
+    (Join-Path $nativeRoot 'src\UiModel.cpp'),
     (Join-Path $nativeRoot 'src\WinMain.cpp'),
     $resource
 )
@@ -45,7 +46,7 @@ $link = @(
     '-municode','-mwindows','-static','-static-libgcc','-static-libstdc++',
     '-Wl,--gc-sections','-Wl,--subsystem,windows','-o',$output,
     '-lws2_32','-liphlpapi','-lcomctl32','-lcomdlg32','-lshell32','-lole32','-lbcrypt','-luuid',
-    '-ladvapi32','-ldxgi','-lwindowscodecs','-luxtheme'
+    '-ladvapi32','-ldxgi','-ld2d1','-ldwrite','-lwindowscodecs','-luxtheme'
 )
 if ($Configuration -eq 'Release') { $link += '-s' }
 

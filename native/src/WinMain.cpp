@@ -1,7 +1,11 @@
 #include "Core.hpp"
+#include "UiModel.hpp"
 
 #include <commctrl.h>
 #include <commdlg.h>
+#include <d2d1.h>
+#include <d2d1helper.h>
+#include <dwrite.h>
 #include <shellapi.h>
 #include <uxtheme.h>
 #include <wincodec.h>
@@ -10,6 +14,7 @@
 #include <array>
 #include <fstream>
 #include <memory>
+#include <unordered_map>
 
 namespace {
 
@@ -18,6 +23,11 @@ using namespace rm;
 constexpr UINT WM_RM_REFRESH = WM_APP + 1;
 constexpr UINT WM_RM_PREFLIGHT = WM_APP + 2;
 constexpr UINT WM_RM_PREVIEW_READY = WM_APP + 3;
+constexpr UINT_PTR TIMER_HEARTBEAT = 1;
+constexpr UINT_PTR TIMER_BURST_REFRESH = 3;
+constexpr UINT_PTR TIMER_UI_TEST_REPORT = 4;
+constexpr UINT IDLE_HEARTBEAT_INTERVAL_MS = 1000;
+constexpr int UI_TEST_BURST_NOTIFICATIONS = 100;
 
 enum ControlId {
     ID_SHARE = 100,
@@ -80,12 +90,218 @@ int gCurrentPage = 0;
 int gInitialPage = 0;
 bool gOpenInitialDetail = false;
 fs::path gUiMetricsReport;
+int gUiTestRows = 0;
 bool gDarkTheme = false;
 HBRUSH gBackgroundBrush = nullptr;
 HBRUSH gSurfaceBrush = nullptr;
 std::array<std::vector<HWND>, 4> gPageControls;
+ui::StableTableModel gNodeRows;
+ui::StableTableModel gJobRows;
+ui::StableTableModel gContributionRows;
+ui::StableTableModel gFrameRows;
+std::atomic<bool> gRefreshQueued = false;
+std::chrono::steady_clock::time_point gLastRefresh{};
+uint64_t gListMutationCount = 0;
+uint64_t gRefreshCount = 0;
+uint64_t gHeartbeatTimerRefreshCount = 0;
+uint64_t gBurstTimerRefreshCount = 0;
+ID2D1Factory* gD2dFactory = nullptr;
+IDWriteFactory* gDwriteFactory = nullptr;
+ID2D1HwndRenderTarget* gRenderTarget = nullptr;
+IDWriteTextFormat* gCardValueFormat = nullptr;
+IDWriteTextFormat* gCardLabelFormat = nullptr;
+HIMAGELIST gRowHeightImages = nullptr;
+SIZE gLayoutBaseClient{};
+std::unordered_map<HWND, RECT> gBaseControlRects;
+
+struct DashboardView {
+    int onlineNodes = 0;
+    int activeJobs = 0;
+    int completedFrames = 0;
+    int totalFrames = 0;
+    int assignedFrames = 0;
+    int idleSeconds = 0;
+    bool blenderReady = false;
+    bool sharing = false;
+
+    bool operator==(const DashboardView&) const = default;
+};
+
+DashboardView gDashboardView;
 
 constexpr COLORREF kAccent = RGB(77, 69, 233);
+
+template <typename T>
+void SafeRelease(T*& value) {
+    if (!value) return;
+    value->Release();
+    value = nullptr;
+}
+
+D2D1_COLOR_F D2dColor(COLORREF value, float alpha = 1.0f) {
+    return D2D1::ColorF(GetRValue(value) / 255.0f, GetGValue(value) / 255.0f,
+                        GetBValue(value) / 255.0f, alpha);
+}
+
+void ReleaseRenderTarget() {
+    SafeRelease(gRenderTarget);
+}
+
+void ReleaseGraphics() {
+    ReleaseRenderTarget();
+    SafeRelease(gCardValueFormat);
+    SafeRelease(gCardLabelFormat);
+    SafeRelease(gDwriteFactory);
+    SafeRelease(gD2dFactory);
+}
+
+bool EnsureGraphics(HWND window) {
+    if (!gD2dFactory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                                 &gD2dFactory)))
+        return false;
+    if (!gDwriteFactory && FAILED(DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(&gDwriteFactory))))
+        return false;
+    if (!gCardValueFormat) {
+        HRESULT hr = gDwriteFactory->CreateTextFormat(
+            L"Segoe UI Variable Display", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 24.0f, L"zh-CN",
+            &gCardValueFormat);
+        if (FAILED(hr)) hr = gDwriteFactory->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 24.0f, L"zh-CN", &gCardValueFormat);
+        if (FAILED(hr)) return false;
+        gCardValueFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    if (!gCardLabelFormat) {
+        HRESULT hr = gDwriteFactory->CreateTextFormat(
+            L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-CN",
+            &gCardLabelFormat);
+        if (FAILED(hr)) hr = gDwriteFactory->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-CN", &gCardLabelFormat);
+        if (FAILED(hr)) return false;
+        gCardLabelFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    if (!gRenderTarget) {
+        RECT client{};
+        GetClientRect(window, &client);
+        const D2D1_SIZE_U size = D2D1::SizeU(
+            static_cast<UINT>(std::max(1L, client.right)),
+            static_cast<UINT>(std::max(1L, client.bottom)));
+        if (FAILED(gD2dFactory->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(),
+                D2D1::HwndRenderTargetProperties(window, size), &gRenderTarget)))
+            return false;
+        gRenderTarget->SetDpi(96.0f, 96.0f);
+    }
+    return true;
+}
+
+void DrawD2dText(const std::wstring& text, IDWriteTextFormat* format,
+                 const D2D1_RECT_F& rect, ID2D1Brush* brush) {
+    if (!text.empty())
+        gRenderTarget->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format,
+                                 rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+void PaintChrome(HWND window) {
+    PAINTSTRUCT paint{};
+    BeginPaint(window, &paint);
+    if (!EnsureGraphics(window)) {
+        FillRect(paint.hdc, &paint.rcPaint,
+                 gBackgroundBrush ? gBackgroundBrush
+                                  : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+        EndPaint(window, &paint);
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(window, &client);
+    gRenderTarget->Resize(D2D1::SizeU(static_cast<UINT>(std::max(1L, client.right)),
+                                      static_cast<UINT>(std::max(1L, client.bottom))));
+    const COLORREF background = gDarkTheme ? RGB(15, 16, 22) : RGB(244, 245, 249);
+    const COLORREF sidebar = gDarkTheme ? RGB(23, 24, 32) : RGB(252, 252, 254);
+    const COLORREF surface = gDarkTheme ? RGB(31, 32, 42) : RGB(255, 255, 255);
+    const COLORREF stroke = gDarkTheme ? RGB(51, 52, 66) : RGB(224, 226, 234);
+    const COLORREF text = gDarkTheme ? RGB(244, 244, 249) : RGB(28, 29, 36);
+    const COLORREF secondary = gDarkTheme ? RGB(164, 166, 183) : RGB(103, 105, 119);
+    ID2D1SolidColorBrush* backgroundBrush = nullptr;
+    ID2D1SolidColorBrush* sidebarBrush = nullptr;
+    ID2D1SolidColorBrush* surfaceBrush = nullptr;
+    ID2D1SolidColorBrush* strokeBrush = nullptr;
+    ID2D1SolidColorBrush* textBrush = nullptr;
+    ID2D1SolidColorBrush* secondaryBrush = nullptr;
+    ID2D1SolidColorBrush* accentBrush = nullptr;
+    gRenderTarget->CreateSolidColorBrush(D2dColor(background), &backgroundBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(sidebar), &sidebarBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(surface), &surfaceBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(stroke), &strokeBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(text), &textBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(secondary), &secondaryBrush);
+    gRenderTarget->CreateSolidColorBrush(D2dColor(kAccent), &accentBrush);
+
+    gRenderTarget->BeginDraw();
+    gRenderTarget->Clear(D2dColor(background));
+    gRenderTarget->FillRectangle(D2D1::RectF(0, 0, 220.0f,
+                                             static_cast<float>(client.bottom)), sidebarBrush);
+    gRenderTarget->DrawLine(D2D1::Point2F(220.0f, 0),
+                            D2D1::Point2F(220.0f, static_cast<float>(client.bottom)),
+                            strokeBrush, 1.0f);
+    gRenderTarget->FillEllipse(D2D1::Ellipse(D2D1::Point2F(31.0f, 31.0f), 5.0f, 5.0f),
+                               accentBrush);
+
+    const float contentLeft = 236.0f;
+    const float contentRight = static_cast<float>(client.right) - 18.0f;
+    if (gCurrentPage == 0) {
+        constexpr float gap = 12.0f;
+        const float cardWidth = std::max(160.0f,
+            (contentRight - contentLeft - gap * 3.0f) / 4.0f);
+        const std::array<std::wstring, 4> labels = {
+            L"在线节点", L"活动任务", L"完成帧", L"本机共享",
+        };
+        const std::array<std::wstring, 4> values = {
+            std::to_wstring(gDashboardView.onlineNodes),
+            std::to_wstring(gDashboardView.activeJobs),
+            std::to_wstring(gDashboardView.completedFrames) + L" / " +
+                std::to_wstring(gDashboardView.totalFrames),
+            gDashboardView.sharing ? L"已开启" : L"已关闭",
+        };
+        for (size_t index = 0; index < labels.size(); ++index) {
+            const float left = contentLeft + static_cast<float>(index) * (cardWidth + gap);
+            const D2D1_ROUNDED_RECT card = D2D1::RoundedRect(
+                D2D1::RectF(left, 86.0f, left + cardWidth, 176.0f), 14.0f, 14.0f);
+            gRenderTarget->FillRoundedRectangle(card, surfaceBrush);
+            gRenderTarget->DrawRoundedRectangle(card, strokeBrush, 1.0f);
+            DrawD2dText(labels[index], gCardLabelFormat,
+                        D2D1::RectF(left + 16.0f, 102.0f, left + cardWidth - 12.0f, 124.0f),
+                        secondaryBrush);
+            DrawD2dText(values[index], gCardValueFormat,
+                        D2D1::RectF(left + 16.0f, 128.0f, left + cardWidth - 12.0f, 163.0f),
+                        index == 3 && gDashboardView.sharing ? accentBrush : textBrush);
+        }
+    } else {
+        const float top = gCurrentPage == 1 ? 72.0f : gCurrentPage == 2 ? 82.0f : 74.0f;
+        const D2D1_ROUNDED_RECT panel = D2D1::RoundedRect(
+            D2D1::RectF(contentLeft, top, contentRight,
+                        static_cast<float>(client.bottom) - 18.0f), 16.0f, 16.0f);
+        gRenderTarget->FillRoundedRectangle(panel, surfaceBrush);
+        gRenderTarget->DrawRoundedRectangle(panel, strokeBrush, 1.0f);
+    }
+
+    HRESULT result = gRenderTarget->EndDraw();
+    SafeRelease(accentBrush);
+    SafeRelease(secondaryBrush);
+    SafeRelease(textBrush);
+    SafeRelease(strokeBrush);
+    SafeRelease(surfaceBrush);
+    SafeRelease(sidebarBrush);
+    SafeRelease(backgroundBrush);
+    if (result == D2DERR_RECREATE_TARGET) ReleaseRenderTarget();
+    EndPaint(window, &paint);
+}
 
 std::wstring FormatTime(std::chrono::system_clock::time_point value) {
     if (value.time_since_epoch() == std::chrono::system_clock::duration::zero()) return L"-";
@@ -143,8 +359,8 @@ void ApplyTheme() {
     gDarkTheme = ResolveDarkTheme(gApp->GetConfig());
     if (gBackgroundBrush) DeleteObject(gBackgroundBrush);
     if (gSurfaceBrush) DeleteObject(gSurfaceBrush);
-    COLORREF background = gDarkTheme ? RGB(18, 18, 24) : RGB(246, 247, 251);
-    COLORREF surface = gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255);
+    COLORREF background = gDarkTheme ? RGB(15, 16, 22) : RGB(244, 245, 249);
+    COLORREF surface = gDarkTheme ? RGB(31, 32, 42) : RGB(255, 255, 255);
     COLORREF text = gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38);
     gBackgroundBrush = CreateSolidBrush(background);
     gSurfaceBrush = CreateSolidBrush(surface);
@@ -155,14 +371,11 @@ void ApplyTheme() {
         ListView_SetBkColor(list, surface);
         ListView_SetTextBkColor(list, surface);
         ListView_SetTextColor(list, text);
+        SetWindowTheme(list, gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        if (HWND header = ListView_GetHeader(list))
+            SetWindowTheme(header, gDarkTheme ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
     }
     BOOL dark = gDarkTheme;
-    SetWindowTheme(GetDlgItem(gWindow, ID_NODES),
-                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    SetWindowTheme(GetDlgItem(gWindow, ID_JOBS),
-                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    SetWindowTheme(GetDlgItem(gWindow, ID_CONTRIBUTION_LIST),
-                   gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
     if (dwm) {
         using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
@@ -188,7 +401,15 @@ std::wstring Text(HWND control) {
     return value;
 }
 
-void SetText(int id, const std::wstring& value) { SetWindowTextW(Item(id), value.c_str()); }
+bool SetWindowTextIfChanged(HWND control, const std::wstring& value) {
+    if (!control || Text(control) == value) return false;
+    SetWindowTextW(control, value.c_str());
+    return true;
+}
+
+void SetText(int id, const std::wstring& value) {
+    SetWindowTextIfChanged(Item(id), value);
+}
 
 int IntValue(int id, int fallback) {
     try {
@@ -209,7 +430,7 @@ HWND AddControl(
     int id,
     HFONT font = nullptr) {
     HWND control = CreateWindowExW(
-        wcscmp(type, WC_LISTVIEWW) == 0 ? WS_EX_CLIENTEDGE : 0, type, text,
+        0, type, text,
         WS_CHILD | WS_VISIBLE | style, x, y, width, height, gWindow,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : gFont), TRUE);
@@ -218,7 +439,8 @@ HWND AddControl(
 
 HWND Label(const wchar_t* text, int x, int y, int width, int height, int id = 0,
            HFONT font = nullptr) {
-    return AddControl(L"STATIC", text, SS_LEFT, x, y, width, height, id, font);
+    return AddControl(L"STATIC", text, SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
+                      x, y, width, height, id, font);
 }
 
 HWND PageControl(int page, HWND control) {
@@ -258,16 +480,136 @@ void SizeListForVisibleRows(HWND list, int rows) {
     }
 }
 
-void SetCell(HWND list, int row, int column, const std::wstring& value) {
-    if (column == 0) {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = row;
-        item.pszText = const_cast<wchar_t*>(value.c_str());
-        ListView_InsertItem(list, &item);
-    } else {
-        ListView_SetItemText(list, row, column, const_cast<wchar_t*>(value.c_str()));
+void ConfigureList(HWND list) {
+    ListView_SetExtendedListViewStyle(list,
+        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+    if (!gRowHeightImages) {
+        constexpr int rowHeight = 40;
+        gRowHeightImages = ImageList_Create(1, rowHeight, ILC_COLOR32, 1, 1);
+        if (gRowHeightImages) {
+            HBITMAP spacer = CreateBitmap(1, rowHeight, 1, 32, nullptr);
+            ImageList_Add(gRowHeightImages, spacer, nullptr);
+            DeleteObject(spacer);
+        }
     }
+    if (gRowHeightImages) ListView_SetImageList(list, gRowHeightImages, LVSIL_SMALL);
+}
+
+void InsertRow(HWND list, int index, const ui::Row& row) {
+    if (row.cells.empty()) return;
+    LVITEMW item{};
+    item.mask = LVIF_TEXT;
+    item.iItem = index;
+    item.pszText = const_cast<wchar_t*>(row.cells[0].c_str());
+    int inserted = ListView_InsertItem(list, &item);
+    if (inserted < 0) return;
+    for (size_t column = 1; column < row.cells.size(); ++column)
+        ListView_SetItemText(list, inserted, static_cast<int>(column),
+                             const_cast<wchar_t*>(row.cells[column].c_str()));
+}
+
+struct TableViewState {
+    std::vector<std::wstring> selectedKeys;
+    std::optional<std::wstring> focusedKey;
+    std::optional<std::wstring> topKey;
+    int topIndex = 0;
+    int topOffset = 0;
+    int horizontalScroll = 0;
+};
+
+TableViewState CaptureTableView(HWND list, const ui::StableTableModel& model) {
+    TableViewState state;
+    const auto& rows = model.Rows();
+    for (int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED); selected >= 0;
+         selected = ListView_GetNextItem(list, selected, LVNI_SELECTED)) {
+        if (selected < static_cast<int>(rows.size()))
+            state.selectedKeys.push_back(rows[static_cast<size_t>(selected)].key);
+    }
+    int focused = ListView_GetNextItem(list, -1, LVNI_FOCUSED);
+    if (focused >= 0 && focused < static_cast<int>(rows.size()))
+        state.focusedKey = rows[static_cast<size_t>(focused)].key;
+    state.topIndex = ListView_GetTopIndex(list);
+    if (state.topIndex >= 0 && state.topIndex < static_cast<int>(rows.size())) {
+        state.topKey = rows[static_cast<size_t>(state.topIndex)].key;
+        RECT item{};
+        if (ListView_GetItemRect(list, state.topIndex, &item, LVIR_BOUNDS))
+            state.topOffset = item.top;
+    }
+    state.horizontalScroll = GetScrollPos(list, SB_HORZ);
+    return state;
+}
+
+void RestoreTableView(HWND list, const TableViewState& state,
+                      const ui::StableTableModel& model) {
+    const auto& rows = model.Rows();
+    ListView_SetItemState(list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    for (const auto& key : state.selectedKeys) {
+        if (auto index = model.IndexOf(key))
+            ListView_SetItemState(list, static_cast<int>(*index), LVIS_SELECTED,
+                                  LVIS_SELECTED);
+    }
+    if (state.focusedKey) {
+        if (auto index = model.IndexOf(*state.focusedKey))
+            ListView_SetItemState(list, static_cast<int>(*index), LVIS_FOCUSED,
+                                  LVIS_FOCUSED);
+    }
+
+    std::optional<size_t> anchor;
+    if (state.topKey) anchor = model.IndexOf(*state.topKey);
+    if (!anchor && !rows.empty())
+        anchor = static_cast<size_t>(std::min<int>(state.topIndex,
+                                                   static_cast<int>(rows.size()) - 1));
+    if (anchor) {
+        ListView_EnsureVisible(list, static_cast<int>(*anchor), FALSE);
+        RECT item{};
+        if (ListView_GetItemRect(list, static_cast<int>(*anchor), &item, LVIR_BOUNDS))
+            ListView_Scroll(list, 0, item.top - state.topOffset);
+    }
+    const int horizontalNow = GetScrollPos(list, SB_HORZ);
+    if (horizontalNow != state.horizontalScroll)
+        ListView_Scroll(list, state.horizontalScroll - horizontalNow, 0);
+}
+
+bool SyncTable(HWND list, ui::StableTableModel& model, std::vector<ui::Row> rows) {
+    if (!list) return false;
+    TableViewState view = CaptureTableView(list, model);
+    auto operations = model.Reconcile(std::move(rows));
+    if (operations.empty()) return false;
+
+    const bool structural = std::any_of(operations.begin(), operations.end(),
+        [](const ui::Operation& operation) {
+            return operation.type != ui::OperationType::Update;
+        });
+    if (structural) SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    for (const auto& operation : operations) {
+        switch (operation.type) {
+            case ui::OperationType::Insert:
+                InsertRow(list, static_cast<int>(operation.index), operation.row);
+                break;
+            case ui::OperationType::Erase:
+                ListView_DeleteItem(list, static_cast<int>(operation.index));
+                break;
+            case ui::OperationType::Move:
+                ListView_DeleteItem(list, static_cast<int>(operation.fromIndex));
+                InsertRow(list, static_cast<int>(operation.index), operation.row);
+                break;
+            case ui::OperationType::Update:
+                for (const auto& cell : operation.cells)
+                    ListView_SetItemText(list, static_cast<int>(operation.index),
+                        static_cast<int>(cell.column), const_cast<wchar_t*>(cell.value.c_str()));
+                ListView_RedrawItems(list, static_cast<int>(operation.index),
+                                     static_cast<int>(operation.index));
+                break;
+        }
+    }
+    gListMutationCount += operations.size();
+    if (structural) {
+        RestoreTableView(list, view, model);
+        SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(list, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
+    return true;
 }
 
 HBITMAP LoadPreviewBitmap(const fs::path& path, UINT maxWidth, UINT maxHeight) {
@@ -371,6 +713,7 @@ void ShowInExplorer(const fs::path& path) {
 }
 
 void UpdateFramePreview();
+ui::VisualState TaskVisualState(TaskState state);
 
 void RefreshJobDetail(bool preserveSelection = true) {
     if (!gDetailWindow) return;
@@ -382,14 +725,9 @@ void RefreshJobDetail(bool preserveSelection = true) {
     const auto& job = *jobValue;
     gRefreshingJobDetail = true;
     HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
-    int selectedFrame = -1;
-    if (preserveSelection) {
-        int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
-        if (selected >= 0 && selected < static_cast<int>(job.frames.size()))
-            selectedFrame = job.frames[static_cast<size_t>(selected)].frame;
-    }
     int completed = 0, failed = 0, stopped = 0, active = 0;
-    ListView_DeleteAllItems(list);
+    std::vector<ui::Row> frameRows;
+    frameRows.reserve(job.frames.size());
     for (int index = 0; index < static_cast<int>(job.frames.size()); ++index) {
         const auto& frame = job.frames[static_cast<size_t>(index)];
         completed += frame.state == TaskState::Completed;
@@ -397,19 +735,23 @@ void RefreshJobDetail(bool preserveSelection = true) {
         stopped += frame.state == TaskState::Stopped;
         active += frame.state == TaskState::Assigned || frame.state == TaskState::Rendering ||
                   frame.state == TaskState::Dispatching;
-        SetCell(list, index, 0, std::to_wstring(frame.frame));
-        SetCell(list, index, 1, TaskStateLabel(frame.state));
-        SetCell(list, index, 2, Utf8ToWide(frame.assignedNodeName));
-        SetCell(list, index, 3, Utf8ToWide(frame.assignedPackageId));
-        SetCell(list, index, 4, FormatDuration(frame.startedAt, frame.endedAt));
-        SetCell(list, index, 5, FormatTime(frame.startedAt));
-        SetCell(list, index, 6, FormatTime(frame.endedAt));
-        SetCell(list, index, 7, frame.error.empty() ? frame.output.wstring()
-                                                    : Utf8ToWide(frame.error));
-        if (frame.frame == selectedFrame)
-            ListView_SetItemState(list, index, LVIS_SELECTED | LVIS_FOCUSED,
-                                  LVIS_SELECTED | LVIS_FOCUSED);
+        ui::Row row;
+        row.key = Utf8ToWide(frame.taskId.empty()
+            ? job.id + ":" + std::to_string(frame.frame) : frame.taskId);
+        row.visualState = TaskVisualState(frame.state);
+        row.cells = {
+            std::to_wstring(frame.frame),
+            TaskStateLabel(frame.state),
+            Utf8ToWide(frame.assignedNodeName),
+            Utf8ToWide(frame.assignedPackageId),
+            FormatDuration(frame.startedAt, frame.endedAt),
+            FormatTime(frame.startedAt),
+            FormatTime(frame.endedAt),
+            frame.error.empty() ? frame.output.wstring() : Utf8ToWide(frame.error),
+        };
+        frameRows.push_back(std::move(row));
     }
+    SyncTable(list, gFrameRows, std::move(frameRows));
     if (!preserveSelection && !job.frames.empty())
         ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED,
                               LVIS_SELECTED | LVIS_FOCUSED);
@@ -418,7 +760,7 @@ void RefreshJobDetail(bool preserveSelection = true) {
         L"    渲染中 " + std::to_wstring(active) + L"    错误 " +
         std::to_wstring(failed) + L"    已停止 " + std::to_wstring(stopped) +
         L"    提交时间 " + FormatTime(job.createdAt);
-    SetWindowTextW(GetDlgItem(gDetailWindow, ID_DETAIL_SUMMARY), summary.c_str());
+    SetWindowTextIfChanged(GetDlgItem(gDetailWindow, ID_DETAIL_SUMMARY), summary);
     gRefreshingJobDetail = false;
     UpdateFramePreview();
 }
@@ -429,7 +771,7 @@ void UpdateFramePreview() {
     if (!job) return;
     HWND list = GetDlgItem(gDetailWindow, ID_DETAIL_FRAMES);
     int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
-    if (selected < 0 || selected >= static_cast<int>(job->frames.size())) {
+    if (selected < 0 || selected >= static_cast<int>(gFrameRows.Rows().size())) {
         StopPreviewGeneration();
         gPreviewSource.clear();
         gPreviewTaskId.clear();
@@ -438,7 +780,14 @@ void UpdateFramePreview() {
                        L"选择一帧查看预览");
         return;
     }
-    const auto& frame = job->frames[static_cast<size_t>(selected)];
+    const std::wstring selectedKey = gFrameRows.Rows()[static_cast<size_t>(selected)].key;
+    auto selectedFrame = std::find_if(job->frames.begin(), job->frames.end(),
+        [&](const FrameTask& frame) {
+            return Utf8ToWide(frame.taskId.empty()
+                ? job->id + ":" + std::to_string(frame.frame) : frame.taskId) == selectedKey;
+        });
+    if (selectedFrame == job->frames.end()) return;
+    const auto& frame = *selectedFrame;
     if (frame.taskId == gPreviewTaskId && frame.output == gPreviewSource) return;
     StopPreviewGeneration();
     gPreviewSource.clear();
@@ -583,108 +932,210 @@ void ConnectManualPeer() {
     }
 }
 
+ui::VisualState TaskVisualState(TaskState state) {
+    switch (state) {
+        case TaskState::Completed: return ui::VisualState::Success;
+        case TaskState::Assigned:
+        case TaskState::Dispatching:
+        case TaskState::Rendering: return ui::VisualState::Active;
+        case TaskState::Pending: return ui::VisualState::Warning;
+        case TaskState::Failed: return ui::VisualState::Error;
+        case TaskState::Stopped: return ui::VisualState::Muted;
+    }
+    return ui::VisualState::Neutral;
+}
+
 void RefreshLists() {
     if (!gApp) return;
-    auto peers = gApp->Peers();
-    HardwareInfo hardware = gApp->Hardware();
-    Config config = gApp->GetConfig();
-    std::wstring manualStatus = gApp->ManualPeerStatus();
-    if (!manualStatus.empty()) SetText(ID_MANUAL_STATUS, manualStatus);
-    HWND nodes = Item(ID_NODES);
-    ListView_DeleteAllItems(nodes);
-    int row = 0;
-    SetCell(nodes, row, 0, Utf8ToWide(config.nodeName) + L"（本机）");
-    SetCell(nodes, row, 1, L"已信任");
-    SetCell(nodes, row, 2, config.shareEnabled
-        ? (IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)
-               ? L"空闲 · 可接单" : L"活跃 · 等待")
-        : L"未共享");
-    SetCell(nodes, row, 3, L"仅空闲");
-    SetCell(nodes, row, 4, std::to_wstring(gApp->AssignedCount()));
-    SetCell(nodes, row, 5, Utf8ToWide(hardware.cpuModel));
-    std::wstring localGpus;
-    for (const auto& gpu : hardware.gpuModels) {
-        if (!localGpus.empty()) localGpus += L" / ";
-        localGpus += Utf8ToWide(gpu);
-    }
-    SetCell(nodes, row, 6, localGpus.empty() ? L"未检测到" : localGpus);
-    SetCell(nodes, row, 7, LocalEndpointSummary(config.httpPort));
-    for (const auto& peer : peers) {
-        ++row;
-        SetCell(nodes, row, 0, Utf8ToWide(peer.name));
-        SetCell(nodes, row, 1, peer.trusted ? L"已信任" : L"邀请码不同");
-        SetCell(nodes, row, 2, peer.shareEnabled
-            ? (peer.assigned ? L"正在渲染" :
-                    L"已空闲 " + std::to_wstring(static_cast<int>(peer.idleSeconds)) + L" 秒")
-            : L"未共享");
-        SetCell(nodes, row, 3, L"仅空闲");
-        SetCell(nodes, row, 4, std::to_wstring(peer.assigned));
-        SetCell(nodes, row, 5, peer.cpuModel.empty() ? L"未报告" : Utf8ToWide(peer.cpuModel));
-        std::wstring remoteGpus;
-        for (const auto& gpu : peer.gpuModels) {
-            if (!remoteGpus.empty()) remoteGpus += L" / ";
-            remoteGpus += Utf8ToWide(gpu);
+    ++gRefreshCount;
+    const Config config = gApp->GetConfig();
+
+    if (gCurrentPage == 0) {
+        const auto peers = gApp->Peers();
+        const auto jobs = gApp->Jobs();
+        const HardwareInfo hardware = gApp->Hardware();
+        const int idleSeconds = static_cast<int>(IdleSeconds());
+        const int assigned = gApp->AssignedCount();
+        std::wstring manualStatus = gApp->ManualPeerStatus();
+        if (!manualStatus.empty()) SetText(ID_MANUAL_STATUS, manualStatus);
+
+        std::vector<ui::Row> nodeRows;
+        nodeRows.reserve(peers.size() + 1);
+        std::wstring localGpus;
+        for (const auto& gpu : hardware.gpuModels) {
+            if (!localGpus.empty()) localGpus += L" / ";
+            localGpus += Utf8ToWide(gpu);
         }
-        SetCell(nodes, row, 6, remoteGpus.empty() ? L"未报告" : remoteGpus);
-        SetCell(nodes, row, 7, Utf8ToWide(peer.address) + L":" + std::to_wstring(peer.httpPort));
+        const bool localIdle = IsComputerIdleForSharedWork(IdleSeconds(),
+                                                            config.idleAfterSeconds);
+        nodeRows.push_back({
+            Utf8ToWide("local:" + config.nodeId),
+            {
+                Utf8ToWide(config.nodeName) + L"（本机）",
+                L"已信任",
+                config.shareEnabled ? (localIdle ? L"空闲 · 可接单" : L"活跃 · 等待")
+                                    : L"未共享",
+                L"仅空闲",
+                std::to_wstring(assigned),
+                Utf8ToWide(hardware.cpuModel),
+                localGpus.empty() ? L"未检测到" : localGpus,
+                LocalEndpointSummary(config.httpPort),
+            },
+            config.shareEnabled
+                ? (localIdle ? ui::VisualState::Success : ui::VisualState::Warning)
+                : ui::VisualState::Muted,
+        });
+        for (const auto& peer : peers) {
+            std::wstring remoteGpus;
+            for (const auto& gpu : peer.gpuModels) {
+                if (!remoteGpus.empty()) remoteGpus += L" / ";
+                remoteGpus += Utf8ToWide(gpu);
+            }
+            nodeRows.push_back({
+                Utf8ToWide(peer.nodeId),
+                {
+                    Utf8ToWide(peer.name),
+                    peer.trusted ? L"已信任" : L"邀请码不同",
+                    peer.shareEnabled
+                        ? (peer.assigned ? L"正在渲染"
+                                         : L"已空闲 " +
+                                               std::to_wstring(static_cast<int>(peer.idleSeconds)) +
+                                               L" 秒")
+                        : L"未共享",
+                    L"仅空闲",
+                    std::to_wstring(peer.assigned),
+                    peer.cpuModel.empty() ? L"未报告" : Utf8ToWide(peer.cpuModel),
+                    remoteGpus.empty() ? L"未报告" : remoteGpus,
+                    Utf8ToWide(peer.address) + L":" + std::to_wstring(peer.httpPort),
+                },
+                !peer.trusted ? ui::VisualState::Error
+                    : peer.assigned ? ui::VisualState::Active
+                    : peer.shareEnabled ? ui::VisualState::Success
+                    : ui::VisualState::Muted,
+            });
+        }
+        SyncTable(Item(ID_NODES), gNodeRows, std::move(nodeRows));
+
+        DashboardView nextDashboard;
+        nextDashboard.onlineNodes = static_cast<int>(peers.size()) + 1;
+        nextDashboard.assignedFrames = assigned;
+        nextDashboard.idleSeconds = idleSeconds;
+        nextDashboard.blenderReady = !FindBlender(config).empty();
+        nextDashboard.sharing = config.shareEnabled;
+        for (const auto& job : jobs) {
+            bool jobActive = false;
+            for (const auto& frame : job.frames) {
+                ++nextDashboard.totalFrames;
+                nextDashboard.completedFrames += frame.state == TaskState::Completed;
+                jobActive = jobActive || frame.state == TaskState::Assigned ||
+                    frame.state == TaskState::Dispatching || frame.state == TaskState::Rendering;
+            }
+            nextDashboard.activeJobs += jobActive;
+        }
+        if (!(nextDashboard == gDashboardView)) {
+            gDashboardView = nextDashboard;
+            RECT client{};
+            GetClientRect(gWindow, &client);
+            RECT cards{236, 86, std::max(237L, client.right - 18), 176};
+            InvalidateRect(gWindow, &cards, FALSE);
+        }
+        SetText(ID_STATUS, std::wstring(config.pairingPending ? L"正在邀请码配对  ·  " : L"") +
+            L"本机空闲 " + std::to_wstring(idleSeconds) + L" 秒  ·  " +
+            (nextDashboard.blenderReady ? L"Blender 已就绪" : L"Blender 未检测到"));
+    } else if (gCurrentPage == 1) {
+        const auto values = gApp->Jobs();
+        std::vector<ui::Row> jobRows;
+        jobRows.reserve(values.size());
+        for (const auto& job : values) {
+            int completed = 0, failed = 0, stopped = 0, active = 0;
+            std::chrono::system_clock::time_point started{}, ended{};
+            for (const auto& frame : job.frames) {
+                completed += frame.state == TaskState::Completed;
+                failed += frame.state == TaskState::Failed;
+                stopped += frame.state == TaskState::Stopped;
+                active += frame.state == TaskState::Assigned ||
+                    frame.state == TaskState::Rendering || frame.state == TaskState::Dispatching;
+                if (frame.startedAt.time_since_epoch() !=
+                        std::chrono::system_clock::duration::zero() &&
+                    (started.time_since_epoch() ==
+                         std::chrono::system_clock::duration::zero() ||
+                     frame.startedAt < started))
+                    started = frame.startedAt;
+                if (frame.endedAt > ended) ended = frame.endedAt;
+            }
+            const TaskState aggregate = completed == static_cast<int>(job.frames.size())
+                ? TaskState::Completed : failed ? TaskState::Failed
+                : stopped ? TaskState::Stopped : active ? TaskState::Rendering
+                : TaskState::Pending;
+            const std::wstring state = aggregate == TaskState::Completed ? L"已完成"
+                : aggregate == TaskState::Failed ? L"有错误"
+                : aggregate == TaskState::Stopped ? L"已停止"
+                : aggregate == TaskState::Rendering ? L"渲染中" : L"待提交";
+            jobRows.push_back({
+                Utf8ToWide(job.id),
+                {
+                    Utf8ToWide(job.name), state,
+                    std::to_wstring(job.frames.size()),
+                    std::to_wstring(completed) + L" / " +
+                        std::to_wstring(job.frames.size()),
+                    FormatDuration(started,
+                        active ? std::chrono::system_clock::time_point{} : ended),
+                    FormatTime(started), active ? L"-" : FormatTime(ended),
+                },
+                TaskVisualState(aggregate),
+            });
+        }
+        SyncTable(Item(ID_JOBS), gJobRows, std::move(jobRows));
+    } else if (gCurrentPage == 2) {
+        const auto records = gApp->Contributions();
+        std::vector<ui::Row> contributionRows;
+        contributionRows.reserve(records.size());
+        for (auto record = records.rbegin(); record != records.rend(); ++record) {
+            const std::wstring state = record->state == "completed" ? L"已完成"
+                : record->state == "stopped" ? L"活跃后已停止"
+                : record->state == "partial" ? L"部分完成" : L"失败";
+            contributionRows.push_back({
+                Utf8ToWide(record->jobId + ":" + record->packageId),
+                {
+                    Utf8ToWide(record->jobName), Utf8ToWide(record->packageId),
+                    Utf8ToWide(record->originName), FrameNumbers(record->frames),
+                    FrameNumbers(record->completedFrames), state,
+                    FormatDuration(record->startedAt, record->endedAt),
+                    FormatTime(record->startedAt), FormatTime(record->endedAt),
+                    Utf8ToWide(record->error),
+                },
+                record->state == "completed" ? ui::VisualState::Success
+                    : record->state == "partial" ? ui::VisualState::Warning
+                    : record->state == "stopped" ? ui::VisualState::Muted
+                    : ui::VisualState::Error,
+            });
+        }
+        SyncTable(Item(ID_CONTRIBUTION_LIST), gContributionRows,
+                  std::move(contributionRows));
     }
 
-    HWND jobs = Item(ID_JOBS);
-    ListView_DeleteAllItems(jobs);
-    auto values = gApp->Jobs();
-    for (int index = 0; index < static_cast<int>(values.size()); ++index) {
-        const auto& job = values[static_cast<size_t>(index)];
-        int completed = 0, failed = 0, stopped = 0, active = 0;
-        std::chrono::system_clock::time_point started{}, ended{};
-        for (const auto& frame : job.frames) {
-            completed += frame.state == TaskState::Completed;
-            failed += frame.state == TaskState::Failed;
-            stopped += frame.state == TaskState::Stopped;
-            active += frame.state == TaskState::Assigned || frame.state == TaskState::Rendering ||
-                      frame.state == TaskState::Dispatching;
-            if (frame.startedAt.time_since_epoch() != std::chrono::system_clock::duration::zero() &&
-                (started.time_since_epoch() == std::chrono::system_clock::duration::zero() ||
-                 frame.startedAt < started))
-                started = frame.startedAt;
-            if (frame.endedAt > ended) ended = frame.endedAt;
-        }
-        std::wstring state = completed == static_cast<int>(job.frames.size()) ? L"已完成"
-            : failed ? L"有错误" : stopped ? L"已停止"
-            : active ? L"渲染中" : L"待提交";
-        SetCell(jobs, index, 0, Utf8ToWide(job.name));
-        SetCell(jobs, index, 1, state);
-        SetCell(jobs, index, 2, std::to_wstring(job.frames.size()));
-        SetCell(jobs, index, 3, std::to_wstring(completed) + L" / " +
-            std::to_wstring(job.frames.size()));
-        SetCell(jobs, index, 4, FormatDuration(started,
-            active ? std::chrono::system_clock::time_point{} : ended));
-        SetCell(jobs, index, 5, FormatTime(started));
-        SetCell(jobs, index, 6, active ? L"-" : FormatTime(ended));
+    if (gDetailWindow) RefreshJobDetail();
+    gLastRefresh = std::chrono::steady_clock::now();
+}
+
+void QueueModelRefresh() {
+    if (!gWindow || gRefreshQueued.exchange(true)) return;
+    if (!PostMessageW(gWindow, WM_RM_REFRESH, 0, 0)) gRefreshQueued = false;
+}
+
+void HandleQueuedRefresh() {
+    if (!gRefreshQueued.load()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - gLastRefresh;
+    if (gLastRefresh.time_since_epoch() != std::chrono::steady_clock::duration::zero() &&
+        elapsed < ui::MinimumRefreshInterval()) {
+        const auto remaining = ui::RefreshDelayFor(elapsed);
+        SetTimer(gWindow, TIMER_BURST_REFRESH,
+                 static_cast<UINT>(std::max<int64_t>(1, remaining.count())), nullptr);
+        return;
     }
-    HWND contributions = Item(ID_CONTRIBUTION_LIST);
-    ListView_DeleteAllItems(contributions);
-    auto records = gApp->Contributions();
-    for (int index = 0; index < static_cast<int>(records.size()); ++index) {
-        const auto& record = records[records.size() - 1 - static_cast<size_t>(index)];
-        std::wstring state = record.state == "completed" ? L"已完成"
-            : record.state == "stopped" ? L"活跃后已停止"
-            : record.state == "partial" ? L"部分完成" : L"失败";
-        SetCell(contributions, index, 0, Utf8ToWide(record.jobName));
-        SetCell(contributions, index, 1, Utf8ToWide(record.packageId));
-        SetCell(contributions, index, 2, Utf8ToWide(record.originName));
-        SetCell(contributions, index, 3, FrameNumbers(record.frames));
-        SetCell(contributions, index, 4, FrameNumbers(record.completedFrames));
-        SetCell(contributions, index, 5, state);
-        SetCell(contributions, index, 6, FormatDuration(record.startedAt, record.endedAt));
-        SetCell(contributions, index, 7, FormatTime(record.startedAt));
-        SetCell(contributions, index, 8, FormatTime(record.endedAt));
-        SetCell(contributions, index, 9, Utf8ToWide(record.error));
-    }
-    SetText(ID_STATUS, std::wstring(config.pairingPending ? L"正在邀请码配对    " : L"") +
-        L"在线电脑：" + std::to_wstring(peers.size() + 1) +
-        L"    已分配渲染：" + std::to_wstring(gApp->AssignedCount()) +
-        L"    Blender：" + (FindBlender(config).empty() ? L"未检测到" : L"已检测") +
-        L"    本机空闲：" + std::to_wstring(static_cast<int>(IdleSeconds())) + L" 秒");
+    gRefreshQueued = false;
+    RefreshLists();
 }
 
 void StartSubmission() {
@@ -731,7 +1182,7 @@ void StartSubmission() {
 
 void BuildUi() {
     for (auto& page : gPageControls) page.clear();
-    Label(L"RenderMesh", 24, 20, 180, 32, 0, gTitleFont);
+    Label(L"RenderMesh", 24, 20, 190, 32, 0, gTitleFont);
     Label(L"Blender 渲染网格", 26, 54, 170, 22);
     AddControl(L"BUTTON", L"共享本机算力", BS_OWNERDRAW,
                12, 88, 196, 76, ID_SHARE);
@@ -739,25 +1190,24 @@ void BuildUi() {
     AddControl(L"BUTTON", L"渲染任务", BS_OWNERDRAW, 18, 244, 184, 42, ID_NAV_TASKS);
     AddControl(L"BUTTON", L"本机贡献", BS_OWNERDRAW, 18, 292, 184, 42, ID_NAV_CONTRIBUTIONS);
     AddControl(L"BUTTON", L"设置", BS_OWNERDRAW, 18, 340, 184, 42, ID_NAV_SETTINGS);
-    Label(L"主色  #4D45E9", 28, 744, 165, 22);
+    Label(L"原生客户端  ·  本地优先", 28, 744, 165, 22);
 
     // 服务器页
     PageControl(0, Label(L"服务器", 248, 24, 250, 36, 0, gTitleFont));
-    PageControl(0, Label(L"", 250, 68, 980, 28, ID_STATUS));
-    PageControl(0, Label(L"手动连接", 250, 116, 80, 24));
+    PageControl(0, Label(L"", 250, 62, 980, 22, ID_STATUS));
+    PageControl(0, Label(L"手动连接", 250, 202, 80, 24));
     PageControl(0, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
-                              334, 112, 235, 28, ID_MANUAL_ENDPOINT));
+                              334, 198, 235, 28, ID_MANUAL_ENDPOINT));
     PageControl(0, AddControl(L"BUTTON", L"连接", BS_PUSHBUTTON,
-                              579, 111, 82, 30, ID_CONNECT_MANUAL));
+                              579, 197, 82, 30, ID_CONNECT_MANUAL));
     PageControl(0, Label(L"填写另一台电脑的局域网 IP:端口，不要填 127.0.0.1",
-                         680, 116, 550, 24, ID_MANUAL_STATUS));
+                         680, 202, 550, 24, ID_MANUAL_STATUS));
     HWND nodes = PageControl(0, AddControl(
         WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        250, 162, 990, 530, ID_NODES));
-    ListView_SetExtendedListViewStyle(nodes,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+        250, 238, 990, 454, ID_NODES));
+    ConfigureList(nodes);
     AddColumn(nodes, 0, 170, L"电脑"); AddColumn(nodes, 1, 85, L"连接");
-    AddColumn(nodes, 2, 140, L"算力状态"); AddColumn(nodes, 3, 85, L"调度策略");
+    AddColumn(nodes, 2, 170, L"算力状态"); AddColumn(nodes, 3, 85, L"调度策略");
     AddColumn(nodes, 4, 75, L"已分配"); AddColumn(nodes, 5, 220, L"CPU 型号");
     AddColumn(nodes, 6, 240, L"GPU 型号"); AddColumn(nodes, 7, 210, L"地址");
 
@@ -791,8 +1241,7 @@ void BuildUi() {
     HWND jobs = PageControl(1, AddControl(
         WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         250, 304, 976, 350, ID_JOBS));
-    ListView_SetExtendedListViewStyle(jobs,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    ConfigureList(jobs);
     AddColumn(jobs, 0, 210, L"任务"); AddColumn(jobs, 1, 95, L"状态");
     AddColumn(jobs, 2, 75, L"总帧数"); AddColumn(jobs, 3, 95, L"完成");
     AddColumn(jobs, 4, 100, L"渲染时长"); AddColumn(jobs, 5, 155, L"开始时间");
@@ -814,8 +1263,7 @@ void BuildUi() {
     HWND contributionList = PageControl(2, AddControl(
         WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         250, 112, 976, 580, ID_CONTRIBUTION_LIST));
-    ListView_SetExtendedListViewStyle(contributionList,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    ConfigureList(contributionList);
     AddColumn(contributionList, 0, 180, L"任务");
     AddColumn(contributionList, 1, 125, L"任务包");
     AddColumn(contributionList, 2, 150, L"来源电脑");
@@ -858,6 +1306,77 @@ void BuildUi() {
     ShowPage(gInitialPage);
 }
 
+void CaptureBaseLayout() {
+    RECT client{};
+    GetClientRect(gWindow, &client);
+    gLayoutBaseClient = {client.right, client.bottom};
+    gBaseControlRects.clear();
+    for (HWND control = GetWindow(gWindow, GW_CHILD); control;
+         control = GetWindow(control, GW_HWNDNEXT)) {
+        RECT rect{};
+        GetWindowRect(control, &rect);
+        MapWindowPoints(HWND_DESKTOP, gWindow, reinterpret_cast<POINT*>(&rect), 2);
+        gBaseControlRects.emplace(control, rect);
+    }
+}
+
+void LayoutUi() {
+    if (gBaseControlRects.empty() || gLayoutBaseClient.cx <= 0) return;
+    RECT client{};
+    GetClientRect(gWindow, &client);
+    constexpr int contentAnchor = 232;
+    constexpr int rightPadding = 18;
+    const int baseContent = std::max(1, static_cast<int>(
+        gLayoutBaseClient.cx - contentAnchor - rightPadding));
+    const int nextContent = std::max(1, static_cast<int>(
+        client.right - contentAnchor - rightPadding));
+    const double scale = static_cast<double>(nextContent) / baseContent;
+    const int heightDelta = client.bottom - gLayoutBaseClient.cy;
+    for (const auto& [control, base] : gBaseControlRects) {
+        if (!IsWindow(control)) continue;
+        RECT next = base;
+        if (base.left >= 220) {
+            next.left = contentAnchor + static_cast<int>((base.left - contentAnchor) * scale);
+            next.right = contentAnchor + static_cast<int>((base.right - contentAnchor) * scale);
+        }
+        const int height = base.bottom - base.top;
+        if (height >= 300) next.bottom += heightDelta;
+        else if (base.top >= 650) {
+            next.top += heightDelta;
+            next.bottom += heightDelta;
+        }
+        MoveWindow(control, next.left, next.top,
+                   std::max(24, static_cast<int>(next.right - next.left)),
+                   std::max(20, static_cast<int>(next.bottom - next.top)), FALSE);
+    }
+    InvalidateRect(gWindow, nullptr, FALSE);
+}
+
+void LayoutDetailWindow(HWND window) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int rightWidth = 330;
+    const int gap = 18;
+    const int margin = 22;
+    const int rightX = std::max(650, static_cast<int>(client.right - margin - rightWidth));
+    const int listWidth = std::max(560, rightX - margin - gap);
+    if (HWND summary = GetDlgItem(window, ID_DETAIL_SUMMARY))
+        MoveWindow(summary, margin, 18, client.right - margin * 2, 28, TRUE);
+    if (HWND frames = GetDlgItem(window, ID_DETAIL_FRAMES))
+        MoveWindow(frames, margin, 55, listWidth,
+                   std::max(360, static_cast<int>(client.bottom - 77)), TRUE);
+    if (HWND preview = GetDlgItem(window, ID_DETAIL_PREVIEW))
+        MoveWindow(preview, rightX, 55, rightWidth, 230, TRUE);
+    if (HWND status = GetDlgItem(window, ID_DETAIL_PREVIEW_STATUS))
+        MoveWindow(status, rightX, 289, rightWidth, 20, TRUE);
+    for (const auto& [id, y] : std::array<std::pair<int, int>, 3>{
+             std::pair{ID_DETAIL_OPEN_OUTPUT, 321},
+             std::pair{ID_DETAIL_OPEN_SOURCE, 365},
+             std::pair{ID_DETAIL_STOP, 421}})
+        if (HWND button = GetDlgItem(window, id))
+            MoveWindow(button, rightX, y, rightWidth, 34, TRUE);
+}
+
 void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     RECT rect = item.rcItem;
     int id = static_cast<int>(item.CtlID);
@@ -868,6 +1387,12 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     bool selected = navPage == gCurrentPage;
     bool pressed = (item.itemState & ODS_SELECTED) != 0;
     COLORREF surface = gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255);
+    COLORREF parentSurface = (share || navPage >= 0)
+        ? (gDarkTheme ? RGB(23, 24, 32) : RGB(252, 252, 254))
+        : (gDarkTheme ? RGB(15, 16, 22) : RGB(244, 245, 249));
+    HBRUSH parentBrush = CreateSolidBrush(parentSurface);
+    FillRect(item.hDC, &rect, parentBrush);
+    DeleteObject(parentBrush);
     COLORREF hover = gDarkTheme ? RGB(47, 46, 64) : RGB(235, 234, 255);
     COLORREF fill = primary || selected ? kAccent : pressed ? hover : surface;
     HBRUSH brush = CreateSolidBrush(fill);
@@ -887,8 +1412,8 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
         RECT label = rect;
         label.left += 14;
         label.right -= 72;
-        std::wstring shareText = config.shareEnabled ? L"共享本机算力\n已开启"
-                                                     : L"共享本机算力\n已关闭";
+        std::wstring shareText = config.shareEnabled ? L"共享算力\n已开启"
+                                                     : L"共享算力\n已关闭";
         DrawTextW(item.hDC, shareText.c_str(), -1, &label,
                   DT_LEFT | DT_VCENTER | DT_WORDBREAK);
         RECT track{rect.right - 62, rect.top + 25, rect.right - 14, rect.top + 51};
@@ -915,18 +1440,225 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     DrawTextW(item.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+const ui::StableTableModel* ModelForList(UINT_PTR id) {
+    switch (id) {
+        case ID_NODES: return &gNodeRows;
+        case ID_JOBS: return &gJobRows;
+        case ID_CONTRIBUTION_LIST: return &gContributionRows;
+        case ID_DETAIL_FRAMES: return &gFrameRows;
+        default: return nullptr;
+    }
+}
+
+bool IsKnownListHeader(HWND header) {
+    for (int id : {ID_NODES, ID_JOBS, ID_CONTRIBUTION_LIST, ID_DETAIL_FRAMES}) {
+        HWND list = id == ID_DETAIL_FRAMES && gDetailWindow
+            ? GetDlgItem(gDetailWindow, id) : GetDlgItem(gWindow, id);
+        if (list && ListView_GetHeader(list) == header) return true;
+    }
+    return false;
+}
+
+LRESULT HandleHeaderCustomDraw(NMCUSTOMDRAW* draw) {
+    if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+    const COLORREF fill = gDarkTheme ? RGB(38, 39, 50) : RGB(247, 248, 251);
+    const COLORREF stroke = gDarkTheme ? RGB(58, 59, 73) : RGB(222, 224, 232);
+    const COLORREF text = gDarkTheme ? RGB(205, 207, 220) : RGB(75, 77, 89);
+    HBRUSH brush = CreateSolidBrush(fill);
+    FillRect(draw->hdc, &draw->rc, brush);
+    DeleteObject(brush);
+    HPEN pen = CreatePen(PS_SOLID, 1, stroke);
+    HGDIOBJ oldPen = SelectObject(draw->hdc, pen);
+    MoveToEx(draw->hdc, draw->rc.left, draw->rc.bottom - 1, nullptr);
+    LineTo(draw->hdc, draw->rc.right, draw->rc.bottom - 1);
+    LineTo(draw->hdc, draw->rc.right, draw->rc.top);
+    SelectObject(draw->hdc, oldPen);
+    DeleteObject(pen);
+    wchar_t buffer[256]{};
+    HDITEMW item{};
+    item.mask = HDI_TEXT;
+    item.pszText = buffer;
+    item.cchTextMax = static_cast<int>(std::size(buffer));
+    Header_GetItem(draw->hdr.hwndFrom, static_cast<int>(draw->dwItemSpec), &item);
+    RECT textRect = draw->rc;
+    textRect.left += 9;
+    textRect.right -= 6;
+    SetBkMode(draw->hdc, TRANSPARENT);
+    SetTextColor(draw->hdc, text);
+    HGDIOBJ oldFont = SelectObject(draw->hdc, gFont);
+    DrawTextW(draw->hdc, buffer, -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(draw->hdc, oldFont);
+    return CDRF_SKIPDEFAULT;
+}
+
+int StatusColumnForList(UINT_PTR id) {
+    switch (id) {
+        case ID_NODES: return 2;
+        case ID_JOBS: return 1;
+        case ID_CONTRIBUTION_LIST: return 5;
+        case ID_DETAIL_FRAMES: return 1;
+        default: return -1;
+    }
+}
+
+COLORREF ListRowBackground(bool selected, size_t row) {
+    if (selected) return gDarkTheme ? RGB(64, 59, 132) : RGB(229, 226, 255);
+    if ((row & 1U) != 0) return gDarkTheme ? RGB(34, 35, 46) : RGB(249, 249, 252);
+    return gDarkTheme ? RGB(31, 32, 42) : RGB(255, 255, 255);
+}
+
+void VisualColors(ui::VisualState state, bool selected, COLORREF& fill, COLORREF& text) {
+    if (selected) {
+        fill = gDarkTheme ? RGB(89, 82, 171) : RGB(208, 203, 255);
+        text = gDarkTheme ? RGB(255, 255, 255) : RGB(47, 40, 128);
+        return;
+    }
+    switch (state) {
+        case ui::VisualState::Success:
+            fill = gDarkTheme ? RGB(27, 72, 59) : RGB(222, 247, 237);
+            text = gDarkTheme ? RGB(110, 231, 184) : RGB(0, 111, 76);
+            break;
+        case ui::VisualState::Active:
+            fill = gDarkTheme ? RGB(59, 54, 120) : RGB(235, 232, 255);
+            text = gDarkTheme ? RGB(188, 182, 255) : RGB(70, 60, 194);
+            break;
+        case ui::VisualState::Warning:
+            fill = gDarkTheme ? RGB(79, 62, 29) : RGB(255, 244, 214);
+            text = gDarkTheme ? RGB(245, 199, 100) : RGB(139, 91, 0);
+            break;
+        case ui::VisualState::Error:
+            fill = gDarkTheme ? RGB(82, 42, 48) : RGB(255, 231, 234);
+            text = gDarkTheme ? RGB(255, 158, 168) : RGB(177, 36, 55);
+            break;
+        default:
+            fill = gDarkTheme ? RGB(55, 56, 69) : RGB(236, 237, 242);
+            text = gDarkTheme ? RGB(190, 192, 207) : RGB(92, 94, 108);
+            break;
+    }
+}
+
+void DrawStatusPill(const NMLVCUSTOMDRAW& draw, const ui::Row& row, int column,
+                    bool selected) {
+    RECT cell{};
+    ListView_GetSubItemRect(draw.nmcd.hdr.hwndFrom, static_cast<int>(draw.nmcd.dwItemSpec),
+                            column, LVIR_BOUNDS, &cell);
+    const COLORREF background = ListRowBackground(
+        selected, static_cast<size_t>(draw.nmcd.dwItemSpec));
+    HBRUSH backgroundBrush = CreateSolidBrush(background);
+    FillRect(draw.nmcd.hdc, &cell, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    std::wstring value = column < static_cast<int>(row.cells.size())
+        ? row.cells[static_cast<size_t>(column)] : L"";
+    HGDIOBJ oldFont = SelectObject(draw.nmcd.hdc, gFont);
+    SIZE measured{};
+    GetTextExtentPoint32W(draw.nmcd.hdc, value.c_str(), static_cast<int>(value.size()),
+                          &measured);
+    const int width = std::min(
+        static_cast<int>(cell.right - cell.left - 14),
+        std::max(56, static_cast<int>(measured.cx + 20)));
+    RECT pill{cell.left + 8, cell.top + 7, cell.left + 8 + width, cell.bottom - 7};
+    COLORREF fill{}, text{};
+    VisualColors(row.visualState, selected, fill, text);
+    HBRUSH fillBrush = CreateSolidBrush(fill);
+    HGDIOBJ oldBrush = SelectObject(draw.nmcd.hdc, fillBrush);
+    HGDIOBJ oldPen = SelectObject(draw.nmcd.hdc, GetStockObject(NULL_PEN));
+    RoundRect(draw.nmcd.hdc, pill.left, pill.top, pill.right, pill.bottom, 16, 16);
+    SelectObject(draw.nmcd.hdc, oldBrush);
+    SelectObject(draw.nmcd.hdc, oldPen);
+    DeleteObject(fillBrush);
+    SetBkMode(draw.nmcd.hdc, TRANSPARENT);
+    SetTextColor(draw.nmcd.hdc, text);
+    DrawTextW(draw.nmcd.hdc, value.c_str(), -1, &pill,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(draw.nmcd.hdc, oldFont);
+}
+
+void DrawProgressCell(const NMLVCUSTOMDRAW& draw, const ui::Row& row, bool selected) {
+    RECT cell{};
+    ListView_GetSubItemRect(draw.nmcd.hdr.hwndFrom, static_cast<int>(draw.nmcd.dwItemSpec),
+                            3, LVIR_BOUNDS, &cell);
+    const COLORREF background = ListRowBackground(
+        selected, static_cast<size_t>(draw.nmcd.dwItemSpec));
+    HBRUSH backgroundBrush = CreateSolidBrush(background);
+    FillRect(draw.nmcd.hdc, &cell, backgroundBrush);
+    DeleteObject(backgroundBrush);
+    int completed = 0, total = 0;
+    const std::wstring value = row.cells.size() > 3 ? row.cells[3] : L"0 / 0";
+    swscanf_s(value.c_str(), L"%d / %d", &completed, &total);
+    RECT track{cell.left + 8, cell.top + 14, cell.right - 8, cell.bottom - 14};
+    HBRUSH trackBrush = CreateSolidBrush(gDarkTheme ? RGB(55, 56, 69) : RGB(230, 231, 237));
+    FillRect(draw.nmcd.hdc, &track, trackBrush);
+    DeleteObject(trackBrush);
+    if (total > 0 && completed > 0) {
+        RECT progress = track;
+        progress.right = progress.left + MulDiv(track.right - track.left, completed, total);
+        HBRUSH progressBrush = CreateSolidBrush(selected && gDarkTheme
+            ? RGB(202, 198, 255) : kAccent);
+        FillRect(draw.nmcd.hdc, &progress, progressBrush);
+        DeleteObject(progressBrush);
+    }
+    SetBkMode(draw.nmcd.hdc, TRANSPARENT);
+    SetTextColor(draw.nmcd.hdc, selected && gDarkTheme ? RGB(255, 255, 255)
+        : gDarkTheme ? RGB(238, 239, 246) : RGB(40, 41, 49));
+    HGDIOBJ oldFont = SelectObject(draw.nmcd.hdc, gFont);
+    DrawTextW(draw.nmcd.hdc, value.c_str(), -1, &cell,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(draw.nmcd.hdc, oldFont);
+}
+
+LRESULT HandleListCustomDraw(NMLVCUSTOMDRAW* draw) {
+    const ui::StableTableModel* model = ModelForList(draw->nmcd.hdr.idFrom);
+    if (!model) {
+        if (IsKnownListHeader(draw->nmcd.hdr.hwndFrom))
+            return HandleHeaderCustomDraw(&draw->nmcd);
+        return CDRF_DODEFAULT;
+    }
+    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+        const bool selected = (ListView_GetItemState(
+            draw->nmcd.hdr.hwndFrom, static_cast<int>(draw->nmcd.dwItemSpec),
+            LVIS_SELECTED) & LVIS_SELECTED) != 0;
+        draw->clrTextBk = ListRowBackground(
+            selected, static_cast<size_t>(draw->nmcd.dwItemSpec));
+        draw->clrText = selected && gDarkTheme ? RGB(255, 255, 255)
+            : gDarkTheme ? RGB(235, 236, 243) : RGB(39, 40, 48);
+        return CDRF_NOTIFYSUBITEMDRAW;
+    }
+    if (draw->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
+        const size_t index = static_cast<size_t>(draw->nmcd.dwItemSpec);
+        if (index >= model->Rows().size()) return CDRF_DODEFAULT;
+        const bool selected = (ListView_GetItemState(
+            draw->nmcd.hdr.hwndFrom, static_cast<int>(draw->nmcd.dwItemSpec),
+            LVIS_SELECTED) & LVIS_SELECTED) != 0;
+        const int statusColumn = StatusColumnForList(draw->nmcd.hdr.idFrom);
+        if (draw->iSubItem == statusColumn) {
+            DrawStatusPill(*draw, model->Rows()[index], statusColumn, selected);
+            return CDRF_SKIPDEFAULT;
+        }
+        if (draw->nmcd.hdr.idFrom == ID_JOBS && draw->iSubItem == 3) {
+            DrawProgressCell(*draw, model->Rows()[index], selected);
+            return CDRF_SKIPDEFAULT;
+        }
+    }
+    return CDRF_DODEFAULT;
+}
+
 void WriteUiMetricsReport() {
     if (gUiMetricsReport.empty()) return;
     HWND jobs = Item(ID_JOBS);
     HWND share = Item(ID_SHARE);
+    const int jobsVisibleRows = ListView_GetCountPerPage(jobs);
     RECT shareRect{};
     GetClientRect(share, &shareRect);
     RECT label = shareRect;
     label.left += 14;
     label.right -= 72;
     Config config = gApp->GetConfig();
-    std::wstring shareText = config.shareEnabled ? L"共享本机算力\n已开启"
-                                                 : L"共享本机算力\n已关闭";
+    std::wstring shareText = config.shareEnabled ? L"共享算力\n已开启"
+                                                 : L"共享算力\n已关闭";
     HDC dc = GetDC(share);
     HGDIOBJ oldFont = SelectObject(dc, gFont);
     RECT measured{0, 0, label.right - label.left, 0};
@@ -934,14 +1666,120 @@ void WriteUiMetricsReport() {
               DT_LEFT | DT_WORDBREAK | DT_CALCRECT);
     SelectObject(dc, oldFont);
     ReleaseDC(share, dc);
+    const uint64_t mutationCountBeforeNoOp = gListMutationCount;
+    const bool noOpReportedMutation = SyncTable(Item(ID_NODES), gNodeRows, gNodeRows.Rows());
+    const uint64_t stableSnapshotMutationDelta =
+        gListMutationCount - mutationCountBeforeNoOp;
+    bool scrollAnchorPreserved = true;
+    bool selectionPreserved = true;
+    bool focusPreserved = true;
+    bool horizontalScrollPreserved = true;
+    bool horizontalScrollWasNonzero = true;
+    bool topPixelOffsetPreserved = true;
+    bool controlOrderMatchesModel = true;
+    bool structuralUpdateApplied = true;
+    uint64_t incrementalMutationDelta = 0;
+    if (gUiTestRows > 0) {
+        std::vector<ui::Row> syntheticRows;
+        syntheticRows.reserve(static_cast<size_t>(gUiTestRows));
+        for (int index = 0; index < gUiTestRows; ++index) {
+            syntheticRows.push_back({
+                L"synthetic-job-" + std::to_wstring(index),
+                {L"性能测试 " + std::to_wstring(index), L"待提交", L"100", L"0 / 100",
+                 L"-", L"-", L"-"},
+                ui::VisualState::Warning,
+            });
+        }
+        SyncTable(jobs, gJobRows, syntheticRows);
+        const int anchorTarget = std::min(50, gUiTestRows - 1);
+        ListView_EnsureVisible(jobs, anchorTarget, FALSE);
+        const int topBefore = ListView_GetTopIndex(jobs);
+        const int selectedBefore = std::min(gUiTestRows - 1, topBefore + 2);
+        ListView_SetItemState(jobs, selectedBefore, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+        RECT topRectBefore{};
+        ListView_GetItemRect(jobs, topBefore, &topRectBefore, LVIR_BOUNDS);
+        ListView_SetColumnWidth(jobs, 6, 600);
+        ListView_Scroll(jobs, 120, 0);
+        const int horizontalBefore = GetScrollPos(jobs, SB_HORZ);
+        horizontalScrollWasNonzero = horizontalBefore > 0;
+        const std::wstring topKeyBefore = gJobRows.Rows()[static_cast<size_t>(topBefore)].key;
+        const std::wstring selectedKeyBefore =
+            gJobRows.Rows()[static_cast<size_t>(selectedBefore)].key;
+        auto changedRows = syntheticRows;
+        const int changedIndex = std::min(gUiTestRows - 1, topBefore + 5);
+        changedRows[static_cast<size_t>(changedIndex)].cells[1] = L"渲染中";
+        changedRows[static_cast<size_t>(changedIndex)].visualState =
+            ui::VisualState::Active;
+        const uint64_t beforeIncrementalUpdate = gListMutationCount;
+        SyncTable(jobs, gJobRows, changedRows);
+        incrementalMutationDelta = gListMutationCount - beforeIncrementalUpdate;
+
+        auto structuralRows = changedRows;
+        structuralRows.insert(structuralRows.begin(), {
+            L"synthetic-job-new",
+            {L"新到任务", L"待提交", L"1", L"0 / 1", L"-", L"-", L"-"},
+            ui::VisualState::Warning,
+        });
+        if (structuralRows.size() > 10)
+            std::swap(structuralRows[8], structuralRows[9]);
+        if (structuralRows.size() > 2) structuralRows.pop_back();
+        const uint64_t beforeStructuralUpdate = gListMutationCount;
+        SyncTable(jobs, gJobRows, std::move(structuralRows));
+        const uint64_t structuralMutationDelta =
+            gListMutationCount - beforeStructuralUpdate;
+        const int topAfter = ListView_GetTopIndex(jobs);
+        const int selectedAfter = ListView_GetNextItem(jobs, -1, LVNI_SELECTED);
+        const int focusedAfter = ListView_GetNextItem(jobs, -1, LVNI_FOCUSED);
+        RECT topRectAfter{};
+        ListView_GetItemRect(jobs, topAfter, &topRectAfter, LVIR_BOUNDS);
+        scrollAnchorPreserved = topAfter >= 0 &&
+            gJobRows.Rows()[static_cast<size_t>(topAfter)].key == topKeyBefore;
+        selectionPreserved = selectedAfter >= 0 &&
+            gJobRows.Rows()[static_cast<size_t>(selectedAfter)].key == selectedKeyBefore;
+        focusPreserved = focusedAfter >= 0 &&
+            gJobRows.Rows()[static_cast<size_t>(focusedAfter)].key == selectedKeyBefore;
+        horizontalScrollPreserved = GetScrollPos(jobs, SB_HORZ) == horizontalBefore;
+        topPixelOffsetPreserved = topRectAfter.top == topRectBefore.top;
+        controlOrderMatchesModel =
+            ListView_GetItemCount(jobs) == static_cast<int>(gJobRows.Rows().size());
+        wchar_t controlText[512]{};
+        for (int row = 0; controlOrderMatchesModel &&
+             row < ListView_GetItemCount(jobs); ++row) {
+            ListView_GetItemText(jobs, row, 0, controlText,
+                                 static_cast<int>(std::size(controlText)));
+            controlOrderMatchesModel =
+                gJobRows.Rows()[static_cast<size_t>(row)].cells[0] == controlText;
+        }
+        structuralUpdateApplied = structuralMutationDelta >= 2;
+        ListView_SetColumnWidth(jobs, 6, 155);
+    }
     json metrics = {
-        {"jobs_visible_rows", ListView_GetCountPerPage(jobs)},
+        {"jobs_visible_rows", jobsVisibleRows},
         {"share_text_width", measured.right - measured.left},
         {"share_text_height", measured.bottom - measured.top},
         {"share_label_width", label.right - label.left},
         {"share_label_height", label.bottom - label.top},
         {"share_text_fits", measured.right - measured.left <= label.right - label.left &&
-                            measured.bottom - measured.top <= label.bottom - label.top},
+                             measured.bottom - measured.top <= label.bottom - label.top},
+        {"stable_snapshot_mutated", noOpReportedMutation},
+        {"stable_snapshot_mutation_delta", stableSnapshotMutationDelta},
+        {"refresh_count", gRefreshCount},
+        {"list_mutation_count", gListMutationCount},
+        {"idle_heartbeat_interval_ms", IDLE_HEARTBEAT_INTERVAL_MS},
+        {"burst_refresh_min_interval_ms", ui::MinimumRefreshInterval().count()},
+        {"ui_test_burst_notifications", UI_TEST_BURST_NOTIFICATIONS},
+        {"observed_burst_refreshes", gBurstTimerRefreshCount},
+        {"observed_heartbeat_refreshes", gHeartbeatTimerRefreshCount},
+        {"scroll_anchor_preserved", scrollAnchorPreserved},
+        {"selection_preserved", selectionPreserved},
+        {"focus_preserved", focusPreserved},
+        {"horizontal_scroll_preserved", horizontalScrollPreserved},
+        {"horizontal_scroll_was_nonzero", horizontalScrollWasNonzero},
+        {"top_pixel_offset_preserved", topPixelOffsetPreserved},
+        {"control_order_matches_model", controlOrderMatchesModel},
+        {"incremental_mutation_delta", incrementalMutationDelta},
+        {"structural_update_applied", structuralUpdateApplied},
     };
     std::error_code ignored;
     fs::create_directories(gUiMetricsReport.parent_path(), ignored);
@@ -957,13 +1795,12 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 22, 18, 1130, 28, window,
                 reinterpret_cast<HMENU>(ID_DETAIL_SUMMARY), GetModuleHandleW(nullptr), nullptr);
             SendMessageW(summary, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
-            HWND frames = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            HWND frames = CreateWindowExW(0, WC_LISTVIEWW, L"",
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 22, 55, 805, 520, window,
                 reinterpret_cast<HMENU>(ID_DETAIL_FRAMES), GetModuleHandleW(nullptr), nullptr);
             SendMessageW(frames, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
-            ListView_SetExtendedListViewStyle(frames,
-                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+            ConfigureList(frames);
             AddColumn(frames, 0, 55, L"帧");
             AddColumn(frames, 1, 82, L"状态");
             AddColumn(frames, 2, 135, L"渲染电脑");
@@ -992,15 +1829,23 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             button(L"在资源管理器中显示选中帧", 321, ID_DETAIL_OPEN_OUTPUT);
             button(L"在资源管理器中显示源 .blend", 365, ID_DETAIL_OPEN_SOURCE);
             button(L"停止本任务", 421, ID_DETAIL_STOP);
-            SetTimer(window, 2, 1000, nullptr);
+            LayoutDetailWindow(window);
             RefreshJobDetail(false);
             return 0;
         }
-        case WM_TIMER:
-            RefreshJobDetail();
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED) return 0;
+            LayoutDetailWindow(window);
             return 0;
+        case WM_GETMINMAXINFO: {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            limits->ptMinTrackSize = {1000, 600};
+            return 0;
+        }
         case WM_NOTIFY: {
             auto* header = reinterpret_cast<NMHDR*>(lParam);
+            if (header->code == NM_CUSTOMDRAW)
+                return HandleListCustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
             if (!gRefreshingJobDetail && header->idFrom == ID_DETAIL_FRAMES &&
                 header->code == LVN_ITEMCHANGED)
                 UpdateFramePreview();
@@ -1029,8 +1874,16 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 if (auto job = FindJob(gDetailJobId)) {
                     int selected = ListView_GetNextItem(
                         GetDlgItem(window, ID_DETAIL_FRAMES), -1, LVNI_SELECTED);
-                    if (selected >= 0 && selected < static_cast<int>(job->frames.size()))
-                        ShowInExplorer(job->frames[static_cast<size_t>(selected)].output);
+                    if (selected >= 0 && selected < static_cast<int>(gFrameRows.Rows().size())) {
+                        const auto& key = gFrameRows.Rows()[static_cast<size_t>(selected)].key;
+                        auto frame = std::find_if(job->frames.begin(), job->frames.end(),
+                            [&](const FrameTask& value) {
+                                return Utf8ToWide(value.taskId.empty()
+                                    ? job->id + ":" + std::to_string(value.frame)
+                                    : value.taskId) == key;
+                            });
+                        if (frame != job->frames.end()) ShowInExplorer(frame->output);
+                    }
                 }
             } else if (LOWORD(wParam) == ID_DETAIL_STOP) {
                 std::wstring error;
@@ -1043,13 +1896,13 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             DestroyWindow(window);
             return 0;
         case WM_DESTROY:
-            KillTimer(window, 2);
             StopPreviewGeneration();
             gPreviewSource.clear();
             gPreviewTaskId.clear();
             ReplacePreviewBitmap(nullptr);
             gDetailWindow = nullptr;
             gDetailJobId.clear();
+            gFrameRows = ui::StableTableModel{};
             return 0;
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wParam);
@@ -1071,12 +1924,11 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
 void OpenSelectedJobDetail() {
     HWND jobs = Item(ID_JOBS);
     int selected = ListView_GetNextItem(jobs, -1, LVNI_SELECTED);
-    auto values = gApp->Jobs();
-    if (selected < 0 || selected >= static_cast<int>(values.size())) {
+    if (selected < 0 || selected >= static_cast<int>(gJobRows.Rows().size())) {
         MessageBoxW(gWindow, L"请先选择一个渲染任务。", L"RenderMesh", MB_ICONINFORMATION);
         return;
     }
-    gDetailJobId = values[static_cast<size_t>(selected)].id;
+    gDetailJobId = WideToUtf8(gJobRows.Rows()[static_cast<size_t>(selected)].key);
     if (gDetailWindow) {
         ShowWindow(gDetailWindow, SW_RESTORE);
         SetForegroundWindow(gDetailWindow);
@@ -1098,19 +1950,38 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case WM_CREATE:
             gWindow = window;
             BuildUi();
+            CaptureBaseLayout();
+            LayoutUi();
             LoadConfigIntoUi();
             ApplyTheme();
-            SetTimer(window, 1, 1000, nullptr);
+            SetTimer(window, TIMER_HEARTBEAT, IDLE_HEARTBEAT_INTERVAL_MS, nullptr);
             RefreshLists();
             if (!gUiMetricsReport.empty()) {
-                WriteUiMetricsReport();
-                PostMessageW(window, WM_CLOSE, 0, 0);
+                for (int index = 0; index < UI_TEST_BURST_NOTIFICATIONS; ++index)
+                    QueueModelRefresh();
+                SetTimer(window, TIMER_UI_TEST_REPORT, 1200, nullptr);
             }
             if (gOpenInitialDetail && ListView_GetItemCount(Item(ID_JOBS)) > 0) {
                 ListView_SetItemState(Item(ID_JOBS), 0, LVIS_SELECTED | LVIS_FOCUSED,
                                       LVIS_SELECTED | LVIS_FOCUSED);
                 OpenSelectedJobDetail();
             }
+            return 0;
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED) return 0;
+            if (gRenderTarget)
+                gRenderTarget->Resize(D2D1::SizeU(
+                    static_cast<UINT>(std::max(1, static_cast<int>(LOWORD(lParam)))),
+                    static_cast<UINT>(std::max(1, static_cast<int>(HIWORD(lParam))))));
+            LayoutUi();
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            limits->ptMinTrackSize = {1120, 720};
+            return 0;
+        }
+        case WM_PAINT:
+            PaintChrome(window);
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
@@ -1125,10 +1996,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     RefreshLists();
                     break;
                 }
-                case ID_NAV_DASHBOARD: ShowPage(0); break;
-                case ID_NAV_TASKS: ShowPage(1); break;
-                case ID_NAV_CONTRIBUTIONS: ShowPage(2); break;
-                case ID_NAV_SETTINGS: ShowPage(3); break;
+                case ID_NAV_DASHBOARD: ShowPage(0); RefreshLists(); break;
+                case ID_NAV_TASKS: ShowPage(1); RefreshLists(); break;
+                case ID_NAV_CONTRIBUTIONS: ShowPage(2); RefreshLists(); break;
+                case ID_NAV_SETTINGS: ShowPage(3); RefreshLists(); break;
                 case ID_BROWSE_BLENDER: {
                     auto path = ChooseFile(L"Blender 程序\0blender.exe\0所有程序\0*.exe\0\0",
                                            L"选择 blender.exe");
@@ -1170,13 +2041,30 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return TRUE;
         case WM_NOTIFY: {
             auto* header = reinterpret_cast<NMHDR*>(lParam);
+            if (header->code == NM_CUSTOMDRAW)
+                return HandleListCustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
             if (header->idFrom == ID_JOBS && header->code == NM_DBLCLK)
                 OpenSelectedJobDetail();
             return 0;
         }
         case WM_TIMER:
+            if (wParam == TIMER_HEARTBEAT) {
+                if (gRefreshQueued.exchange(false)) KillTimer(window, TIMER_BURST_REFRESH);
+                ++gHeartbeatTimerRefreshCount;
+                RefreshLists();
+            } else if (wParam == TIMER_BURST_REFRESH) {
+                KillTimer(window, TIMER_BURST_REFRESH);
+                gRefreshQueued = false;
+                ++gBurstTimerRefreshCount;
+                RefreshLists();
+            } else if (wParam == TIMER_UI_TEST_REPORT) {
+                KillTimer(window, TIMER_UI_TEST_REPORT);
+                WriteUiMetricsReport();
+                PostMessageW(window, WM_CLOSE, 0, 0);
+            }
+            return 0;
         case WM_RM_REFRESH:
-            RefreshLists();
+            HandleQueuedRefresh();
             return 0;
         case WM_RM_PREFLIGHT: {
             std::unique_ptr<std::wstring> result(reinterpret_cast<std::wstring*>(lParam));
@@ -1201,7 +2089,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             if (gApp && gApp->GetConfig().theme == "system") ApplyTheme();
             return 0;
         case WM_DESTROY:
-            KillTimer(window, 1);
+            KillTimer(window, TIMER_HEARTBEAT);
+            KillTimer(window, TIMER_BURST_REFRESH);
+            KillTimer(window, TIMER_UI_TEST_REPORT);
+            gWindow = nullptr;
             PostQuitMessage(0);
             return 0;
         case WM_CTLCOLORSTATIC: {
@@ -1217,20 +2108,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             SetBkColor(dc, gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255));
             return reinterpret_cast<LRESULT>(gSurfaceBrush);
         }
-        case WM_ERASEBKGND: {
-            RECT client{};
-            GetClientRect(window, &client);
-            FillRect(reinterpret_cast<HDC>(wParam), &client, gBackgroundBrush
-                ? gBackgroundBrush : reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
-            HPEN pen = CreatePen(PS_SOLID, 1,
-                gDarkTheme ? RGB(50, 50, 62) : RGB(224, 225, 232));
-            HGDIOBJ old = SelectObject(reinterpret_cast<HDC>(wParam), pen);
-            MoveToEx(reinterpret_cast<HDC>(wParam), 220, 0, nullptr);
-            LineTo(reinterpret_cast<HDC>(wParam), 220, client.bottom);
-            SelectObject(reinterpret_cast<HDC>(wParam), old);
-            DeleteObject(pen);
+        case WM_ERASEBKGND:
             return TRUE;
-        }
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -1285,6 +2164,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--detail") gOpenInitialDetail = true;
         else if (arg == L"--ui-metrics-report" && i + 1 < argumentCount)
             gUiMetricsReport = arguments[++i];
+        else if (arg == L"--ui-test-rows" && i + 1 < argumentCount)
+            gUiTestRows = std::clamp(_wtoi(arguments[++i]), 0, 10000);
     }
     LocalFree(arguments);
     InitializeLogging(dataDir);
@@ -1444,10 +2325,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
 
     gFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
     gTitleFont = CreateFontW(-28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
@@ -1462,10 +2343,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     RegisterClassW(&detailClass);
     gWindow = CreateWindowExW(
         0, windowClass.lpszClassName, L"RenderMesh · Blender 分布式渲染农场",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1280, 820, nullptr, nullptr, instance, nullptr);
     gApp->SetChangedCallback([] {
-        if (gWindow) PostMessageW(gWindow, WM_RM_REFRESH, 0, 0);
+        QueueModelRefresh();
     });
     ShowWindow(gWindow, show);
     UpdateWindow(gWindow);
@@ -1478,6 +2360,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     StopPreviewGeneration();
     gApp->Stop();
     if (gPreflight.joinable()) gPreflight.join();
+    ReleaseGraphics();
+    if (gRowHeightImages) ImageList_Destroy(gRowHeightImages);
     DeleteObject(gFont);
     DeleteObject(gTitleFont);
     if (gBackgroundBrush) DeleteObject(gBackgroundBrush);

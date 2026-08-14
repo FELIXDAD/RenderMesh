@@ -1,0 +1,56 @@
+#pragma once
+
+#include <chrono>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace rm::ui {
+
+enum class VisualState { Neutral, Success, Active, Warning, Error, Muted };
+
+constexpr std::chrono::milliseconds MinimumRefreshInterval() {
+    return std::chrono::milliseconds(16);
+}
+
+inline std::chrono::milliseconds RefreshDelayFor(
+    std::chrono::steady_clock::duration elapsed) {
+    const auto minimum = MinimumRefreshInterval();
+    if (elapsed >= minimum) return std::chrono::milliseconds::zero();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(minimum - elapsed);
+}
+
+struct Row {
+    std::wstring key;
+    std::vector<std::wstring> cells;
+    VisualState visualState = VisualState::Neutral;
+
+    bool operator==(const Row&) const = default;
+};
+
+struct CellChange {
+    size_t column = 0;
+    std::wstring value;
+};
+
+enum class OperationType { Insert, Erase, Move, Update };
+
+struct Operation {
+    OperationType type = OperationType::Update;
+    size_t index = 0;
+    size_t fromIndex = 0;
+    Row row;
+    std::vector<CellChange> cells;
+};
+
+class StableTableModel {
+public:
+    std::vector<Operation> Reconcile(std::vector<Row> next);
+    const std::vector<Row>& Rows() const { return rows_; }
+    std::optional<size_t> IndexOf(const std::wstring& key) const;
+
+private:
+    std::vector<Row> rows_;
+};
+
+}  // namespace rm::ui
