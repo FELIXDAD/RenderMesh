@@ -354,6 +354,18 @@ std::string DiscoverySignature(const Config& config, const json& message) {
     return HmacSha256(config.clusterToken, signedValue);
 }
 
+std::string ActivitySnapshotProof(
+    const Config& config, const std::string& challenge,
+    const std::string& nodeId, const WorkerActivity& activity) {
+    return HmacSha256(
+        config.clusterToken,
+        "activity-proof|" + nodeId + "|" + challenge + "|" +
+            HeaderDisplayText(activity.jobName, 128) + "|" +
+            json(activity.frames).dump() + "|" +
+            std::to_string(activity.completedFrames) + "|" +
+            (activity.rendering ? "1" : "0"));
+}
+
 struct LocalIPv4Interface {
     std::string address;
     std::optional<std::string> broadcast;
@@ -1131,11 +1143,10 @@ struct NodeApp::Impl {
         server.set_payload_max_length(100ull * 1024 * 1024 * 1024);
         server.set_read_timeout(5, 0);
         server.set_write_timeout(5, 0);
-        server.Get("/health", [&](const httplib::Request&, httplib::Response& response) {
+        server.Get("/health", [&](const httplib::Request& request, httplib::Response& response) {
             Config config = owner->GetConfig();
             WorkerActivity activity = CurrentActivity();
-            response.set_content(
-                json{{"status", "ok"}, {"protocol", 7}, {"project_cache", true},
+            json snapshot{{"status", "ok"}, {"protocol", 7}, {"project_cache", true},
                      {"frame_packages", true}, {"result_bundles", true},
                      {"package_cancel", true},
                      {"node_id", config.nodeId},
@@ -1148,9 +1159,15 @@ struct NodeApp::Impl {
                      {"activity_frames", activity.frames},
                      {"activity_completed", activity.completedFrames},
                      {"activity_rendering", activity.rendering},
-                     {"idle", static_cast<int>(IdleSeconds())}}
-                    .dump(),
-                "application/json");
+                     {"idle", static_cast<int>(IdleSeconds())}};
+            std::string challenge = request.has_param("challenge")
+                ? request.get_param_value("challenge") : "";
+            if (SafeId(challenge) && challenge.size() >= 16 &&
+                !config.pairingPending && config.clusterToken.size() >= 16) {
+                snapshot["activity_proof"] = ActivitySnapshotProof(
+                    config, challenge, config.nodeId, activity);
+            }
+            response.set_content(snapshot.dump(), "application/json");
         });
         server.Post("/v2/pair", [&](const httplib::Request& request,
                                       httplib::Response& response) {
@@ -1964,6 +1981,31 @@ struct NodeApp::Impl {
             config = owner->GetConfig();
         }
         std::string challenge = NewRandomHex(16);
+        healthResponse = client.Get("/health?challenge=" + challenge);
+        if (!healthResponse || healthResponse->status != 200) {
+            result = L"目标未能返回经过验证的节点状态";
+            return false;
+        }
+        health = json::parse(healthResponse->body, nullptr, false);
+        if (health.is_discarded() || !health.is_object() ||
+            health.value("node_id", "") != nodeId) {
+            result = L"目标返回了无法识别的 RenderMesh 节点信息";
+            return false;
+        }
+        WorkerActivity signedActivity;
+        signedActivity.jobName = HeaderDisplayText(health.value("activity_job", ""), 128);
+        signedActivity.frames = health.value("activity_frames", std::vector<int>{});
+        if (signedActivity.frames.size() > 5) signedActivity.frames.resize(5);
+        signedActivity.completedFrames = std::min(
+            health.value("activity_completed", size_t{0}), signedActivity.frames.size());
+        signedActivity.rendering = health.value("activity_rendering", false);
+        std::string expectedActivityProof = ActivitySnapshotProof(
+            config, challenge, nodeId, signedActivity);
+        if (!ConstantTimeEqual(
+                health.value("activity_proof", ""), expectedActivityProof)) {
+            result = L"连接被拒绝：节点活动状态未通过邀请码验证";
+            return false;
+        }
         auto proofResponse = client.Get("/v1/prove?challenge=" + challenge);
         if (!proofResponse || proofResponse->status != 200) {
             result = L"目标未能完成邀请码验证";
@@ -1995,12 +2037,7 @@ struct NodeApp::Impl {
         peer.gpuModels = health.value("gpu_models", std::vector<std::string>{});
         peer.currentTaskKnown = health.contains("task_id");
         peer.currentTaskId = health.value("task_id", "");
-        peer.activity.jobName = HeaderDisplayText(health.value("activity_job", ""), 128);
-        peer.activity.frames = health.value("activity_frames", std::vector<int>{});
-        if (peer.activity.frames.size() > 5) peer.activity.frames.resize(5);
-        peer.activity.completedFrames = std::min(
-            health.value("activity_completed", size_t{0}), peer.activity.frames.size());
-        peer.activity.rendering = health.value("activity_rendering", false);
+        peer.activity = std::move(signedActivity);
         peer.manualRoute = true;
         peer.manualValidatedAt = std::chrono::steady_clock::now();
         peer.idleSeconds = health.value("idle", 0.0);
@@ -2017,10 +2054,12 @@ struct NodeApp::Impl {
     void ManualPeerLoop() {
         while (!stopRequested.load()) {
             std::string endpoint = owner->GetConfig().manualPeerEndpoint;
+            bool active = false;
             if (!endpoint.empty()) {
                 Peer peer;
                 std::wstring status;
                 if (ProbeManualPeer(endpoint, peer, status)) {
+                    active = peer.activity.Active();
                     bool committed = false;
                     {
                         std::scoped_lock lock(stateMutex);
@@ -2035,7 +2074,8 @@ struct NodeApp::Impl {
                 SetManualStatus(std::move(status));
                 Notify();
             }
-            for (int step = 0; step < 20 && !stopRequested.load(); ++step) Sleep(100);
+            const int delaySteps = active ? 3 : 10;
+            for (int step = 0; step < delaySteps && !stopRequested.load(); ++step) Sleep(100);
         }
     }
 
@@ -3771,6 +3811,19 @@ bool RunSelfTest(std::wstring& report) {
         discoveryV7["activity_completed"] = 1;
         discoveryV7["activity_rendering"] = true;
         std::string discoveryV7Proof = DiscoverySignature(signatureConfig, discoveryV7);
+        WorkerActivity signedActivity;
+        signedActivity.jobName = "signed render";
+        signedActivity.frames = {1, 2, 3};
+        signedActivity.completedFrames = 1;
+        signedActivity.rendering = true;
+        std::string activityProof = ActivitySnapshotProof(
+            signatureConfig, "0011223344556677", "signed-node", signedActivity);
+        signedActivity.completedFrames = 2;
+        if (ConstantTimeEqual(activityProof, ActivitySnapshotProof(
+                signatureConfig, "0011223344556677", "signed-node", signedActivity))) {
+            report = L"Manual-peer activity snapshot was not authenticated";
+            return false;
+        }
         discoveryV7["activity_job"] = "tampered render";
         if (ConstantTimeEqual(discoveryV7Proof,
                               DiscoverySignature(signatureConfig, discoveryV7))) {
