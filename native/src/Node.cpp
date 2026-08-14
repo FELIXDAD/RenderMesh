@@ -3,7 +3,9 @@
 #include <iphlpapi.h>
 
 #include "Core.hpp"
+#include "UiModel.hpp"
 #include "../third_party/httplib.h"
+#include "../third_party/sqlite/sqlite3.h"
 
 #include <algorithm>
 #include <cwctype>
@@ -351,19 +353,23 @@ std::string DiscoverySignature(const Config& config, const json& message) {
             std::to_string(message.value("activity_completed", size_t{0})) + "|" +
             std::string(message.value("activity_rendering", false) ? "1" : "0");
     }
+    if (message.value("protocol", 1) >= 8)
+        signedValue += "|" + std::string(message.value("job_cleanup", false) ? "1" : "0");
     return HmacSha256(config.clusterToken, signedValue);
 }
 
 std::string ActivitySnapshotProof(
     const Config& config, const std::string& challenge,
-    const std::string& nodeId, const WorkerActivity& activity) {
+    const std::string& nodeId, const WorkerActivity& activity,
+    bool supportsJobCleanup) {
     return HmacSha256(
         config.clusterToken,
         "activity-proof|" + nodeId + "|" + challenge + "|" +
             HeaderDisplayText(activity.jobName, 128) + "|" +
             json(activity.frames).dump() + "|" +
             std::to_string(activity.completedFrames) + "|" +
-            (activity.rendering ? "1" : "0"));
+            (activity.rendering ? "1" : "0") + "|" +
+            (supportsJobCleanup ? "1" : "0"));
 }
 
 struct LocalIPv4Interface {
@@ -457,6 +463,7 @@ void PreserveAuthenticatedV2Metadata(Peer& candidate, const Peer& existing) {
     candidate.supportsFramePackages = existing.supportsFramePackages;
     candidate.supportsResultBundles = existing.supportsResultBundles;
     candidate.supportsPackageCancellation = existing.supportsPackageCancellation;
+    candidate.supportsJobCleanup = existing.supportsJobCleanup;
     candidate.name = existing.name;
     candidate.cpuPercent = existing.cpuPercent;
     candidate.idleSeconds = existing.idleSeconds;
@@ -587,6 +594,18 @@ std::optional<fs::path> ResultDestination(
         safe = safe && component != L".." && component != L".";
     if (!safe) return std::nullopt;
     return target->directory / relative;
+}
+
+std::map<std::string, fs::path> PublishedArtifactPaths(
+    const fs::path& dataDir, const RenderJob& job, int frame,
+    const std::map<std::string, fs::path>& artifacts) {
+    std::map<std::string, fs::path> published;
+    for (const auto& [logical, source] : artifacts) {
+        (void)source;
+        if (auto destination = ResultDestination(dataDir, job, frame, logical))
+            published[logical] = *destination;
+    }
+    return published;
 }
 
 bool PublishResultArtifacts(
@@ -810,7 +829,16 @@ struct NodeApp::Impl {
     std::map<std::pair<std::string, std::string>, std::chrono::steady_clock::time_point>
         jobPeerBackoff;
     std::vector<RenderJob> jobs;
+    std::atomic<uint64_t> jobRevision{1};
     std::vector<ContributionRecord> contributions;
+    struct PendingCleanup {
+        std::string operationId;
+        std::string nodeId;
+        std::string jobId;
+        std::string projectHash;
+    };
+    std::mutex cleanupMutex;
+    std::vector<PendingCleanup> pendingCleanups;
     std::mutex callbackMutex;
     std::function<void()> changed;
     mutable std::mutex manualStatusMutex;
@@ -848,7 +876,112 @@ struct NodeApp::Impl {
     }
 
     fs::path JobsPath() const { return owner->DataDir() / L"jobs.json"; }
+    fs::path JobsDatabasePath() const { return owner->DataDir() / L"jobs.db"; }
     fs::path ContributionsPath() const { return owner->DataDir() / L"contributions.json"; }
+    fs::path PendingCleanupsPath() const {
+        return owner->DataDir() / L"cleanup-pending.json";
+    }
+
+    void PersistPendingCleanups() {
+        json rows = json::array();
+        {
+            std::scoped_lock lock(cleanupMutex);
+            for (const auto& request : pendingCleanups) {
+                rows.push_back({{"operation_id", request.operationId},
+                                {"node_id", request.nodeId},
+                                {"job_id", request.jobId},
+                                {"project_hash", request.projectHash}});
+            }
+        }
+        std::wstring error;
+        if (!WriteDurableFileAtomic(PendingCleanupsPath(), rows.dump(2), error))
+            LogError("cleanup queue was not persisted; " + WideToUtf8(error));
+    }
+
+    void LoadPendingCleanups() {
+        if (!fs::exists(PendingCleanupsPath())) return;
+        try {
+            std::ifstream input(PendingCleanupsPath(), std::ios::binary);
+            const json rows = json::parse(input);
+            std::scoped_lock lock(cleanupMutex);
+            for (const auto& row : rows) {
+                PendingCleanup request{
+                    row.value("operation_id", ""), row.value("node_id", ""),
+                    row.value("job_id", ""), row.value("project_hash", "")};
+                if (SafeId(request.operationId) && SafeId(request.nodeId) &&
+                    SafeId(request.jobId) && SafeSha256(request.projectHash))
+                    pendingCleanups.push_back(std::move(request));
+            }
+        } catch (...) {
+        }
+    }
+
+    void QueueRemoteCleanup(const RenderJob& job) {
+        if (!SafeId(job.id) || !SafeSha256(job.projectHash)) return;
+        std::set<std::string> nodes;
+        for (const auto& nodeId : job.remoteNodeIds)
+            if (SafeId(nodeId) && nodeId != owner->GetConfig().nodeId)
+                nodes.insert(nodeId);
+        for (const auto& frame : job.frames)
+            if (SafeId(frame.assignedNodeId) && frame.assignedNodeId != owner->GetConfig().nodeId)
+                nodes.insert(frame.assignedNodeId);
+        bool changed = false;
+        {
+            std::scoped_lock lock(cleanupMutex);
+            for (const auto& nodeId : nodes) {
+                const bool exists = std::any_of(
+                    pendingCleanups.begin(), pendingCleanups.end(),
+                    [&](const PendingCleanup& request) {
+                        return request.nodeId == nodeId && request.jobId == job.id;
+                    });
+                if (!exists) {
+                    pendingCleanups.push_back(
+                        {NewRandomHex(12), nodeId, job.id, job.projectHash});
+                    changed = true;
+                }
+            }
+        }
+        if (changed) PersistPendingCleanups();
+    }
+
+    void ProcessPendingCleanups() {
+        std::vector<PendingCleanup> snapshot;
+        {
+            std::scoped_lock lock(cleanupMutex);
+            snapshot = pendingCleanups;
+        }
+        if (snapshot.empty()) return;
+        Config config = owner->GetConfig();
+        std::set<std::string> completedOperations;
+        for (const auto& request : snapshot) {
+            std::optional<Peer> target;
+            {
+                std::scoped_lock lock(stateMutex);
+                auto found = peers.find(request.nodeId);
+                if (found != peers.end() && found->second.supportsJobCleanup &&
+                    std::chrono::steady_clock::now() - found->second.lastSeen <= kPeerTimeout)
+                    target = found->second;
+            }
+            if (!target) continue;
+            httplib::Headers headers = {
+                {"X-RM-Token", config.clusterToken}, {"X-RM-Job", request.jobId},
+                {"X-RM-Project", request.projectHash},
+                {"X-RM-Operation", request.operationId},
+            };
+            auto response = PostEmpty(target->address, target->httpPort,
+                                      "/v4/job-cleanup", headers, &stopRequested);
+            if (response && response->status == 200)
+                completedOperations.insert(request.operationId);
+        }
+        if (completedOperations.empty()) return;
+        {
+            std::scoped_lock lock(cleanupMutex);
+            std::erase_if(pendingCleanups, [&](const PendingCleanup& request) {
+                return completedOperations.contains(request.operationId);
+            });
+        }
+        PersistPendingCleanups();
+    }
 
     std::shared_ptr<std::atomic<bool>> JobCancellation(const std::string& jobId) {
         std::scoped_lock lock(cancellationMutex);
@@ -893,8 +1026,72 @@ struct NodeApp::Impl {
         manualStatus = std::move(value);
     }
 
+    void MaintainJobHistory() {
+        const auto now = std::chrono::system_clock::now();
+        std::vector<RenderJob> purge;
+        bool changed = false;
+        {
+            std::scoped_lock lock(stateMutex);
+            for (auto& job : jobs) {
+                const bool terminal = !job.frames.empty() && std::all_of(
+                    job.frames.begin(), job.frames.end(), [](const FrameTask& frame) {
+                        return frame.state == TaskState::Completed ||
+                            frame.state == TaskState::Failed ||
+                            frame.state == TaskState::Stopped;
+                    });
+                if (!terminal) {
+                    if (job.finishedAt.time_since_epoch() !=
+                        std::chrono::system_clock::duration::zero()) {
+                        job.finishedAt = {};
+                        changed = true;
+                    }
+                    continue;
+                }
+                if (job.finishedAt.time_since_epoch() ==
+                    std::chrono::system_clock::duration::zero()) {
+                    for (const auto& frame : job.frames)
+                        job.finishedAt = std::max(job.finishedAt, frame.endedAt);
+                    if (job.finishedAt.time_since_epoch() ==
+                        std::chrono::system_clock::duration::zero())
+                        job.finishedAt = now;
+                    changed = true;
+                }
+                if (job.artifactsPurgedAt.time_since_epoch() ==
+                        std::chrono::system_clock::duration::zero() &&
+                    ui::IsExpiredJob(
+                        {Utf8ToWide(job.id), Utf8ToWide(job.name), job.priority,
+                         job.createdAt, job.finishedAt}, now))
+                    purge.push_back(job);
+            }
+        }
+        for (const auto& job : purge) {
+            std::error_code removeError;
+            fs::remove_all(owner->DataDir() / L"jobs" / Utf8ToWide(job.id), removeError);
+            if (removeError) {
+                LogWarning("expired job artifacts could not be removed; job=" + job.id);
+                continue;
+            }
+            QueueRemoteCleanup(job);
+            std::scoped_lock lock(stateMutex);
+            auto found = std::find_if(jobs.begin(), jobs.end(), [&](const RenderJob& value) {
+                return value.id == job.id;
+            });
+            if (found != jobs.end() && found->artifactsPurgedAt.time_since_epoch() ==
+                    std::chrono::system_clock::duration::zero()) {
+                found->artifactsPurgedAt = now;
+                changed = true;
+            }
+        }
+        if (changed) {
+            PersistJobs();
+            Notify();
+        }
+        ProcessPendingCleanups();
+    }
+
     void CacheMaintenanceLoop() {
         while (!stopRequested.load()) {
+            MaintainJobHistory();
             if (workerAssigned.load() == 0) {
                 std::scoped_lock lock(cacheMutex);
                 size_t removed = CleanupExpiredProjectCaches(owner->DataDir());
@@ -905,12 +1102,7 @@ struct NodeApp::Impl {
         }
     }
 
-    void PersistJobs() {
-        std::scoped_lock persistLock(persistMutex);
-        json rows = json::array();
-        {
-            std::scoped_lock lock(stateMutex);
-            for (const auto& job : jobs) {
+    static json SerializeJob(const RenderJob& job) {
                 json frames = json::array();
                 json primaryOutputs = json::object();
                 json compositorOutputs = json::array();
@@ -932,12 +1124,18 @@ struct NodeApp::Impl {
                         {"dispatch_attempts", frame.dispatchAttempts},
                         {"attempt_token", frame.attemptToken},
                         {"output", WideToUtf8(frame.output.wstring())},
+                        {"artifacts", [&] {
+                            json values = json::object();
+                            for (const auto& [logical, path] : frame.artifacts)
+                                values[logical] = WideToUtf8(path.wstring());
+                            return values;
+                        }()},
                         {"error", frame.error},
                         {"started_at", UnixMilliseconds(frame.startedAt)},
                         {"ended_at", UnixMilliseconds(frame.endedAt)},
                     });
                 }
-                rows.push_back({
+                return {
                     {"id", job.id}, {"name", job.name},
                     {"source_blend", WideToUtf8(job.sourceBlend.wstring())},
                     {"blend", WideToUtf8(job.preparedBlend.wstring())},
@@ -948,23 +1146,17 @@ struct NodeApp::Impl {
                     {"requires_gpu", job.requiresGpu},
                     {"primary_outputs", primaryOutputs},
                     {"compositor_outputs", compositorOutputs},
+                    {"remote_node_ids", job.remoteNodeIds},
                     {"frames", frames},
                     {"created_at", UnixMilliseconds(job.createdAt)},
-                });
-            }
-        }
-        std::wstring error;
-        if (!WriteDurableFileAtomic(JobsPath(), rows.dump(2), error))
-            LogError("jobs state was not replaced; " + WideToUtf8(error));
+                    {"finished_at", UnixMilliseconds(job.finishedAt)},
+                    {"artifacts_purged_at", UnixMilliseconds(job.artifactsPurgedAt)},
+                    {"priority", job.priority},
+                };
     }
 
-    void LoadJobs() {
-        if (!fs::exists(JobsPath())) return;
+    static std::optional<RenderJob> DeserializeJob(const json& row) {
         try {
-            std::ifstream input(JobsPath(), std::ios::binary);
-            json rows = json::parse(input);
-            std::scoped_lock lock(stateMutex);
-            for (const auto& row : rows) {
                 RenderJob job;
                 job.id = row.value("id", "");
                 job.name = row.value("name", "");
@@ -993,6 +1185,12 @@ struct NodeApp::Impl {
                     if (target.directory.is_absolute())
                         job.compositorOutputs.push_back(std::move(target));
                 }
+                for (const auto& nodeId : row.value(
+                         "remote_node_ids", std::vector<std::string>{})) {
+                    if (SafeId(nodeId) && std::find(job.remoteNodeIds.begin(),
+                            job.remoteNodeIds.end(), nodeId) == job.remoteNodeIds.end())
+                        job.remoteNodeIds.push_back(nodeId);
+                }
                 for (const auto& value : row.value("frames", json::array())) {
                     FrameTask frame;
                     frame.taskId = value.value("task_id", "");
@@ -1010,14 +1208,148 @@ struct NodeApp::Impl {
                     frame.dispatchAttempts = value.value("dispatch_attempts", 0);
                     frame.attemptToken = value.value("attempt_token", "");
                     frame.output = Utf8ToWide(value.value("output", ""));
+                    for (const auto& [logical, path] :
+                         value.value("artifacts", json::object()).items()) {
+                        if (logical == "primary" || logical.starts_with("compositor/"))
+                            frame.artifacts[logical] =
+                                Utf8ToWide(path.get<std::string>());
+                    }
                     frame.error = value.value("error", "");
                     frame.startedAt = TimeFromUnixMilliseconds(value.value("started_at", int64_t{0}));
                     frame.endedAt = TimeFromUnixMilliseconds(value.value("ended_at", int64_t{0}));
                     job.frames.push_back(std::move(frame));
                 }
                 job.createdAt = TimeFromUnixMilliseconds(row.value("created_at", int64_t{0}));
-                if (!job.id.empty()) jobs.push_back(std::move(job));
+                job.finishedAt = TimeFromUnixMilliseconds(row.value("finished_at", int64_t{0}));
+                job.artifactsPurgedAt = TimeFromUnixMilliseconds(
+                    row.value("artifacts_purged_at", int64_t{0}));
+                job.priority = std::clamp(row.value("priority", 0), 0, 100);
+                if (job.id.empty()) return std::nullopt;
+                return job;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    sqlite3* OpenJobsDatabase() const {
+        sqlite3* database = nullptr;
+        const std::string path = WideToUtf8(JobsDatabasePath().wstring());
+        if (sqlite3_open_v2(path.c_str(), &database,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                nullptr) != SQLITE_OK) {
+            if (database) sqlite3_close(database);
+            return nullptr;
+        }
+        sqlite3_busy_timeout(database, 3000);
+        sqlite3_db_config(database, SQLITE_DBCONFIG_DEFENSIVE, 1, nullptr);
+        sqlite3_exec(database, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+        sqlite3_exec(database, "PRAGMA trusted_schema=OFF;", nullptr, nullptr, nullptr);
+        constexpr const char* schema =
+            "CREATE TABLE IF NOT EXISTS jobs("
+            "id TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL,"
+            "finished_at INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0,"
+            "payload TEXT NOT NULL);";
+        if (sqlite3_exec(database, schema, nullptr, nullptr, nullptr) != SQLITE_OK) {
+            sqlite3_close(database);
+            return nullptr;
+        }
+        return database;
+    }
+
+    void PersistJobs() {
+        std::scoped_lock persistLock(persistMutex);
+        std::vector<RenderJob> snapshot;
+        {
+            std::scoped_lock lock(stateMutex);
+            snapshot = jobs;
+        }
+        sqlite3* database = OpenJobsDatabase();
+        if (!database) {
+            json rows = json::array();
+            for (const auto& job : snapshot) rows.push_back(SerializeJob(job));
+            std::wstring error;
+            if (!WriteDurableFileAtomic(JobsPath(), rows.dump(2), error))
+                LogError("jobs state was not replaced; " + WideToUtf8(error));
+            ++jobRevision;
+            return;
+        }
+        sqlite3_exec(database, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+        sqlite3_stmt* statement = nullptr;
+        constexpr const char* sql =
+            "INSERT INTO jobs(id,created_at,finished_at,priority,payload) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at,"
+            "finished_at=excluded.finished_at,priority=excluded.priority,payload=excluded.payload "
+            "WHERE jobs.payload<>excluded.payload;";
+        bool ok = sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK;
+        for (const auto& job : snapshot) {
+            if (!ok) break;
+            const std::string payload = SerializeJob(job).dump();
+            sqlite3_bind_text(statement, 1, job.id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(statement, 2, UnixMilliseconds(job.createdAt));
+            sqlite3_bind_int64(statement, 3, UnixMilliseconds(job.finishedAt));
+            sqlite3_bind_int(statement, 4, job.priority);
+            sqlite3_bind_text(statement, 5, payload.c_str(),
+                              static_cast<int>(payload.size()), SQLITE_TRANSIENT);
+            ok = sqlite3_step(statement) == SQLITE_DONE;
+            sqlite3_reset(statement);
+            sqlite3_clear_bindings(statement);
+        }
+        if (statement) sqlite3_finalize(statement);
+        sqlite3_exec(database, ok ? "COMMIT;" : "ROLLBACK;", nullptr, nullptr, nullptr);
+        if (!ok) LogError("jobs database transaction failed");
+        sqlite3_close(database);
+        ++jobRevision;
+    }
+
+    void DeletePersistedJob(const std::string& jobId) {
+        std::scoped_lock persistLock(persistMutex);
+        sqlite3* database = OpenJobsDatabase();
+        if (!database) return;
+        sqlite3_stmt* statement = nullptr;
+        if (sqlite3_prepare_v2(database, "DELETE FROM jobs WHERE id=?;", -1,
+                               &statement, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(statement, 1, jobId.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(statement);
+        }
+        if (statement) sqlite3_finalize(statement);
+        sqlite3_close(database);
+        ++jobRevision;
+    }
+
+    void LoadJobs() {
+        bool loadedDatabase = false;
+        if (sqlite3* database = OpenJobsDatabase()) {
+            sqlite3_stmt* statement = nullptr;
+            if (sqlite3_prepare_v2(database,
+                    "SELECT payload FROM jobs ORDER BY created_at ASC,id ASC;", -1,
+                    &statement, nullptr) == SQLITE_OK) {
+                std::scoped_lock lock(stateMutex);
+                while (sqlite3_step(statement) == SQLITE_ROW) {
+                    const auto* text = reinterpret_cast<const char*>(
+                        sqlite3_column_text(statement, 0));
+                    if (!text) continue;
+                    json row = json::parse(text, nullptr, false);
+                    if (row.is_discarded()) continue;
+                    if (auto job = DeserializeJob(row)) jobs.push_back(std::move(*job));
+                }
+                loadedDatabase = !jobs.empty();
             }
+            if (statement) sqlite3_finalize(statement);
+            sqlite3_close(database);
+        }
+        fs::path migrationBackup = JobsPath();
+        migrationBackup += L".pre-sqlite-backup";
+        if (loadedDatabase || fs::exists(migrationBackup) || !fs::exists(JobsPath())) return;
+        try {
+            std::ifstream input(JobsPath(), std::ios::binary);
+            json rows = json::parse(input);
+            {
+                std::scoped_lock lock(stateMutex);
+                for (const auto& row : rows)
+                    if (auto job = DeserializeJob(row)) jobs.push_back(std::move(*job));
+            }
+            PersistJobs();
+            CopyFileW(JobsPath().c_str(), migrationBackup.c_str(), TRUE);
         } catch (...) {
         }
     }
@@ -1146,9 +1478,9 @@ struct NodeApp::Impl {
         server.Get("/health", [&](const httplib::Request& request, httplib::Response& response) {
             Config config = owner->GetConfig();
             WorkerActivity activity = CurrentActivity();
-            json snapshot{{"status", "ok"}, {"protocol", 7}, {"project_cache", true},
+            json snapshot{{"status", "ok"}, {"protocol", 8}, {"project_cache", true},
                      {"frame_packages", true}, {"result_bundles", true},
-                     {"package_cancel", true},
+                     {"package_cancel", true}, {"job_cleanup", true},
                      {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
                      {"assigned", workerAssigned.load()}, {"cpu", 100},
@@ -1165,7 +1497,7 @@ struct NodeApp::Impl {
             if (SafeId(challenge) && challenge.size() >= 16 &&
                 !config.pairingPending && config.clusterToken.size() >= 16) {
                 snapshot["activity_proof"] = ActivitySnapshotProof(
-                    config, challenge, config.nodeId, activity);
+                    config, challenge, config.nodeId, activity, true);
             }
             response.set_content(snapshot.dump(), "application/json");
         });
@@ -1226,6 +1558,57 @@ struct NodeApp::Impl {
             response.status = 202;
             response.set_content("cancellation recorded", "text/plain");
             LogInfo("remote package cancellation recorded; package=" + packageId);
+        });
+        server.Post("/v4/job-cleanup", [&](const httplib::Request& request,
+                                              httplib::Response& response) {
+            Config config = owner->GetConfig();
+            if (config.pairingPending || config.clusterToken.size() < 16 ||
+                !ConstantTimeEqual(request.get_header_value("X-RM-Token"),
+                                   config.clusterToken)) {
+                response.status = 401;
+                return;
+            }
+            const std::string jobId = request.get_header_value("X-RM-Job");
+            const std::string hash = request.get_header_value("X-RM-Project");
+            const std::string operationId = request.get_header_value("X-RM-Operation");
+            if (!SafeId(jobId) || !SafeSha256(hash) || !SafeId(operationId)) {
+                response.status = 422;
+                return;
+            }
+            if (workerAssigned.load() != 0) {
+                response.status = 409;
+                response.set_content("worker is rendering; cleanup will be retried", "text/plain");
+                return;
+            }
+            std::vector<fs::path> taskDirectories;
+            bool hashStillQueued = false;
+            {
+                std::scoped_lock lock(workMutex);
+                std::queue<WorkItem> retained;
+                while (!work.empty()) {
+                    WorkItem item = std::move(work.front());
+                    work.pop();
+                    if (item.jobId == jobId) {
+                        if (!item.temporaryTaskDir.empty())
+                            taskDirectories.push_back(item.temporaryTaskDir);
+                        continue;
+                    }
+                    hashStillQueued = hashStillQueued || item.projectHash == hash;
+                    retained.push(std::move(item));
+                }
+                work.swap(retained);
+            }
+            std::error_code ignored;
+            for (const auto& directory : taskDirectories)
+                fs::remove_all(directory, ignored);
+            if (!hashStillQueued) {
+                std::scoped_lock lock(cacheMutex);
+                fs::remove_all(ProjectCacheDirectory(owner->DataDir(), hash), ignored);
+            }
+            response.status = 200;
+            response.set_content("job artifacts removed", "text/plain");
+            LogInfo("remote job cleanup completed; job=" + jobId +
+                    "; operation=" + operationId);
         });
         server.Get("/v2/cache/status", [&](const httplib::Request& request,
                                              httplib::Response& response) {
@@ -1904,6 +2287,9 @@ struct NodeApp::Impl {
                     if (status == "completed" && ok) {
                         target.state = TaskState::Completed;
                         target.output = publishedPrimary;
+                        target.artifacts = PublishedArtifactPaths(
+                            owner->DataDir(), jobs[targetJob], target.frame,
+                            receivedArtifacts);
                         target.error.clear();
                         target.endedAt = std::chrono::system_clock::now();
                     } else if (status == "retry" && ok) {
@@ -2000,7 +2386,8 @@ struct NodeApp::Impl {
             health.value("activity_completed", size_t{0}), signedActivity.frames.size());
         signedActivity.rendering = health.value("activity_rendering", false);
         std::string expectedActivityProof = ActivitySnapshotProof(
-            config, challenge, nodeId, signedActivity);
+            config, challenge, nodeId, signedActivity,
+            health.value("job_cleanup", false));
         if (!ConstantTimeEqual(
                 health.value("activity_proof", ""), expectedActivityProof)) {
             result = L"连接被拒绝：节点活动状态未通过邀请码验证";
@@ -2025,6 +2412,7 @@ struct NodeApp::Impl {
         peer.supportsFramePackages = health.value("frame_packages", false);
         peer.supportsResultBundles = health.value("result_bundles", false);
         peer.supportsPackageCancellation = health.value("package_cancel", false);
+        peer.supportsJobCleanup = health.value("job_cleanup", false);
         peer.name = health.value("name", "");
         if (peer.name.empty()) peer.name = "手动节点-" + nodeId.substr(0, 8);
         peer.address = address;
@@ -2117,8 +2505,9 @@ struct NodeApp::Impl {
                 if (!config.pairingPending && config.clusterToken.size() >= 16) {
                     WorkerActivity activity = CurrentActivity();
                     json messageV7 = {
-                        {"protocol", 7}, {"project_cache", true}, {"frame_packages", true},
+                        {"protocol", 8}, {"project_cache", true}, {"frame_packages", true},
                         {"result_bundles", true}, {"package_cancel", true},
+                        {"job_cleanup", true},
                         {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
@@ -2180,7 +2569,7 @@ struct NodeApp::Impl {
             try {
                 json message = json::parse(std::string(buffer, received));
                 int protocol = message.value("protocol", 0);
-                if (protocol < 1 || protocol > 7) continue;
+                if (protocol < 1 || protocol > 8) continue;
                 char remoteAddress[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &remote.sin_addr, remoteAddress, sizeof(remoteAddress));
                 Peer peer;
@@ -2189,6 +2578,7 @@ struct NodeApp::Impl {
                 peer.supportsFramePackages = message.value("frame_packages", false);
                 peer.supportsResultBundles = message.value("result_bundles", false);
                 peer.supportsPackageCancellation = message.value("package_cancel", false);
+                peer.supportsJobCleanup = message.value("job_cleanup", false);
                 peer.nodeId = message.value("node_id", "");
                 if (!SafeId(peer.nodeId) || peer.nodeId == config.nodeId) continue;
                 peer.address = remoteAddress;
@@ -2554,25 +2944,33 @@ struct NodeApp::Impl {
             bool found = false;
             {
                 std::scoped_lock lock(stateMutex);
-                for (size_t j = 0; j < jobs.size() && !found; ++j) {
-                    for (size_t f = 0; f < jobs[j].frames.size(); ++f) {
-                        if (jobs[j].frames[f].state == TaskState::Pending) {
-                            jobIndex = j;
-                            jobCopy = jobs[j];
-                            for (size_t candidate = f;
-                                 candidate < jobs[j].frames.size() &&
-                                 frameIndices.size() < wantedFrames;
-                                 ++candidate) {
-                                if (jobs[j].frames[candidate].state != TaskState::Pending)
-                                    continue;
-                                jobs[j].frames[candidate].state = TaskState::Dispatching;
-                                frameIndices.push_back(candidate);
-                                frameCopies.push_back(jobs[j].frames[candidate]);
-                            }
-                            found = true;
-                            break;
-                        }
+                size_t selected = jobs.size();
+                for (size_t j = 0; j < jobs.size(); ++j) {
+                    const bool pending = std::any_of(
+                        jobs[j].frames.begin(), jobs[j].frames.end(),
+                        [](const FrameTask& frame) {
+                            return frame.state == TaskState::Pending;
+                        });
+                    if (!pending) continue;
+                    if (selected == jobs.size() || ui::DispatchesBefore(
+                            {Utf8ToWide(jobs[j].id), Utf8ToWide(jobs[j].name),
+                             jobs[j].priority, jobs[j].createdAt, jobs[j].finishedAt},
+                            {Utf8ToWide(jobs[selected].id), Utf8ToWide(jobs[selected].name),
+                             jobs[selected].priority, jobs[selected].createdAt,
+                             jobs[selected].finishedAt}))
+                        selected = j;
+                }
+                if (selected != jobs.size()) {
+                    jobIndex = selected;
+                    jobCopy = jobs[selected];
+                    for (size_t f = 0; f < jobs[selected].frames.size() &&
+                         frameIndices.size() < wantedFrames; ++f) {
+                        if (jobs[selected].frames[f].state != TaskState::Pending) continue;
+                        jobs[selected].frames[f].state = TaskState::Dispatching;
+                        frameIndices.push_back(f);
+                        frameCopies.push_back(jobs[selected].frames[f]);
                     }
+                    found = !frameIndices.empty();
                 }
             }
             if (!found) {
@@ -2626,6 +3024,11 @@ struct NodeApp::Impl {
                         assignmentReserved = frameIndices[index] < jobs[jobIndex].frames.size() &&
                             jobs[jobIndex].frames[frameIndices[index]].state == TaskState::Dispatching;
                     if (!assignmentReserved) handled = true;
+                    if (assignmentReserved && std::find(
+                            jobs[jobIndex].remoteNodeIds.begin(),
+                            jobs[jobIndex].remoteNodeIds.end(), peer->nodeId) ==
+                            jobs[jobIndex].remoteNodeIds.end())
+                        jobs[jobIndex].remoteNodeIds.push_back(peer->nodeId);
                     for (size_t index = 0; index < frameIndices.size(); ++index) {
                         if (!assignmentReserved) break;
                         if (jobIndex >= jobs.size() ||
@@ -2999,7 +3402,11 @@ struct NodeApp::Impl {
                             stateUpdated = true;
                             frame->state = published ? TaskState::Completed : TaskState::Failed;
                             frame->assignedPackageId.clear();
-                            if (published) frame->output = publishedPrimary;
+                            if (published) {
+                                frame->output = publishedPrimary;
+                                frame->artifacts = PublishedArtifactPaths(
+                                    owner->DataDir(), jobSnapshot, frameNumber, artifactMap);
+                            }
                             frame->error = published ? "" : WideToUtf8(publishError);
                             frame->endedAt = std::chrono::system_clock::now();
                         }
@@ -3171,8 +3578,8 @@ struct NodeApp::Impl {
                         bool frameSuccess = output != outputs.end();
                         fs::path publishedPrimary;
                         std::wstring publishError;
+                        std::map<std::string, fs::path> artifacts;
                         if (frameSuccess) {
-                            std::map<std::string, fs::path> artifacts;
                             for (const auto& artifact : output->second)
                                 artifacts[artifact.logicalPath] = artifact.source;
                             frameSuccess = PublishResultArtifacts(
@@ -3183,7 +3590,11 @@ struct NodeApp::Impl {
                         if (frame->state == TaskState::Stopped) continue;
                         frame->state = frameSuccess ? TaskState::Completed : TaskState::Failed;
                         frame->assignedPackageId.clear();
-                        if (frameSuccess) frame->output = publishedPrimary;
+                        if (frameSuccess) {
+                            frame->output = publishedPrimary;
+                            frame->artifacts = PublishedArtifactPaths(
+                                owner->DataDir(), job, packagedFrame.frame, artifacts);
+                        }
                         frame->error = frameSuccess ? "" : WideToUtf8(
                             publishError.empty() ? renderError : publishError);
                         frame->endedAt = std::chrono::system_clock::now();
@@ -3221,6 +3632,7 @@ NodeApp::NodeApp(ConfigStore store, Config config, bool mockRenderer,
       config_(std::move(config)), mockRenderer_(mockRenderer) {
     impl_->LoadJobs();
     impl_->LoadContributions();
+    impl_->LoadPendingCleanups();
 }
 
 NodeApp::~NodeApp() { Stop(); }
@@ -3347,6 +3759,15 @@ std::vector<RenderJob> NodeApp::Jobs() const {
     return impl_->jobs;
 }
 
+std::optional<RenderJob> NodeApp::FindJob(const std::string& jobId) const {
+    if (!SafeId(jobId)) return std::nullopt;
+    std::scoped_lock lock(impl_->stateMutex);
+    auto found = std::find_if(impl_->jobs.begin(), impl_->jobs.end(),
+                              [&](const RenderJob& job) { return job.id == jobId; });
+    if (found == impl_->jobs.end()) return std::nullopt;
+    return *found;
+}
+
 std::vector<ContributionRecord> NodeApp::Contributions() const {
     std::scoped_lock lock(impl_->stateMutex);
     return impl_->contributions;
@@ -3435,6 +3856,189 @@ bool NodeApp::StopJob(const std::string& jobId, std::wstring& error) {
     return true;
 }
 
+bool NodeApp::SetJobPriority(
+    const std::string& jobId, bool prioritised, std::wstring& error) {
+    if (!SafeId(jobId)) {
+        error = L"任务 ID 无效";
+        return false;
+    }
+    bool found = false;
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        for (auto& job : impl_->jobs) {
+            if (job.id != jobId) continue;
+            job.priority = prioritised ? 100 : 0;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        error = L"未找到任务";
+        return false;
+    }
+    impl_->PersistJobs();
+    impl_->Notify();
+    return true;
+}
+
+bool NodeApp::SaveJobAs(
+    const std::string& jobId, const fs::path& destination,
+    std::wstring& error) const {
+    if (!SafeId(jobId) || destination.empty()) {
+        error = L"另存位置无效";
+        return false;
+    }
+    RenderJob job;
+    bool found = false;
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        auto current = std::find_if(impl_->jobs.begin(), impl_->jobs.end(),
+                                    [&](const RenderJob& value) {
+                                        return value.id == jobId;
+                                    });
+        if (current != impl_->jobs.end()) {
+            job = *current;
+            found = true;
+        }
+    }
+    if (!found) {
+        error = L"未找到任务";
+        return false;
+    }
+    if (job.artifactsPurgedAt.time_since_epoch() !=
+        std::chrono::system_clock::duration::zero()) {
+        error = L"该作业已经过期，托管结果已清理";
+        return false;
+    }
+    std::error_code ec;
+    fs::path absoluteDestination = fs::absolute(destination, ec).lexically_normal();
+    if (ec) {
+        error = L"无法解析另存位置";
+        return false;
+    }
+    fs::create_directories(absoluteDestination, ec);
+    if (ec) {
+        error = L"无法创建另存目录";
+        return false;
+    }
+    const std::string operation = NewRandomHex(8);
+    fs::path staging = absoluteDestination /
+        Utf8ToWide(".rendermesh-save-" + job.id + "-" + operation);
+    fs::path final = absoluteDestination / Utf8ToWide(job.name + "_" + job.id);
+    if (fs::exists(final, ec)) {
+        error = L"目标位置已经存在同名作业目录";
+        return false;
+    }
+    fs::create_directories(staging / L"primary", ec);
+    if (ec) {
+        error = L"无法创建另存暂存目录";
+        return false;
+    }
+    size_t copied = 0;
+    json manifest{{"job_id", job.id}, {"scene_name", job.name},
+                  {"created_at", UnixMilliseconds(job.createdAt)},
+                  {"files", json::array()}};
+    for (const auto& frame : job.frames) {
+        if (frame.state != TaskState::Completed || frame.output.empty() ||
+            !fs::is_regular_file(frame.output, ec)) continue;
+        fs::path target = staging / L"primary" / frame.output.filename();
+        if (!CopyFileW(frame.output.c_str(), target.c_str(), TRUE)) {
+            error = L"无法复制渲染序列：" + frame.output.wstring();
+            fs::remove_all(staging, ec);
+            return false;
+        }
+        manifest["files"].push_back(WideToUtf8(
+            (fs::path(L"primary") / target.filename()).generic_wstring()));
+        ++copied;
+    }
+    std::set<std::wstring> copiedArtifacts;
+    for (const auto& frame : job.frames) {
+        for (const auto& [logical, source] : frame.artifacts) {
+            if (logical == "primary" || !logical.starts_with("compositor/") ||
+                !fs::is_regular_file(source, ec)) {
+                ec.clear();
+                continue;
+            }
+            if (logical.find('\\') != std::string::npos) continue;
+            fs::path relative = Utf8ToWide(logical);
+            bool safe = relative.is_relative() && !relative.has_root_name() &&
+                !relative.has_root_directory();
+            for (const auto& component : relative)
+                safe = safe && component != L".." && component != L".";
+            if (!safe || !copiedArtifacts.insert(relative.wstring()).second) continue;
+            fs::path targetPath = staging / relative;
+            fs::create_directories(targetPath.parent_path(), ec);
+            if (ec || !CopyFileW(source.c_str(), targetPath.c_str(), TRUE)) {
+                error = L"无法复制合成器输出：" + source.wstring();
+                fs::remove_all(staging, ec);
+                return false;
+            }
+            manifest["files"].push_back(WideToUtf8(relative.generic_wstring()));
+        }
+    }
+    if (!copied) {
+        error = L"该作业没有可另存的已完成序列";
+        fs::remove_all(staging, ec);
+        return false;
+    }
+    std::wstring writeError;
+    if (!WriteDurableFileAtomic(staging / L"manifest.json", manifest.dump(2), writeError)) {
+        error = writeError;
+        fs::remove_all(staging, ec);
+        return false;
+    }
+    if (!MoveFileExW(staging.c_str(), final.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        error = L"无法发布另存结果：" + LastErrorMessage();
+        fs::remove_all(staging, ec);
+        return false;
+    }
+    return true;
+}
+
+bool NodeApp::DeleteJob(const std::string& jobId, std::wstring& error) {
+    if (!SafeId(jobId)) {
+        error = L"任务 ID 无效";
+        return false;
+    }
+    bool active = false;
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        auto found = std::find_if(impl_->jobs.begin(), impl_->jobs.end(),
+                                  [&](const RenderJob& job) { return job.id == jobId; });
+        if (found == impl_->jobs.end()) {
+            error = L"未找到任务";
+            return false;
+        }
+        active = std::any_of(found->frames.begin(), found->frames.end(),
+                             [](const FrameTask& frame) {
+                                 return frame.state == TaskState::Pending ||
+                                     frame.state == TaskState::Dispatching ||
+                                     frame.state == TaskState::Assigned ||
+                                     frame.state == TaskState::Rendering;
+                             });
+    }
+    if (active && !StopJob(jobId, error)) return false;
+    RenderJob removed;
+    {
+        std::scoped_lock lock(impl_->stateMutex);
+        auto found = std::find_if(impl_->jobs.begin(), impl_->jobs.end(),
+                                  [&](const RenderJob& job) { return job.id == jobId; });
+        if (found == impl_->jobs.end()) return true;
+        removed = *found;
+        impl_->jobs.erase(found);
+    }
+    impl_->QueueRemoteCleanup(removed);
+    impl_->ProcessPendingCleanups();
+    std::error_code removeError;
+    fs::remove_all(DataDir() / L"jobs" / Utf8ToWide(jobId), removeError);
+    if (removeError)
+        LogWarning("local managed job artifacts could not be fully removed; job=" + jobId);
+    impl_->DeletePersistedJob(jobId);
+    impl_->Notify();
+    LogInfo("job deleted; id=" + jobId);
+    return true;
+}
+
 HardwareInfo NodeApp::Hardware() const { return impl_->hardware; }
 
 int NodeApp::AssignedCount() const {
@@ -3444,6 +4048,8 @@ int NodeApp::AssignedCount() const {
 WorkerActivity NodeApp::CurrentActivity() const {
     return impl_->CurrentActivity();
 }
+
+uint64_t NodeApp::JobRevision() const { return impl_->jobRevision.load(); }
 
 void NodeApp::InjectPeerForTest(Peer peer) {
     peer.lastSeen = std::chrono::steady_clock::now();
@@ -3624,6 +4230,37 @@ bool RunSelfTest(std::wstring& report) {
             !IsSafeOutputExtension(".png") || IsSafeOutputExtension("png") ||
             IsSafeOutputExtension(".bad/path")) {
             report = L"Six-digit invite-code validation failed";
+            return false;
+        }
+        fs::path legacyRoot = root / L"legacy-job-migration";
+        fs::create_directories(legacyRoot);
+        const int64_t legacyCreated = UnixMilliseconds(
+            std::chrono::system_clock::now() - std::chrono::hours(2));
+        const int64_t legacyEnded = UnixMilliseconds(
+            std::chrono::system_clock::now() - std::chrono::hours(1));
+        std::ofstream(legacyRoot / L"jobs.json", std::ios::binary) << json::array({
+            {{"id", "legacy-job"}, {"name", "Legacy Scene"},
+             {"format", "PNG"}, {"extension", ".png"},
+             {"frames", json::array({
+                 {{"task_id", "legacy-job-1"}, {"frame", 1},
+                  {"state", static_cast<int>(TaskState::Completed)},
+                  {"ended_at", legacyEnded}}
+             })},
+             {"created_at", legacyCreated}}
+        }).dump(2);
+        ConfigStore legacyStore(legacyRoot);
+        Config legacyConfig = legacyStore.Load();
+        NodeApp legacyApp(std::move(legacyStore), legacyConfig, true);
+        bool legacyImported = legacyApp.Jobs().size() == 1 &&
+            legacyApp.Jobs().front().id == "legacy-job" &&
+            fs::exists(legacyRoot / L"jobs.db") &&
+            fs::exists(legacyRoot / L"jobs.json.pre-sqlite-backup");
+        std::wstring legacyDeleteError;
+        bool legacyDeleted = legacyImported &&
+            legacyApp.DeleteJob("legacy-job", legacyDeleteError);
+        NodeApp legacyReloaded(ConfigStore(legacyRoot), legacyConfig, true);
+        if (!legacyDeleted || !legacyReloaded.Jobs().empty()) {
+            report = L"Legacy jobs.json migration or deletion persistence failed";
             return false;
         }
         fs::path joinRoot = root / L"join-config";
@@ -3817,11 +4454,17 @@ bool RunSelfTest(std::wstring& report) {
         signedActivity.completedFrames = 1;
         signedActivity.rendering = true;
         std::string activityProof = ActivitySnapshotProof(
-            signatureConfig, "0011223344556677", "signed-node", signedActivity);
+            signatureConfig, "0011223344556677", "signed-node", signedActivity, true);
         signedActivity.completedFrames = 2;
         if (ConstantTimeEqual(activityProof, ActivitySnapshotProof(
-                signatureConfig, "0011223344556677", "signed-node", signedActivity))) {
+                signatureConfig, "0011223344556677", "signed-node", signedActivity, true))) {
             report = L"Manual-peer activity snapshot was not authenticated";
+            return false;
+        }
+        signedActivity.completedFrames = 1;
+        if (ConstantTimeEqual(activityProof, ActivitySnapshotProof(
+                signatureConfig, "0011223344556677", "signed-node", signedActivity, false))) {
+            report = L"Manual-peer cleanup capability was not authenticated";
             return false;
         }
         discoveryV7["activity_job"] = "tampered render";
@@ -3830,12 +4473,24 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Protocol-v7 worker activity was not authenticated";
             return false;
         }
+        json discoveryV8 = discoveryV7;
+        discoveryV8["activity_job"] = "signed render";
+        discoveryV8["protocol"] = 8;
+        discoveryV8["job_cleanup"] = true;
+        std::string discoveryV8Proof = DiscoverySignature(signatureConfig, discoveryV8);
+        discoveryV8["job_cleanup"] = false;
+        if (ConstantTimeEqual(discoveryV8Proof,
+                              DiscoverySignature(signatureConfig, discoveryV8))) {
+            report = L"Protocol-v8 cleanup capability was not authenticated";
+            return false;
+        }
         Peer authenticatedPeer;
-        authenticatedPeer.protocolVersion = 7;
+        authenticatedPeer.protocolVersion = 8;
         authenticatedPeer.supportsProjectCache = true;
         authenticatedPeer.supportsFramePackages = true;
         authenticatedPeer.supportsResultBundles = true;
         authenticatedPeer.supportsPackageCancellation = true;
+        authenticatedPeer.supportsJobCleanup = true;
         authenticatedPeer.name = "SIGNED-NAME";
         authenticatedPeer.cpuPercent = 17;
         authenticatedPeer.idleSeconds = 181;
@@ -3848,9 +4503,9 @@ bool RunSelfTest(std::wstring& report) {
         legacyUpdate.cpuPercent = 99;
         legacyUpdate.idleSeconds = 999;
         PreserveAuthenticatedV2Metadata(legacyUpdate, authenticatedPeer);
-        if (legacyUpdate.protocolVersion != 7 || !legacyUpdate.supportsProjectCache ||
+        if (legacyUpdate.protocolVersion != 8 || !legacyUpdate.supportsProjectCache ||
             !legacyUpdate.supportsFramePackages || !legacyUpdate.supportsResultBundles ||
-            !legacyUpdate.supportsPackageCancellation ||
+            !legacyUpdate.supportsPackageCancellation || !legacyUpdate.supportsJobCleanup ||
             legacyUpdate.name != "SIGNED-NAME" ||
             legacyUpdate.cpuPercent != 17 || legacyUpdate.idleSeconds != 181 ||
             legacyUpdate.cpuModel != "SIGNED-CPU" ||
@@ -4001,11 +4656,31 @@ bool RunSelfTest(std::wstring& report) {
                 bool paired = !pairedConfig.pairingPending &&
                     pairedConfig.clusterToken == sharedToken;
                 bool hardwareReported = false;
+                bool activityProjected = false;
+                std::optional<Peer> connectedPeer;
                 for (const auto& peer : origin.Peers()) {
                     if (peer.nodeId == workerConfig.nodeId && !peer.cpuModel.empty()) {
                         hardwareReported = true;
+                        connectedPeer = peer;
                         break;
                     }
+                }
+                if (connectedPeer) {
+                    Peer activityPeer = *connectedPeer;
+                    activityPeer.activity = {
+                        "activity-projection-self-test", {10, 11, 12}, 1, true};
+                    activityPeer.lastSeen = std::chrono::steady_clock::now();
+                    origin.InjectPeerForTest(activityPeer);
+                    for (const auto& visible : origin.Peers()) {
+                        activityProjected = activityProjected ||
+                            (visible.nodeId == workerConfig.nodeId &&
+                             visible.activity.jobName == "activity-projection-self-test" &&
+                             visible.activity.frames == std::vector<int>{10, 11, 12} &&
+                             visible.activity.completedFrames == 1 &&
+                             visible.activity.rendering);
+                    }
+                    connectedPeer->lastSeen = std::chrono::steady_clock::now();
+                    origin.InjectPeerForTest(*connectedPeer);
                 }
 
                 fs::path prepared = root / L"prepared.blend";
@@ -4081,7 +4756,8 @@ bool RunSelfTest(std::wstring& report) {
                 std::string jobId = origin.SubmitPrepared(
                     "two-node-self-test", preflight, 1, 7, 1, submitError);
                 bool clusterOk = malformedRejected && pairingStarted && paired &&
-                    manuallyConnected && hardwareReported && stoppedOk && stoppedReloaded &&
+                    manuallyConnected && hardwareReported && activityProjected &&
+                    stoppedOk && stoppedReloaded &&
                     !jobId.empty();
                 bool usedRemote = false;
                 bool streamedFirstFrame = false;
@@ -4254,6 +4930,52 @@ bool RunSelfTest(std::wstring& report) {
                         std::to_wstring(workerStoppedPackage) + L"; origin_stopped=" +
                         std::to_wstring(originStayedStopped) + L"; worker_state=" +
                         workerCancellationState;
+                }
+                if (clusterOk) {
+                    std::wstring lifecycleError;
+                    const fs::path savedRoot = root / L"saved-job";
+                    bool priorityUpdated = origin.SetJobPriority(jobId, true, lifecycleError);
+                    bool priorityVisible = false;
+                    for (const auto& current : origin.Jobs())
+                        if (current.id == jobId) priorityVisible = current.priority == 100;
+                    bool saved = priorityUpdated && priorityVisible &&
+                        origin.SaveJobAs(jobId, savedRoot, lifecycleError);
+                    bool manifestFound = false;
+                    if (saved && fs::exists(savedRoot)) {
+                        for (const auto& entry : fs::directory_iterator(savedRoot)) {
+                            fs::path manifestPath = entry.path() / L"manifest.json";
+                            if (!fs::exists(manifestPath)) continue;
+                            json savedManifest = json::parse(
+                                std::ifstream(manifestPath, std::ios::binary), nullptr, false);
+                            bool hasPrimary = false;
+                            bool hasCompositor = false;
+                            bool everyFileExists = !savedManifest.is_discarded();
+                            for (const auto& file : savedManifest.value(
+                                     "files", std::vector<std::string>{})) {
+                                hasPrimary = hasPrimary || file.starts_with("primary/");
+                                hasCompositor = hasCompositor || file.starts_with("compositor/");
+                                everyFileExists = everyFileExists &&
+                                    fs::is_regular_file(entry.path() / Utf8ToWide(file));
+                            }
+                            manifestFound = everyFileExists && hasPrimary && hasCompositor;
+                        }
+                    }
+                    const std::string cleanupHash = jobs.back().projectHash;
+                    bool deleted = manifestFound && origin.DeleteJob(jobId, lifecycleError);
+                    bool metadataRemoved = true;
+                    for (const auto& current : origin.Jobs())
+                        metadataRemoved = metadataRemoved && current.id != jobId;
+                    bool remoteCacheRemoved = false;
+                    auto cleanupDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(2);
+                    while (deleted && std::chrono::steady_clock::now() < cleanupDeadline) {
+                        remoteCacheRemoved = !CacheEntryValid(workerRoot, cleanupHash);
+                        if (remoteCacheRemoved) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                    clusterOk = deleted && metadataRemoved && remoteCacheRemoved;
+                    if (!clusterOk)
+                        error = L"job lifecycle cleanup self-test failed: " + lifecycleError;
                 }
                 if (clusterOk) {
                     worker.Stop();

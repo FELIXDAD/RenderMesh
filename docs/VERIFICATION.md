@@ -47,6 +47,8 @@
 21. 0.2.7 在公开 `NodeApp::SubmitPrepared` seam 上以不允许共享的 Windows 文件句柄独占 packed 工程 250 ms：旧实现稳定返回 `Transient locked-source submission self-test failed: 无法复制已打包工程`；加入仅针对瞬时文件竞争的 50 ms/最长 5 秒重试后，同一测试创建任务成功，完整内置自检返回 0。永久错误与超时仍返回原 Windows 错误，不会创建半任务。
 22. 0.2.8 在双 NodeApp 公共 seam 中把五帧 Worker 测试包设为逐帧可观察：旧实现必须等五帧结束，自检以 `per-frame result streaming self-test failed` 返回 1；改为运行中消费原子清单后，第 1 帧主图与 AOV 已在 Origin 落盘时后四帧仍未完成，完整自检返回 0。随后用 `D:\05_Documents\Desktop\测试.blend` 和 Blender 5.2 做真实第 1 帧验证，清单同时记录主 PNG 与 6,213,274 字节多层 EXR `compositor/output-0/测试_000001.exr`；原 `{blend_name}` 不再退化为缓存名 `source`，且固定文件名补帧号避免包内覆盖。
 
+23. 0.2.9 把作业元数据迁移到静态 SQLite WAL，历史列表按提交时间倒序且不按数量截断；终态满七天后保留“（过期）”元数据并清理托管副本。内置测试覆盖 `jobs.json` 导入后删除不复活、优先级/FIFO 比较、主序列与合成器结果原子另存、协议 v8 清理能力签名、远端缓存删除和确定性的活动投影；UI 回归继续验证 1 Hz 空闲心跳、16 ms 突发合帧、滚动/选择/焦点保持及无全表重置。
+
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 
 ## 便携性

@@ -12,6 +12,7 @@ using rm::ui::OperationType;
 using rm::ui::Row;
 using rm::ui::StableTableModel;
 using rm::ui::WorkerActivityView;
+using rm::ui::JobHistoryView;
 using namespace std::chrono_literals;
 
 Row MakeRow(std::wstring key, std::initializer_list<const wchar_t*> cells) {
@@ -159,6 +160,45 @@ void EmptyWorkerActivityUsesAnEmDash() {
            "an idle worker should not show an assigned count");
 }
 
+void NewestJobsAreDisplayedFirstWithoutTruncation() {
+    const auto base = std::chrono::system_clock::time_point{};
+    std::vector<JobHistoryView> jobs = {
+        {L"old", L"Old", 0, base + 1h, {}},
+        {L"new", L"New", 0, base + 3h, {}},
+        {L"middle", L"Middle", 0, base + 2h, {}},
+    };
+    rm::ui::SortJobsForDisplay(jobs);
+    Expect(jobs.size() == 3, "display ordering must retain every history row");
+    Expect(jobs[0].id == L"new" && jobs[1].id == L"middle" && jobs[2].id == L"old",
+           "newest submitted job should appear at the top");
+}
+
+void TerminalJobsExpireAfterSevenDays() {
+    const auto base = std::chrono::system_clock::time_point{} + 100h;
+    JobHistoryView finished{L"done", L"Scene", 0, base, base + 1h};
+    Expect(!rm::ui::IsExpiredJob(finished, base + 8h),
+           "a recently finished job must not expire");
+    Expect(rm::ui::IsExpiredJob(finished, base + 1h + 24h * 7),
+           "a terminal job expires exactly seven days after finishing");
+    Expect(rm::ui::DisplayJobName(finished, base + 1h + 24h * 7) == L"（过期）Scene",
+           "expired history should keep its row and prefix the scene name");
+
+    JobHistoryView active{L"active", L"Long render", 0, base, {}};
+    Expect(!rm::ui::IsExpiredJob(active, base + 24h * 30),
+           "an active job must never expire from submission age alone");
+}
+
+void PriorityWinsThenOldestSubmissionWins() {
+    const auto base = std::chrono::system_clock::time_point{};
+    JobHistoryView normalOld{L"a", L"A", 0, base + 1h, {}};
+    JobHistoryView normalNew{L"b", L"B", 0, base + 2h, {}};
+    JobHistoryView urgentNew{L"c", L"C", 100, base + 3h, {}};
+    Expect(rm::ui::DispatchesBefore(urgentNew, normalOld),
+           "an explicitly prioritised job should dispatch first");
+    Expect(rm::ui::DispatchesBefore(normalOld, normalNew),
+           "equal priority should preserve FIFO scheduling");
+}
+
 }  // namespace
 
 int main() {
@@ -171,6 +211,9 @@ int main() {
     RefreshBurstIsCoalescedToOneDisplayFrame();
     ActiveWorkerShowsJobFramesAndProgress();
     EmptyWorkerActivityUsesAnEmDash();
+    NewestJobsAreDisplayedFirstWithoutTruncation();
+    TerminalJobsExpireAfterSevenDays();
+    PriorityWinsThenOldestSubmissionWins();
     std::cout << "UI_MODEL_TESTS_OK\n";
     return 0;
 }

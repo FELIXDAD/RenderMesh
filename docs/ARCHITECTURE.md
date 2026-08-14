@@ -47,7 +47,7 @@ Blender 5.2 的活动场景允许第 0 帧，RenderMesh 会正确读取、显示
 ```text
 %LOCALAPPDATA%\RenderMesh\
   config.json
-  jobs.json
+  jobs.db
   contributions.json
   logs\RenderMesh-YYYY-MM-DD.log
   tools\preflight.py
@@ -64,7 +64,7 @@ Blender 5.2 的活动场景允许第 0 帧，RenderMesh 会正确读取、显示
 
 程序重启时，把未完成的 Assigned/Dispatching/Rendering 帧恢复为 Pending；完成结果和错误记录保留。Worker 在缓存上传、接单和任务结束时刷新 `last-used`；后台只在没有活跃任务时清理最后使用超过七天的工程目录。协议 v2 的逐帧临时目录只保存输出并在回传后删除；协议 v1 的临时工程也按旧逻辑随帧删除。
 
-`jobs.json` 同时记录源 `.blend` 路径、每帧开始/结束时间和 Stopped 状态。`contributions.json` 最多保留 5000 个 Worker 任务包历史，包含来源、分配帧、已回传帧、状态与时间；两者均使用独立临时文件原子替换。
+`jobs.db` 记录源 `.blend` 路径、每帧开始/结束时间、Stopped 状态、终态时间、清理时间和优先级；`contributions.json` 最多保留 5000 个 Worker 任务包历史，包含来源、分配帧、已回传帧、状态与时间，并使用独立临时文件原子替换。
 
 ## Blender 进程边界
 
@@ -82,6 +82,12 @@ blender --background --disable-autoexec source.blend
 ## 节点活动展示
 
 协议 v7 在既有发现心跳中增加并签名 Worker 当前作业名、帧包、完成数和渲染阶段。服务器页因此可以在“已分配”列显示每台电脑正在渲染的作业和帧进度，不传输工程绝对路径。手动连接会用随机 challenge 对同一份活动快照单独做 HMAC 验证，不能把一次认证证明拼接到被篡改的 `/health` 数据；活动期间以 300ms 合并轮询，空闲时回到 1 秒。旧节点继续退化为仅显示“正在渲染”。
+
+## 作业历史、优先级与清理
+
+任务元数据存入静态嵌入 SQLite 的 `jobs.db`，旧 `jobs.json` 首次启动时自动导入并留下 `.pre-sqlite-backup`。SQLite 使用 WAL 事务，禁用扩展加载和 DQS，仍保持单 EXE。任务历史不按数量截断，列表按提交时间倒序显示；调度按优先级降序、同优先级提交时间升序选择下一任务包，不抢占正在渲染的帧。
+
+任务进入 Completed、Failed 或 Stopped 终态满七天后保留历史行并显示“（过期）”，只清理 RenderMesh 托管目录和远端缓存，不删除原始 `.blend` 或已经发布到用户目录的结果。协议 v8 显式声明并签名 `job_cleanup` 能力；`/v4/job-cleanup` 只接受内部集群凭证、合法 Job ID、工程 SHA-256 和幂等 operation ID。Origin 为离线节点持久保留清理请求，节点重连并声明该能力后继续执行；Worker 渲染中返回 409 让 Origin 重试，空闲时只删除自身数据目录内匹配的任务临时目录和工程缓存。
 
 ## 生产化后续
 

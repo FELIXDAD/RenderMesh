@@ -234,6 +234,7 @@ struct FrameTask {
     int dispatchAttempts = 0;
     std::string attemptToken;
     fs::path output;
+    std::map<std::string, fs::path> artifacts;
     std::string error;
     std::chrono::system_clock::time_point startedAt{};
     std::chrono::system_clock::time_point endedAt{};
@@ -252,8 +253,12 @@ struct RenderJob {
     bool requiresGpu = false;
     std::map<int, fs::path> primaryOutputs;
     std::vector<OutputTarget> compositorOutputs;
+    std::vector<std::string> remoteNodeIds;
     std::vector<FrameTask> frames;
     std::chrono::system_clock::time_point createdAt;
+    std::chrono::system_clock::time_point finishedAt{};
+    std::chrono::system_clock::time_point artifactsPurgedAt{};
+    int priority = 0;
 };
 
 struct ContributionRecord {
@@ -285,6 +290,7 @@ struct Peer {
     bool supportsFramePackages = false;
     bool supportsResultBundles = false;
     bool supportsPackageCancellation = false;
+    bool supportsJobCleanup = false;
     std::string nodeId;
     std::string name;
     std::string address;
@@ -350,11 +356,17 @@ public:
     std::wstring ManualPeerStatus() const;
     std::vector<Peer> Peers() const;
     std::vector<RenderJob> Jobs() const;
+    std::optional<RenderJob> FindJob(const std::string& jobId) const;
     std::vector<ContributionRecord> Contributions() const;
     bool StopJob(const std::string& jobId, std::wstring& error);
+    bool SetJobPriority(const std::string& jobId, bool prioritised, std::wstring& error);
+    bool SaveJobAs(const std::string& jobId, const fs::path& destination,
+                   std::wstring& error) const;
+    bool DeleteJob(const std::string& jobId, std::wstring& error);
     HardwareInfo Hardware() const;
     int AssignedCount() const;
     WorkerActivity CurrentActivity() const;
+    uint64_t JobRevision() const;
     bool Running() const { return running_; }
 
     // In-process transport test seam. Production peers still come from UDP discovery.

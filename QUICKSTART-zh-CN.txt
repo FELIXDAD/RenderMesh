@@ -1,4 +1,4 @@
-RenderMesh 0.2.8（Windows x64）
+RenderMesh 0.2.9（Windows x64）
 
 无需安装、无需 Python、无需 .NET、无需管理员权限。
 

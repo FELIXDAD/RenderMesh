@@ -7,6 +7,7 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
 #include <wincodec.h>
 
@@ -14,6 +15,7 @@
 #include <array>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <unordered_map>
 
 namespace {
@@ -24,6 +26,7 @@ constexpr UINT WM_RM_REFRESH = WM_APP + 1;
 constexpr UINT WM_RM_PREFLIGHT = WM_APP + 2;
 constexpr UINT WM_RM_PREVIEW_READY = WM_APP + 3;
 constexpr UINT WM_RM_INSPECTION = WM_APP + 4;
+constexpr UINT WM_RM_JOB_OPERATION = WM_APP + 5;
 constexpr UINT_PTR TIMER_HEARTBEAT = 1;
 constexpr UINT_PTR TIMER_BURST_REFRESH = 3;
 constexpr UINT_PTR TIMER_UI_TEST_REPORT = 4;
@@ -77,6 +80,14 @@ enum ControlId {
     ID_DETAIL_OPEN_OUTPUT,
     ID_DETAIL_STOP,
     ID_DETAIL_PREVIEW_STATUS,
+    ID_JOB_PRIORITY = 400,
+    ID_JOB_SAVE_AS,
+    ID_JOB_OPEN_OUTPUT,
+    ID_JOB_CONTEXT_DETAILS,
+    ID_JOB_COPY_ID,
+    ID_JOB_COPY_NAME,
+    ID_JOB_COPY_BOTH,
+    ID_JOB_DELETE,
 };
 
 std::unique_ptr<NodeApp> gApp;
@@ -90,6 +101,8 @@ std::thread gInspection;
 std::atomic<bool> gInspectionRunning = false;
 std::atomic<bool> gInspectionStop = false;
 std::atomic<uint64_t> gInspectionGeneration = 0;
+std::thread gJobOperation;
+std::atomic<bool> gJobOperationRunning = false;
 HWND gDetailWindow = nullptr;
 std::string gDetailJobId;
 HBITMAP gPreviewBitmap = nullptr;
@@ -118,6 +131,7 @@ uint64_t gListMutationCount = 0;
 uint64_t gRefreshCount = 0;
 uint64_t gHeartbeatTimerRefreshCount = 0;
 uint64_t gBurstTimerRefreshCount = 0;
+uint64_t gLastJobRevision = std::numeric_limits<uint64_t>::max();
 ID2D1Factory* gD2dFactory = nullptr;
 IDWriteFactory* gDwriteFactory = nullptr;
 ID2D1HwndRenderTarget* gRenderTarget = nullptr;
@@ -126,6 +140,11 @@ IDWriteTextFormat* gCardLabelFormat = nullptr;
 HIMAGELIST gRowHeightImages = nullptr;
 SIZE gLayoutBaseClient{};
 std::unordered_map<HWND, RECT> gBaseControlRects;
+
+struct JobOperationResult {
+    bool ok = false;
+    std::wstring message;
+};
 
 struct DashboardView {
     int onlineNodes = 0;
@@ -369,8 +388,7 @@ std::wstring WorkerActivityText(const WorkerActivity& activity, int assigned) {
 
 std::optional<RenderJob> FindJob(const std::string& id) {
     if (!gApp) return std::nullopt;
-    for (auto& job : gApp->Jobs()) if (job.id == id) return job;
-    return std::nullopt;
+    return gApp->FindJob(id);
 }
 
 bool SystemUsesDarkTheme() {
@@ -920,6 +938,10 @@ void UpdateFramePreview() {
     });
 }
 
+void CopyText(const std::wstring& text);
+void OpenSelectedJobDetail();
+void RefreshLists();
+
 std::wstring ChooseFile(const wchar_t* filter, const wchar_t* title) {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{};
@@ -931,6 +953,223 @@ std::wstring ChooseFile(const wchar_t* filter, const wchar_t* title) {
     dialog.lpstrTitle = title;
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     return GetOpenFileNameW(&dialog) ? path : L"";
+}
+
+std::wstring ChooseFolder(const wchar_t* title) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog))))
+        return {};
+    dialog->SetTitle(title);
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                       FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+    std::wstring selected;
+    if (SUCCEEDED(dialog->Show(gWindow))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                selected = path;
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return selected;
+}
+
+std::optional<RenderJob> SelectedJob() {
+    HWND jobs = Item(ID_JOBS);
+    const int selected = ListView_GetNextItem(jobs, -1, LVNI_SELECTED);
+    if (selected < 0 || selected >= static_cast<int>(gJobRows.Rows().size()))
+        return std::nullopt;
+    return FindJob(WideToUtf8(gJobRows.Rows()[static_cast<size_t>(selected)].key));
+}
+
+struct MenuItemData {
+    const wchar_t* text;
+    bool danger = false;
+    bool submenu = false;
+};
+
+void MeasureContextMenuItem(MEASUREITEMSTRUCT& item) {
+    auto* data = reinterpret_cast<const MenuItemData*>(item.itemData);
+    HDC dc = GetDC(gWindow);
+    HFONT previous = static_cast<HFONT>(SelectObject(dc, gFont));
+    SIZE text{};
+    if (data && data->text)
+        GetTextExtentPoint32W(dc, data->text, static_cast<int>(wcslen(data->text)), &text);
+    SelectObject(dc, previous);
+    ReleaseDC(gWindow, dc);
+    item.itemWidth = std::max<UINT>(210, static_cast<UINT>(text.cx + 64));
+    item.itemHeight = 34;
+}
+
+void DrawContextMenuItem(const DRAWITEMSTRUCT& item) {
+    auto* data = reinterpret_cast<const MenuItemData*>(item.itemData);
+    const bool selected = (item.itemState & ODS_SELECTED) != 0;
+    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    COLORREF background = selected ? RGB(37, 62, 48)
+        : gDarkTheme ? RGB(31, 31, 40) : RGB(250, 250, 252);
+    HBRUSH brush = CreateSolidBrush(background);
+    FillRect(item.hDC, &item.rcItem, brush);
+    DeleteObject(brush);
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, disabled ? RGB(112, 114, 124)
+        : data && data->danger ? RGB(255, 116, 122)
+        : gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+    HFONT previous = static_cast<HFONT>(SelectObject(item.hDC, gFont));
+    RECT textRect = item.rcItem;
+    textRect.left += 18;
+    DrawTextW(item.hDC, data && data->text ? data->text : L"", -1, &textRect,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    if (data && data->submenu) {
+        RECT arrowRect = item.rcItem;
+        arrowRect.right -= 14;
+        DrawTextW(item.hDC, L"›", 1, &arrowRect,
+                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    }
+    SelectObject(item.hDC, previous);
+    if (item.itemState & ODS_FOCUS) {
+        RECT focus = item.rcItem;
+        InflateRect(&focus, -3, -3);
+        DrawFocusRect(item.hDC, &focus);
+    }
+}
+
+void StartSaveJobAs(const RenderJob& job) {
+    if (gJobOperationRunning.load()) {
+        MessageBoxW(gWindow, L"已有另存操作正在进行。", L"RenderMesh", MB_ICONINFORMATION);
+        return;
+    }
+    const std::wstring destination = ChooseFolder(L"选择作业序列的另存位置");
+    if (destination.empty()) return;
+    if (gJobOperation.joinable()) gJobOperation.join();
+    gJobOperationRunning = true;
+    const std::string jobId = job.id;
+    gJobOperation = std::thread([jobId, destination] {
+        auto* result = new JobOperationResult;
+        result->ok = gApp->SaveJobAs(jobId, destination, result->message);
+        if (result->ok) result->message = L"作业序列已另存完成。";
+        gJobOperationRunning = false;
+        if (!PostMessageW(gWindow, WM_RM_JOB_OPERATION, 0,
+                          reinterpret_cast<LPARAM>(result)))
+            delete result;
+    });
+}
+
+void ExecuteJobContextCommand(UINT command, const RenderJob& job) {
+    std::wstring error;
+    switch (command) {
+        case ID_JOB_PRIORITY:
+            if (!gApp->SetJobPriority(job.id, job.priority == 0, error))
+                MessageBoxW(gWindow, error.c_str(), L"RenderMesh", MB_ICONWARNING);
+            break;
+        case ID_JOB_SAVE_AS:
+            StartSaveJobAs(job);
+            break;
+        case ID_JOB_OPEN_OUTPUT: {
+            fs::path directory;
+            for (const auto& frame : job.frames) {
+                if (!frame.output.empty() && fs::exists(frame.output)) {
+                    directory = frame.output.parent_path();
+                    break;
+                }
+            }
+            if (directory.empty())
+                directory = gApp->DataDir() / L"jobs" / Utf8ToWide(job.id) / L"outputs";
+            ShellExecuteW(gWindow, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        case ID_JOB_CONTEXT_DETAILS:
+            OpenSelectedJobDetail();
+            break;
+        case ID_JOB_COPY_ID:
+            CopyText(Utf8ToWide(job.id));
+            break;
+        case ID_JOB_COPY_NAME:
+            CopyText(Utf8ToWide(job.name));
+            break;
+        case ID_JOB_COPY_BOTH:
+            CopyText(Utf8ToWide(job.id + "  " + job.name));
+            break;
+        case ID_JOB_DELETE: {
+            const std::wstring prompt = L"删除作业“" + Utf8ToWide(job.name) +
+                L"”？\n\n将停止未完成帧，删除 RenderMesh 托管副本并通知远端节点；"
+                L"不会删除原始 .blend 和已发布到用户目录的结果。";
+            if (MessageBoxW(gWindow, prompt.c_str(), L"删除作业",
+                            MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2) == IDOK &&
+                !gApp->DeleteJob(job.id, error))
+                MessageBoxW(gWindow, error.c_str(), L"RenderMesh", MB_ICONWARNING);
+            break;
+        }
+    }
+    RefreshLists();
+}
+
+void ShowJobContextMenu(POINT screenPoint) {
+    auto job = SelectedJob();
+    if (!job) return;
+    static const MenuItemData priorityOn{L"优先渲染"};
+    static const MenuItemData priorityOff{L"取消优先"};
+    static const MenuItemData saveAs{L"另存为…"};
+    static const MenuItemData openOutput{L"打开本地下载目录"};
+    static const MenuItemData details{L"查看作业详情"};
+    static const MenuItemData copy{L"复制", false, true};
+    static const MenuItemData copyId{L"作业 ID"};
+    static const MenuItemData copyName{L"场景名"};
+    static const MenuItemData copyBoth{L"作业 ID + 场景名"};
+    static const MenuItemData remove{L"删除作业", true};
+    HMENU menu = CreatePopupMenu();
+    HMENU copyMenu = CreatePopupMenu();
+    const bool hasPending = std::any_of(job->frames.begin(), job->frames.end(),
+        [](const FrameTask& frame) {
+            return frame.state == TaskState::Pending ||
+                frame.state == TaskState::Dispatching ||
+                frame.state == TaskState::Assigned ||
+                frame.state == TaskState::Rendering;
+        });
+    const bool hasCompleted = std::any_of(job->frames.begin(), job->frames.end(),
+        [](const FrameTask& frame) {
+            return frame.state == TaskState::Completed && !frame.output.empty();
+        });
+    AppendMenuW(menu, MF_OWNERDRAW | (hasPending ? 0 : MF_GRAYED), ID_JOB_PRIORITY,
+                reinterpret_cast<LPCWSTR>(job->priority > 0 ? &priorityOff : &priorityOn));
+    AppendMenuW(menu, MF_OWNERDRAW | (hasCompleted &&
+                job->artifactsPurgedAt.time_since_epoch() ==
+                    std::chrono::system_clock::duration::zero() ? 0 : MF_GRAYED), ID_JOB_SAVE_AS,
+                reinterpret_cast<LPCWSTR>(&saveAs));
+    AppendMenuW(menu, MF_OWNERDRAW, ID_JOB_OPEN_OUTPUT,
+                reinterpret_cast<LPCWSTR>(&openOutput));
+    AppendMenuW(menu, MF_OWNERDRAW, ID_JOB_CONTEXT_DETAILS,
+                reinterpret_cast<LPCWSTR>(&details));
+    AppendMenuW(copyMenu, MF_OWNERDRAW, ID_JOB_COPY_ID,
+                reinterpret_cast<LPCWSTR>(&copyId));
+    AppendMenuW(copyMenu, MF_OWNERDRAW, ID_JOB_COPY_NAME,
+                reinterpret_cast<LPCWSTR>(&copyName));
+    AppendMenuW(copyMenu, MF_OWNERDRAW, ID_JOB_COPY_BOTH,
+                reinterpret_cast<LPCWSTR>(&copyBoth));
+    AppendMenuW(menu, MF_POPUP | MF_OWNERDRAW,
+                reinterpret_cast<UINT_PTR>(copyMenu), reinterpret_cast<LPCWSTR>(&copy));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_OWNERDRAW, ID_JOB_DELETE,
+                reinterpret_cast<LPCWSTR>(&remove));
+    MENUINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = MIM_BACKGROUND | MIM_STYLE;
+    info.hbrBack = gSurfaceBrush;
+    info.dwStyle = MNS_CHECKORBMP;
+    SetMenuInfo(menu, &info);
+    SetMenuInfo(copyMenu, &info);
+    SetForegroundWindow(gWindow);
+    const UINT command = TrackPopupMenuEx(
+        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
+        screenPoint.x, screenPoint.y, gWindow, nullptr);
+    DestroyMenu(menu);
+    if (command) ExecuteJobContextCommand(command, *job);
 }
 
 void CopyText(const std::wstring& text) {
@@ -1118,9 +1357,22 @@ void RefreshLists() {
             L"本机空闲 " + std::to_wstring(idleSeconds) + L" 秒  ·  " +
             (nextDashboard.blenderReady ? L"Blender 已就绪" : L"Blender 未检测到"));
     } else if (gCurrentPage == 1) {
-        const auto values = gApp->Jobs();
+        const uint64_t revision = gApp->JobRevision();
+        if (revision == gLastJobRevision) {
+            if (gDetailWindow) RefreshJobDetail();
+            gLastRefresh = std::chrono::steady_clock::now();
+            return;
+        }
+        gLastJobRevision = revision;
+        auto values = gApp->Jobs();
+        std::stable_sort(values.begin(), values.end(), [](const RenderJob& left,
+                                                          const RenderJob& right) {
+            if (left.createdAt != right.createdAt) return left.createdAt > right.createdAt;
+            return left.id > right.id;
+        });
         std::vector<ui::Row> jobRows;
         jobRows.reserve(values.size());
+        const auto now = std::chrono::system_clock::now();
         for (const auto& job : values) {
             int completed = 0, failed = 0, stopped = 0, active = 0;
             std::chrono::system_clock::time_point started{}, ended{};
@@ -1149,7 +1401,9 @@ void RefreshLists() {
             jobRows.push_back({
                 Utf8ToWide(job.id),
                 {
-                    Utf8ToWide(job.name), state,
+                    ui::DisplayJobName({Utf8ToWide(job.id), Utf8ToWide(job.name),
+                                        job.priority, job.createdAt, job.finishedAt}, now),
+                    job.priority > 0 ? L"优先 · " + state : state,
                     std::to_wstring(job.frames.size()),
                     std::to_wstring(completed) + L" / " +
                         std::to_wstring(job.frames.size()),
@@ -1348,7 +1602,7 @@ void BuildUi() {
                          250, 178, 976, 24, ID_TASK_HELP));
     PageControl(1, AddControl(L"STATIC", L"等待选择工程", SS_LEFT,
                               250, 210, 976, 45, ID_PREFLIGHT));
-    PageControl(1, Label(L"任务队列", 250, 274, 440, 26, ID_TASK_QUEUE_LABEL));
+    PageControl(1, Label(L"任务队列 · 新任务在上", 250, 274, 440, 26, ID_TASK_QUEUE_LABEL));
     HWND jobs = PageControl(1, AddControl(
         WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         250, 304, 976, 350, ID_JOBS));
@@ -2232,14 +2486,54 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             return 0;
         case WM_DRAWITEM:
-            DrawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            if (reinterpret_cast<DRAWITEMSTRUCT*>(lParam)->CtlType == ODT_MENU)
+                DrawContextMenuItem(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            else
+                DrawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
             return TRUE;
+        case WM_MEASUREITEM:
+            if (reinterpret_cast<MEASUREITEMSTRUCT*>(lParam)->CtlType == ODT_MENU) {
+                MeasureContextMenuItem(*reinterpret_cast<MEASUREITEMSTRUCT*>(lParam));
+                return TRUE;
+            }
+            break;
+        case WM_CONTEXTMENU:
+            if (reinterpret_cast<HWND>(wParam) == Item(ID_JOBS)) {
+                POINT point{static_cast<int>(static_cast<short>(LOWORD(lParam))),
+                            static_cast<int>(static_cast<short>(HIWORD(lParam)))};
+                if (point.x == -1 && point.y == -1) {
+                    const int selected = ListView_GetNextItem(Item(ID_JOBS), -1, LVNI_SELECTED);
+                    RECT row{};
+                    if (selected >= 0 && ListView_GetItemRect(
+                            Item(ID_JOBS), selected, &row, LVIR_BOUNDS)) {
+                        point = {row.left + 20, row.bottom};
+                        ClientToScreen(Item(ID_JOBS), &point);
+                    } else {
+                        GetCursorPos(&point);
+                    }
+                }
+                ShowJobContextMenu(point);
+                return 0;
+            }
+            break;
         case WM_NOTIFY: {
             auto* header = reinterpret_cast<NMHDR*>(lParam);
             if (header->code == NM_CUSTOMDRAW)
                 return HandleListCustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
             if (header->idFrom == ID_JOBS && header->code == NM_DBLCLK)
                 OpenSelectedJobDetail();
+            if (header->idFrom == ID_JOBS && header->code == NM_RCLICK) {
+                auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (click->iItem >= 0) {
+                    ListView_SetItemState(Item(ID_JOBS), click->iItem,
+                                          LVIS_SELECTED | LVIS_FOCUSED,
+                                          LVIS_SELECTED | LVIS_FOCUSED);
+                    POINT point = click->ptAction;
+                    ClientToScreen(Item(ID_JOBS), &point);
+                    ShowJobContextMenu(point);
+                }
+                return 0;
+            }
             return 0;
         }
         case WM_TIMER:
@@ -2285,6 +2579,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             EnableWindow(Item(ID_SUBMIT), TRUE);
             return 0;
         }
+        case WM_RM_JOB_OPERATION: {
+            std::unique_ptr<JobOperationResult> result(
+                reinterpret_cast<JobOperationResult*>(lParam));
+            if (gJobOperation.joinable()) gJobOperation.join();
+            if (result)
+                MessageBoxW(window, result->message.c_str(), L"RenderMesh",
+                            result->ok ? MB_ICONINFORMATION : MB_ICONWARNING);
+            return 0;
+        }
         case WM_CLOSE:
             if (gInspectionRunning.load() || gInspection.joinable()) {
                 SetText(ID_PREFLIGHT, L"正在中止工程读取并安全退出…");
@@ -2307,6 +2610,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             KillTimer(window, TIMER_HEARTBEAT);
             KillTimer(window, TIMER_BURST_REFRESH);
             KillTimer(window, TIMER_UI_TEST_REPORT);
+            if (gJobOperation.joinable()) gJobOperation.join();
             gWindow = nullptr;
             PostQuitMessage(0);
             return 0;

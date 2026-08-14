@@ -1,6 +1,6 @@
 # Third-party notices
 
-RenderMesh vendors these header-only MIT-licensed libraries:
+RenderMesh vendors the following libraries:
 
 ## cpp-httplib 0.53.0
 
@@ -17,6 +17,14 @@ Copyright 2013-2025 Niels Lohmann
 Source: https://github.com/nlohmann/json
 
 MIT License: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the conditions in the upstream license. The software is provided "AS IS", without warranty of any kind.
+
+## SQLite 3.53.4
+
+Source: https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+
+SQLite is in the public domain and is statically compiled into RenderMesh. The
+upstream project provides additional warranty-of-title documentation at
+https://www.sqlite.org/copyright.html.
 
 ## MIT License text applying to both libraries
 

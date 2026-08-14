@@ -56,6 +56,31 @@ std::wstring FormatWorkerActivity(const WorkerActivityView& activity) {
     return value;
 }
 
+bool IsExpiredJob(const JobHistoryView& job,
+                  std::chrono::system_clock::time_point now) {
+    if (job.finishedAt.time_since_epoch() ==
+        std::chrono::system_clock::duration::zero()) return false;
+    return now - job.finishedAt >= std::chrono::hours(24 * 7);
+}
+
+std::wstring DisplayJobName(const JobHistoryView& job,
+                            std::chrono::system_clock::time_point now) {
+    return IsExpiredJob(job, now) ? L"\uff08\u8fc7\u671f\uff09" + job.name : job.name;
+}
+
+void SortJobsForDisplay(std::vector<JobHistoryView>& jobs) {
+    std::stable_sort(jobs.begin(), jobs.end(), [](const auto& left, const auto& right) {
+        if (left.createdAt != right.createdAt) return left.createdAt > right.createdAt;
+        return left.id > right.id;
+    });
+}
+
+bool DispatchesBefore(const JobHistoryView& left, const JobHistoryView& right) {
+    if (left.priority != right.priority) return left.priority > right.priority;
+    if (left.createdAt != right.createdAt) return left.createdAt < right.createdAt;
+    return left.id < right.id;
+}
+
 std::vector<Operation> StableTableModel::Reconcile(std::vector<Row> next) {
     std::vector<Operation> operations;
 

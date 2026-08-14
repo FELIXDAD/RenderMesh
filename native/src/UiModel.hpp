@@ -40,6 +40,21 @@ struct WorkerActivityView {
     bool rendering = false;
 };
 
+struct JobHistoryView {
+    std::wstring id;
+    std::wstring name;
+    int priority = 0;
+    std::chrono::system_clock::time_point createdAt{};
+    std::chrono::system_clock::time_point finishedAt{};
+};
+
+bool IsExpiredJob(const JobHistoryView& job,
+                  std::chrono::system_clock::time_point now);
+std::wstring DisplayJobName(const JobHistoryView& job,
+                            std::chrono::system_clock::time_point now);
+void SortJobsForDisplay(std::vector<JobHistoryView>& jobs);
+bool DispatchesBefore(const JobHistoryView& left, const JobHistoryView& right);
+
 std::wstring FormatWorkerActivity(const WorkerActivityView& activity);
 
 enum class OperationType { Insert, Erase, Move, Update };

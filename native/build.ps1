@@ -16,6 +16,7 @@ if (-not $toolchain) {
 }
 $bin = Join-Path $toolchain.FullName 'bin'
 $compiler = Join-Path $bin 'clang++.exe'
+$cCompiler = Join-Path $bin 'clang.exe'
 $resourceCompiler = Join-Path $bin 'llvm-windres.exe'
 $buildDir = Join-Path $nativeRoot "build\$Configuration"
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
@@ -23,6 +24,12 @@ New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 $resource = Join-Path $buildDir 'RenderMesh.res.o'
 & $resourceCompiler --codepage=65001 (Join-Path $nativeRoot 'RenderMesh.rc') -O coff -o $resource
 if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
+
+$sqliteObject = Join-Path $buildDir 'sqlite3.o'
+& $cCompiler -std=c17 -Os -DSQLITE_THREADSAFE=1 -DSQLITE_DQS=0 `
+    -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 `
+    -c (Join-Path $nativeRoot 'third_party\sqlite\sqlite3.c') -o $sqliteObject
+if ($LASTEXITCODE -ne 0) { throw 'SQLite compilation failed.' }
 
 $common = @(
     '-std=c++20', '-DUNICODE', '-D_UNICODE', '-D_WIN32_WINNT=0x0A00',
@@ -39,6 +46,7 @@ $sources = @(
     (Join-Path $nativeRoot 'src\Node.cpp'),
     (Join-Path $nativeRoot 'src\UiModel.cpp'),
     (Join-Path $nativeRoot 'src\WinMain.cpp'),
+    $sqliteObject,
     $resource
 )
 $output = Join-Path $buildDir 'RenderMesh.exe'
