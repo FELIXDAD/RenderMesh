@@ -43,6 +43,7 @@ std::string HmacSha256(const std::string& key, const std::string& value);
 fs::path ExecutableDirectory();
 fs::path DefaultDataDirectory();
 double IdleSeconds();
+bool IsComputerIdleForSharedWork(double idleSeconds, int idleAfterSeconds);
 std::optional<std::string> DirectedBroadcastAddress(
     const std::string& address, unsigned long prefixLength);
 std::wstring LocalEndpointSummary(int port);
@@ -66,7 +67,6 @@ struct Config {
     std::string clusterToken;
     bool pairingPending = false;
     bool shareEnabled = false;
-    int activeCpuPercent = 15;
     int idleAfterSeconds = 180;
     int httpPort = 8391;
     int discoveryPort = 8390;
@@ -110,7 +110,6 @@ struct PreflightReport {
     std::string renderEngine;
     std::string outputFormat;
     std::string outputExtension;
-    bool cpuSafeWhileActive = false;
     bool requiresGpu = false;
     std::vector<std::string> addons;
     std::vector<DependencyItem> missing;
@@ -157,7 +156,6 @@ bool RenderBlenderFrame(
     int frame,
     const std::string& outputFormat,
     const std::string& outputExtension,
-    bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
     std::wstring& error);
@@ -168,7 +166,6 @@ bool RenderBlenderPackage(
     const std::vector<int>& frames,
     const std::string& outputFormat,
     const std::string& outputExtension,
-    bool applySharingLimit,
     bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
@@ -217,7 +214,6 @@ struct RenderJob {
     std::string outputExtension = ".png";
     std::string blenderVersion;
     std::string renderEngine;
-    bool cpuSafeWhileActive = false;
     bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
     std::map<int, fs::path> primaryOutputs;
@@ -284,7 +280,6 @@ struct WorkItem {
     std::string outputExtension;
     std::string blenderVersion;
     std::string renderEngine;
-    bool cpuSafeWhileActive = false;
     bool requiresGpu = false;
     std::vector<std::string> requiredAddons;
     std::string attemptToken;
@@ -294,19 +289,6 @@ struct WorkItem {
     std::string originName;
     std::string originAddress;
     int originPort = 8391;
-};
-
-class WindowsJobLimiter {
-public:
-    WindowsJobLimiter();
-    ~WindowsJobLimiter();
-    WindowsJobLimiter(const WindowsJobLimiter&) = delete;
-    WindowsJobLimiter& operator=(const WindowsJobLimiter&) = delete;
-    bool Assign(HANDLE process, std::wstring& error);
-    bool SetCpuPercent(int percent, std::wstring& error);
-
-private:
-    HANDLE handle_ = nullptr;
 };
 
 class NodeApp {

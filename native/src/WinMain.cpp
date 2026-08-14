@@ -22,8 +22,6 @@ constexpr UINT WM_RM_PREVIEW_READY = WM_APP + 3;
 enum ControlId {
     ID_SHARE = 100,
     ID_NODE_NAME,
-    ID_CPU_SLIDER,
-    ID_CPU_VALUE,
     ID_IDLE_SECONDS,
     ID_BLENDER_PATH,
     ID_BROWSE_BLENDER,
@@ -531,8 +529,6 @@ void LoadConfigIntoUi() {
     SetText(ID_NODE_NAME, Utf8ToWide(config.nodeName));
     SendMessageW(Item(ID_SHARE), BM_SETCHECK,
                  config.shareEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(ID_CPU_SLIDER), TBM_SETPOS, TRUE, config.activeCpuPercent);
-    SetText(ID_CPU_VALUE, std::to_wstring(config.activeCpuPercent) + L"%");
     SetText(ID_IDLE_SECONDS, std::to_wstring(config.idleAfterSeconds));
     SetText(ID_BLENDER_PATH, config.blenderPath.wstring());
     SetText(ID_CLUSTER_TOKEN, Utf8ToWide(config.inviteCode));
@@ -544,7 +540,6 @@ void LoadConfigIntoUi() {
 Config ReadConfigFromUi() {
     Config config = gApp->GetConfig();
     config.nodeName = WideToUtf8(Text(Item(ID_NODE_NAME)));
-    config.activeCpuPercent = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
     config.idleAfterSeconds = std::clamp(IntValue(ID_IDLE_SECONDS, 180), 1, 86400);
     config.blenderPath = Text(Item(ID_BLENDER_PATH));
     config.inviteCode = WideToUtf8(Text(Item(ID_CLUSTER_TOKEN)));
@@ -601,9 +596,10 @@ void RefreshLists() {
     SetCell(nodes, row, 0, Utf8ToWide(config.nodeName) + L"（本机）");
     SetCell(nodes, row, 1, L"已信任");
     SetCell(nodes, row, 2, config.shareEnabled
-        ? (IdleSeconds() >= config.idleAfterSeconds ? L"空闲 · GPU可用" : L"活跃 · GPU等待")
+        ? (IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)
+               ? L"空闲 · 可接单" : L"活跃 · 等待")
         : L"未共享");
-    SetCell(nodes, row, 3, std::to_wstring(config.activeCpuPercent) + L"%");
+    SetCell(nodes, row, 3, L"仅空闲");
     SetCell(nodes, row, 4, std::to_wstring(gApp->AssignedCount()));
     SetCell(nodes, row, 5, Utf8ToWide(hardware.cpuModel));
     std::wstring localGpus;
@@ -618,10 +614,10 @@ void RefreshLists() {
         SetCell(nodes, row, 0, Utf8ToWide(peer.name));
         SetCell(nodes, row, 1, peer.trusted ? L"已信任" : L"邀请码不同");
         SetCell(nodes, row, 2, peer.shareEnabled
-            ? (peer.assigned ? L"正在渲染" : peer.idleSeconds >= config.idleAfterSeconds
-                    ? L"空闲 · GPU可用" : L"活跃 · GPU等待")
+            ? (peer.assigned ? L"正在渲染" :
+                    L"已空闲 " + std::to_wstring(static_cast<int>(peer.idleSeconds)) + L" 秒")
             : L"未共享");
-        SetCell(nodes, row, 3, std::to_wstring(peer.cpuPercent) + L"%");
+        SetCell(nodes, row, 3, L"仅空闲");
         SetCell(nodes, row, 4, std::to_wstring(peer.assigned));
         SetCell(nodes, row, 5, peer.cpuModel.empty() ? L"未报告" : Utf8ToWide(peer.cpuModel));
         std::wstring remoteGpus;
@@ -761,7 +757,7 @@ void BuildUi() {
     ListView_SetExtendedListViewStyle(nodes,
         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
     AddColumn(nodes, 0, 170, L"电脑"); AddColumn(nodes, 1, 85, L"连接");
-    AddColumn(nodes, 2, 140, L"算力状态"); AddColumn(nodes, 3, 85, L"活动限额");
+    AddColumn(nodes, 2, 140, L"算力状态"); AddColumn(nodes, 3, 85, L"调度策略");
     AddColumn(nodes, 4, 75, L"已分配"); AddColumn(nodes, 5, 220, L"CPU 型号");
     AddColumn(nodes, 6, 240, L"GPU 型号"); AddColumn(nodes, 7, 210, L"地址");
 
@@ -836,34 +832,29 @@ void BuildUi() {
     PageControl(3, Label(L"电脑名称", 270, 100, 155, 24));
     PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
                               445, 96, 350, 30, ID_NODE_NAME));
-    PageControl(3, Label(L"活跃状态 CPU 任务上限", 270, 154, 190, 24));
-    HWND slider = PageControl(3, AddControl(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS,
-                                            445, 146, 285, 38, ID_CPU_SLIDER));
-    SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELONG(1, 100));
-    PageControl(3, Label(L"15%", 742, 154, 55, 24, ID_CPU_VALUE));
-    PageControl(3, Label(L"无键鼠输入后启用 GPU（秒）", 270, 208, 240, 24));
+    PageControl(3, Label(L"无键鼠输入后进入闲置（秒）", 270, 154, 240, 24));
     PageControl(3, AddControl(L"EDIT", L"180", WS_BORDER | ES_NUMBER,
-                              520, 204, 110, 30, ID_IDLE_SECONDS));
-    PageControl(3, Label(L"Blender 程序", 270, 262, 155, 24));
+                              520, 150, 110, 30, ID_IDLE_SECONDS));
+    PageControl(3, Label(L"Blender 程序", 270, 208, 155, 24));
     PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
-                              445, 258, 650, 30, ID_BLENDER_PATH));
+                              445, 204, 650, 30, ID_BLENDER_PATH));
     PageControl(3, AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON,
-                              1105, 257, 90, 32, ID_BROWSE_BLENDER));
-    PageControl(3, Label(L"六位邀请码", 270, 316, 155, 24));
+                              1105, 203, 90, 32, ID_BROWSE_BLENDER));
+    PageControl(3, Label(L"六位邀请码", 270, 262, 155, 24));
     PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
-                              445, 312, 240, 30, ID_CLUSTER_TOKEN));
+                              445, 258, 240, 30, ID_CLUSTER_TOKEN));
     PageControl(3, AddControl(L"BUTTON", L"复制", BS_PUSHBUTTON,
-                              695, 311, 90, 32, ID_COPY_TOKEN));
-    PageControl(3, Label(L"外观", 270, 370, 155, 24));
+                              695, 257, 90, 32, ID_COPY_TOKEN));
+    PageControl(3, Label(L"外观", 270, 316, 155, 24));
     HWND theme = PageControl(3, AddControl(L"COMBOBOX", L"",
-        CBS_DROPDOWNLIST | WS_VSCROLL, 445, 366, 240, 120, ID_THEME));
+        CBS_DROPDOWNLIST | WS_VSCROLL, 445, 312, 240, 120, ID_THEME));
     SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"跟随系统"));
     SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"浅色"));
     SendMessageW(theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"深色"));
     PageControl(3, Label(L"端口 8391 · 后台日志按天保存在数据目录",
-                         270, 430, 600, 24));
+                         270, 376, 600, 24));
     PageControl(3, AddControl(L"BUTTON", L"保存设置", BS_OWNERDRAW,
-                              445, 486, 240, 40, ID_SAVE_SETTINGS));
+                              445, 432, 240, 40, ID_SAVE_SETTINGS));
     ShowPage(gInitialPage);
 }
 
@@ -1121,12 +1112,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 OpenSelectedJobDetail();
             }
             return 0;
-        case WM_HSCROLL:
-            if (reinterpret_cast<HWND>(lParam) == Item(ID_CPU_SLIDER)) {
-                int value = static_cast<int>(SendMessageW(Item(ID_CPU_SLIDER), TBM_GETPOS, 0, 0));
-                SetText(ID_CPU_VALUE, std::to_wstring(value) + L"%");
-            }
-            return 0;
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case ID_SHARE: {
@@ -1269,7 +1254,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     fs::path dataDir = DefaultDataDirectory();
-    bool selfTest = false, mock = false, headless = false, noDialog = false;
+    bool selfTest = false, headless = false, noDialog = false;
     fs::path preflightSource, preflightPrepared, preflightReport, blenderOverride;
     fs::path renderSource, renderOutputDir, compatibilitySource;
     fs::path previewSource, previewOutput;
@@ -1280,7 +1265,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::wstring arg = arguments[i];
         if (arg == L"--self-test") selfTest = true;
         else if (arg == L"--no-dialog") noDialog = true;
-        else if (arg == L"--mock-renderer") mock = true;
         else if (arg == L"--headless") headless = true;
         else if (arg == L"--data-dir" && i + 1 < argumentCount) dataDir = arguments[++i];
         else if (arg == L"--preflight" && i + 1 < argumentCount) preflightSource = arguments[++i];
@@ -1351,7 +1335,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             {"render_engine", result.renderEngine},
             {"render_format", result.outputFormat},
             {"file_extension", result.outputExtension},
-            {"cpu_safe_while_active", result.cpuSafeWhileActive},
             {"requires_gpu", result.requiresGpu},
             {"addons", result.addons}, {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
@@ -1400,7 +1383,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             std::map<int, std::vector<RenderArtifact>> artifacts;
             ok = !manifest.is_discarded() && RenderBlenderPackage(
                 renderConfig, renderSource, renderOutputDir, {renderFrame}, renderFormat,
-                manifest.value("file_extension", ".png"), false, false, stopRequested,
+                manifest.value("file_extension", ".png"), false, stopRequested,
                 finishCurrentThenStop, targets, artifacts, renderError);
             if (ok && artifacts.contains(renderFrame)) {
                 auto primary = std::find_if(
@@ -1415,7 +1398,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                                     renderFormat,
                                     renderFormat == "PNG" ? ".png" :
                                         renderFormat == "JPEG" ? ".jpg" : ".exr",
-                                    false, stopRequested, output, renderError);
+                                    stopRequested, output, renderError);
         }
         PrintToParentConsole(ok ? L"渲染成功：" + output.wstring() : renderError);
         return ok ? 0 : 4;
@@ -1445,7 +1428,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     ConfigStore store(dataDir);
     Config config = store.Load();
     if (overridePort >= 1024 && overridePort <= 65535) config.httpPort = overridePort;
-    gApp = std::make_unique<NodeApp>(std::move(store), config, mock);
+    gApp = std::make_unique<NodeApp>(std::move(store), config);
     std::wstring error;
     if (!gApp->Start(error)) {
         MessageBoxW(nullptr, error.c_str(), L"RenderMesh 启动失败", MB_ICONERROR);

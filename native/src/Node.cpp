@@ -869,7 +869,6 @@ struct NodeApp::Impl {
                     {"format", job.outputFormat}, {"extension", job.outputExtension},
                     {"version", job.blenderVersion},
                     {"render_engine", job.renderEngine},
-                    {"cpu_safe_while_active", job.cpuSafeWhileActive},
                     {"requires_gpu", job.requiresGpu},
                     {"primary_outputs", primaryOutputs},
                     {"compositor_outputs", compositorOutputs},
@@ -902,7 +901,6 @@ struct NodeApp::Impl {
                 job.outputExtension = row.value("extension", FrameExtension(job.outputFormat));
                 job.blenderVersion = row.value("version", "");
                 job.renderEngine = row.value("render_engine", "");
-                job.cpuSafeWhileActive = row.value("cpu_safe_while_active", false);
                 job.requiresGpu = row.value("requires_gpu", false);
                 job.requiredAddons = row.value("addons", std::vector<std::string>{});
                 json primaryOutputRows = row.value("primary_outputs", json::object());
@@ -1078,7 +1076,7 @@ struct NodeApp::Impl {
                      {"package_cancel", true},
                      {"node_id", config.nodeId},
                      {"name", config.nodeName}, {"share", config.shareEnabled},
-                     {"assigned", workerAssigned.load()}, {"cpu", config.activeCpuPercent},
+                     {"assigned", workerAssigned.load()}, {"cpu", 100},
                      {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
                      {"pairing_available", !config.pairingPending},
                      {"task_id", CurrentTaskId()}, {"idle", static_cast<int>(IdleSeconds())}}
@@ -1189,16 +1187,16 @@ struct NodeApp::Impl {
                 std::string hash = request.get_header_value("X-RM-Project");
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string engine = request.get_header_value("X-RM-Engine");
-                bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
                 bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
                 auto addons = HeaderStringList(request, "X-RM-Addons");
                 if (!SafeSha256(hash) || version.empty() || engine.empty()) {
                     response.status = 422;
                     return;
                 }
-                if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                if (!owner->mockRenderer_ &&
+                    !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                     response.status = 425;
-                    response.set_content("GPU project waits until this computer is idle",
+                    response.set_content("project waits until this computer is idle",
                                          "text/plain");
                     return;
                 }
@@ -1247,7 +1245,8 @@ struct NodeApp::Impl {
                     response.set_content("project hash mismatch", "text/plain");
                     return;
                 }
-                if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+                if (!owner->mockRenderer_ &&
+                    !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                     std::error_code ignored;
                     fs::remove_all(directory, ignored);
                     response.status = 425;
@@ -1260,7 +1259,7 @@ struct NodeApp::Impl {
                 std::atomic<bool> resumedInput = false;
                 std::atomic<bool>* effectiveStop = &stopRequested;
                 std::thread compatibilityGuard;
-                if (!owner->mockRenderer_ && !cpuSafe) {
+                if (!owner->mockRenderer_) {
                     effectiveStop = &compatibilityStop;
                     compatibilityGuard = std::thread([&] {
                         while (!compatibilityStop.load()) {
@@ -1268,7 +1267,7 @@ struct NodeApp::Impl {
                                 compatibilityStop = true;
                                 break;
                             }
-                            if (IdleSeconds() < config.idleAfterSeconds) {
+                            if (!IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                                 resumedInput = true;
                                 compatibilityStop = true;
                                 break;
@@ -1328,7 +1327,6 @@ struct NodeApp::Impl {
             std::string extension = request.get_header_value("X-RM-Extension");
             std::string version = request.get_header_value("X-RM-Blender");
             std::string engine = request.get_header_value("X-RM-Engine");
-            bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
             std::string attemptToken = request.get_header_value("X-RM-Attempt");
             auto addons = HeaderStringList(request, "X-RM-Addons");
@@ -1344,9 +1342,10 @@ struct NodeApp::Impl {
                 response.set_content("task was cancelled before acceptance", "text/plain");
                 return;
             }
-            if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+            if (!owner->mockRenderer_ &&
+                !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                 response.status = 425;
-                response.set_content("GPU task waits until this computer is idle", "text/plain");
+                response.set_content("task waits until this computer is idle", "text/plain");
                 return;
             }
             std::unique_lock cacheLock(cacheMutex);
@@ -1382,7 +1381,6 @@ struct NodeApp::Impl {
             item.outputExtension = extension;
             item.blenderVersion = version;
             item.renderEngine = engine;
-            item.cpuSafeWhileActive = cpuSafe;
             item.requiresGpu = requiresGpu;
             item.requiredAddons = std::move(addons);
             item.attemptToken = attemptToken;
@@ -1426,7 +1424,6 @@ struct NodeApp::Impl {
             std::string extension = request.get_header_value("X-RM-Extension");
             std::string version = request.get_header_value("X-RM-Blender");
             std::string engine = request.get_header_value("X-RM-Engine");
-            bool cpuSafe = request.get_header_value("X-RM-CPU-Safe") == "1";
             bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
             auto addons = HeaderStringList(request, "X-RM-Addons");
             std::vector<OutputTarget> compositorOutputs;
@@ -1470,9 +1467,10 @@ struct NodeApp::Impl {
                 response.set_content("package was cancelled before acceptance", "text/plain");
                 return;
             }
-            if (!cpuSafe && IdleSeconds() < config.idleAfterSeconds) {
+            if (!owner->mockRenderer_ &&
+                !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                 response.status = 425;
-                response.set_content("GPU package waits until this computer is idle",
+                response.set_content("package waits until this computer is idle",
                                      "text/plain");
                 return;
             }
@@ -1512,7 +1510,6 @@ struct NodeApp::Impl {
             item.outputExtension = extension;
             item.blenderVersion = version;
             item.renderEngine = engine;
-            item.cpuSafeWhileActive = cpuSafe;
             item.requiresGpu = requiresGpu;
             item.requiredAddons = std::move(addons);
             item.compositorOutputs = std::move(compositorOutputs);
@@ -1581,7 +1578,6 @@ struct NodeApp::Impl {
                 if (!request.has_header("X-RM-Extension")) extension = FrameExtension(format);
                 std::string version = request.get_header_value("X-RM-Blender");
                 std::string renderEngine = request.get_header_value("X-RM-Engine");
-                bool cpuSafeWhileActive = request.get_header_value("X-RM-CPU-Safe") == "1";
                 bool requiresGpu = request.get_header_value("X-RM-Requires-GPU") == "1";
                 std::string attemptToken = request.get_header_value("X-RM-Attempt");
                 auto addons = HeaderStringList(request, "X-RM-Addons");
@@ -1593,9 +1589,10 @@ struct NodeApp::Impl {
                     response.set_content("invalid task metadata", "text/plain");
                     return;
                 }
-                if (!cpuSafeWhileActive && IdleSeconds() < config.idleAfterSeconds) {
+                if (!owner->mockRenderer_ &&
+                    !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                     response.status = 425;
-                    response.set_content("GPU or unknown renderer waits until this computer is idle", "text/plain");
+                    response.set_content("task waits until this computer is idle", "text/plain");
                     return;
                 }
                 if (!HasTransferCapacity(request, owner->DataDir())) {
@@ -1629,7 +1626,8 @@ struct NodeApp::Impl {
                     fs::remove_all(taskDir, ignored);
                     return;
                 }
-                if (!cpuSafeWhileActive && IdleSeconds() < config.idleAfterSeconds) {
+                if (!owner->mockRenderer_ &&
+                    !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                     response.status = 425;
                     response.set_content("computer became active during upload", "text/plain");
                     std::error_code ignored;
@@ -1642,7 +1640,7 @@ struct NodeApp::Impl {
                 std::atomic<bool> resumedInput = false;
                 std::atomic<bool>* effectiveStop = &stopRequested;
                 std::thread compatibilityGuard;
-                if (!owner->mockRenderer_ && !cpuSafeWhileActive) {
+                if (!owner->mockRenderer_) {
                     effectiveStop = &compatibilityStop;
                     compatibilityGuard = std::thread([&] {
                         while (!compatibilityStop.load()) {
@@ -1650,7 +1648,7 @@ struct NodeApp::Impl {
                                 compatibilityStop = true;
                                 break;
                             }
-                            if (IdleSeconds() < config.idleAfterSeconds) {
+                            if (!IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                                 resumedInput = true;
                                 compatibilityStop = true;
                                 break;
@@ -1667,7 +1665,7 @@ struct NodeApp::Impl {
                 if (compatibilityGuard.joinable()) compatibilityGuard.join();
                 if (!compatible) {
                     if (resumedInput.load())
-                        compatibility = L"电脑恢复使用，已中止 GPU/未知引擎兼容性检查";
+                        compatibility = L"电脑恢复使用，已中止 Blender 兼容性检查";
                     response.status = resumedInput.load() ? 425 : 409;
                     response.set_content(WideToUtf8(compatibility), "text/plain; charset=utf-8");
                     std::error_code ignored;
@@ -1686,7 +1684,6 @@ struct NodeApp::Impl {
                 item.outputExtension = extension;
                 item.blenderVersion = version;
                 item.renderEngine = renderEngine;
-                item.cpuSafeWhileActive = cpuSafeWhileActive;
                 item.requiresGpu = requiresGpu;
                 item.requiredAddons = std::move(addons);
                 item.attemptToken = attemptToken;
@@ -2013,7 +2010,7 @@ struct NodeApp::Impl {
                         {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
-                        {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
+                        {"cpu", 100}, {"assigned", workerAssigned.load()},
                         {"cpu_model", hardware.cpuModel}, {"gpu_models", hardware.gpuModels},
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
@@ -2026,7 +2023,7 @@ struct NodeApp::Impl {
                         {"protocol", 1}, {"node_id", config.nodeId}, {"name", config.nodeName},
                         {"nonce", NewRandomHex(8)}, {"addresses", localAddresses},
                         {"port", config.httpPort}, {"share", config.shareEnabled},
-                        {"cpu", config.activeCpuPercent}, {"assigned", workerAssigned.load()},
+                        {"cpu", 100}, {"assigned", workerAssigned.load()},
                         {"task_id", CurrentTaskId()},
                         {"idle", static_cast<int>(IdleSeconds())},
                     };
@@ -2216,7 +2213,7 @@ struct NodeApp::Impl {
             {"X-RM-Project", job.projectHash},
             {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Engine", job.renderEngine},
-            {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
             {"X-RM-Addons", json(job.requiredAddons).dump()},
         };
@@ -2263,7 +2260,7 @@ struct NodeApp::Impl {
             {"X-RM-Format", job.outputFormat}, {"X-RM-Blender", job.blenderVersion},
             {"X-RM-Extension", job.outputExtension},
             {"X-RM-Engine", job.renderEngine},
-            {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
             {"X-RM-Attempt", attemptToken},
             {"X-RM-Addons", json(job.requiredAddons).dump()},
@@ -2334,7 +2331,7 @@ struct NodeApp::Impl {
             {"X-RM-Project", job.projectHash}, {"X-RM-Format", job.outputFormat},
             {"X-RM-Extension", job.outputExtension},
             {"X-RM-Blender", job.blenderVersion}, {"X-RM-Engine", job.renderEngine},
-            {"X-RM-CPU-Safe", job.cpuSafeWhileActive ? "1" : "0"},
+            {"X-RM-CPU-Safe", "0"},
             {"X-RM-Requires-GPU", job.requiresGpu ? "1" : "0"},
             {"X-RM-Addons", json(job.requiredAddons).dump()},
             {"X-RM-Origin-Port", std::to_string(config.httpPort)},
@@ -2580,7 +2577,6 @@ struct NodeApp::Impl {
                 item.outputExtension = jobCopy.outputExtension;
                 item.blenderVersion = jobCopy.blenderVersion;
                 item.renderEngine = jobCopy.renderEngine;
-                item.cpuSafeWhileActive = jobCopy.cpuSafeWhileActive;
                 item.requiresGpu = jobCopy.requiresGpu;
                 item.requiredAddons = jobCopy.requiredAddons;
                 item.compositorOutputs = jobCopy.compositorOutputs;
@@ -2733,9 +2729,9 @@ struct NodeApp::Impl {
             if (item.remote && PackageCancelled(cancellationId)) {
                 renderError = L"任务包已由提交方停止";
                 retryAfterIdle = true;
-            } else if (item.remote && !item.cpuSafeWhileActive &&
-                IdleSeconds() < renderConfig.idleAfterSeconds) {
-                renderError = L"本任务可能使用 GPU；电脑恢复使用后已停止，将在空闲时重新分配";
+            } else if (!owner->mockRenderer_ && item.remote &&
+                !IsComputerIdleForSharedWork(IdleSeconds(), renderConfig.idleAfterSeconds)) {
+                renderError = L"电脑恢复使用后已停止，将在空闲时重新分配";
                 retryAfterIdle = true;
             } else if (owner->mockRenderer_) {
                 fs::create_directories(item.outputDir);
@@ -2772,8 +2768,7 @@ struct NodeApp::Impl {
                 for (const auto& frame : item.frames) frameNumbers.push_back(frame.frame);
                 RenderBlenderPackage(
                     renderConfig, item.blend, item.outputDir, frameNumbers,
-                    item.outputFormat, item.outputExtension, item.remote,
-                    item.remote && !item.cpuSafeWhileActive, stopRequested,
+                    item.outputFormat, item.outputExtension, item.remote, stopRequested,
                     finishCurrentThenStop, item.compositorOutputs, outputs, renderError);
                 retryAfterIdle = finishCurrentThenStop.load();
             }
@@ -2985,7 +2980,6 @@ bool NodeApp::UpdateConfig(Config config, std::wstring& error) {
     }
     if (config.nodeName.empty() || !IsInviteCode(config.inviteCode) ||
         (!config.pairingPending && config.clusterToken.size() < 16) ||
-        config.activeCpuPercent < 1 || config.activeCpuPercent > 100 ||
         config.idleAfterSeconds < 1 || config.idleAfterSeconds > 86400 ||
         (config.theme != "system" && config.theme != "light" && config.theme != "dark")) {
         error = L"设置值无效";
@@ -3191,7 +3185,6 @@ std::string NodeApp::SubmitPrepared(
     job.outputExtension = report.outputExtension;
     job.blenderVersion = report.blenderVersion;
     job.renderEngine = report.renderEngine;
-    job.cpuSafeWhileActive = report.cpuSafeWhileActive;
     job.requiresGpu = report.requiresGpu;
     job.requiredAddons = report.addons;
     job.primaryOutputs = report.primaryOutputs;
@@ -3220,6 +3213,12 @@ std::string NodeApp::SubmitPrepared(
 
 bool RunSelfTest(std::wstring& report) {
     try {
+        if (IsComputerIdleForSharedWork(179.9, 180) ||
+            !IsComputerIdleForSharedWork(180.0, 180) ||
+            !IsComputerIdleForSharedWork(600.0, 180)) {
+            report = L"Idle-only sharing policy self-test failed";
+            return false;
+        }
         const auto packages = BuildFramePackages({1, 3, 5, 7, 9, 11, 13});
         if (packages.size() != 2 || packages[0] != std::vector<int>({1, 3, 5, 7, 9}) ||
             packages[1] != std::vector<int>({11, 13}) ||
@@ -3237,7 +3236,6 @@ bool RunSelfTest(std::wstring& report) {
             return false;
         }
         config.nodeName = "SELFTEST";
-        config.activeCpuPercent = 17;
         config.idleAfterSeconds = 7;
         config.inviteCode = "042731";
         config.clusterToken = "legacy-token-123";
@@ -3246,8 +3244,7 @@ bool RunSelfTest(std::wstring& report) {
         std::wstring error;
         Config persisted;
         if (!store.Save(config, error) ||
-            (persisted = store.Load()).activeCpuPercent != 17 ||
-            persisted.idleAfterSeconds != 7 ||
+            (persisted = store.Load()).idleAfterSeconds != 7 ||
             persisted.inviteCode != "042731" ||
             persisted.clusterToken != "legacy-token-123" ||
             persisted.manualPeerEndpoint != config.manualPeerEndpoint ||
@@ -3520,27 +3517,8 @@ bool RunSelfTest(std::wstring& report) {
             report = L"流式任务传输失败";
             return false;
         }
-        STARTUPINFOW startup{};
-        startup.cb = sizeof(startup);
-        PROCESS_INFORMATION process{};
-        std::wstring command = L"cmd.exe /c ping 127.0.0.1 -n 2 > nul";
-        std::vector<wchar_t> buffer(command.begin(), command.end());
-        buffer.push_back(0);
-        if (!CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE,
-                            CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr,
-                            &startup, &process)) {
-            report = L"测试子进程启动失败";
-            return false;
-        }
-        WindowsJobLimiter limiter;
-        bool limited = limiter.Assign(process.hProcess, error) && limiter.SetCpuPercent(15, error) &&
-            limiter.SetCpuPercent(100, error);
-        ResumeThread(process.hThread);
-        WaitForSingleObject(process.hProcess, 5000);
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-
-        if (limited) {
+        bool clusterSuitePassed = true;
+        {
             fs::path originRoot = root / L"origin";
             fs::path workerRoot = root / L"worker";
             ConfigStore originStore(originRoot);
@@ -3571,9 +3549,10 @@ bool RunSelfTest(std::wstring& report) {
             workerConfig.httpPort = workerPort;
             workerConfig.discoveryPort = 0;
             workerConfig.shareEnabled = true;
+            workerConfig.idleAfterSeconds = 1;
 
             NodeApp origin(std::move(originStore), originConfig, true,
-                           std::chrono::milliseconds(600));
+                           std::chrono::milliseconds(2500));
             NodeApp worker(std::move(workerStore), workerConfig, true);
             std::wstring startError;
             bool started = worker.Start(startError) && origin.Start(startError);
@@ -3623,7 +3602,6 @@ bool RunSelfTest(std::wstring& report) {
                 preflight.renderEngine = "CYCLES";
                 preflight.outputFormat = "PNG";
                 preflight.outputExtension = ".png";
-                preflight.cpuSafeWhileActive = true;
                 fs::path finalOutputRoot = root / L"origin-final";
                 for (int frame = 1; frame <= 7; ++frame)
                     preflight.primaryOutputs[frame] = finalOutputRoot /
@@ -4042,9 +4020,9 @@ bool RunSelfTest(std::wstring& report) {
                     clusterOk = reachedAssigned && recoveredLocally && staleRejected;
                 }
                 if (!clusterOk && error.empty()) error = L"two-node HTTP dispatch/result test failed";
-                limited = limited && clusterOk;
+                clusterSuitePassed = clusterOk;
             } else {
-                limited = false;
+                clusterSuitePassed = false;
                 error = startError;
             }
             origin.Stop();
@@ -4052,11 +4030,11 @@ bool RunSelfTest(std::wstring& report) {
         }
         std::error_code ignored;
         fs::remove_all(root, ignored);
-        if (!limited) {
-            report = L"Windows CPU Job Object 测试失败：" + error;
+        if (!clusterSuitePassed) {
+            report = L"双节点调度自检失败：" + error;
             return false;
         }
-        report = L"SELF_TEST_OK：配置、可取消流式传输、CPU 15%→100%、双节点五帧分发、停止栅栏和掉线重派均通过";
+        report = L"SELF_TEST_OK：配置、可取消流式传输、仅空闲接单、双节点五帧分发、停止栅栏和掉线重派均通过";
         return true;
     } catch (const std::exception& exception) {
         report = L"自检异常：" + Utf8ToWide(exception.what());

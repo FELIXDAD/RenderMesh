@@ -102,11 +102,53 @@ struct ProcessResult {
     std::wstring error;
 };
 
+class WindowsProcessTree {
+public:
+    WindowsProcessTree() {
+        handle_ = CreateJobObjectW(nullptr, nullptr);
+        if (!handle_) return;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(handle_, JobObjectExtendedLimitInformation,
+                                     &limits, sizeof(limits))) {
+            CloseHandle(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    ~WindowsProcessTree() {
+        if (handle_) CloseHandle(handle_);
+    }
+
+    WindowsProcessTree(const WindowsProcessTree&) = delete;
+    WindowsProcessTree& operator=(const WindowsProcessTree&) = delete;
+
+    bool TryAssign(HANDLE process, std::wstring& error) {
+        if (!handle_) {
+            error = L"无法创建 Windows 进程树容器";
+            return false;
+        }
+        if (!AssignProcessToJobObject(handle_, process)) {
+            error = LastErrorMessage();
+            return false;
+        }
+        assigned_ = true;
+        return true;
+    }
+
+    bool Terminate(DWORD exitCode) const {
+        return assigned_ && TerminateJobObject(handle_, exitCode);
+    }
+
+private:
+    HANDLE handle_ = nullptr;
+    bool assigned_ = false;
+};
+
 ProcessResult RunProcess(
     const fs::path& executable,
     const std::vector<std::wstring>& arguments,
     const fs::path& logPath,
-    const Config* renderPolicy = nullptr,
     std::atomic<bool>* stopRequested = nullptr) {
     ProcessResult result;
     fs::create_directories(logPath.parent_path());
@@ -134,11 +176,7 @@ ProcessResult RunProcess(
     startup.hStdOutput = log;
     startup.hStdError = log;
     PROCESS_INFORMATION process{};
-    DWORD flags = CREATE_NO_WINDOW;
-    // Windows 10/11 support nested jobs. Keeping the renderer in the parent's
-    // job avoids ERROR_ACCESS_DENIED under managed desktop/agent environments,
-    // while the child job below still enforces the Blender process-tree cap.
-    if (renderPolicy) flags |= CREATE_SUSPENDED;
+    DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
     BOOL created = CreateProcessW(
         executable.c_str(), buffer.data(), nullptr, nullptr, TRUE, flags, nullptr,
         logPath.parent_path().c_str(), &startup, &process);
@@ -149,44 +187,42 @@ ProcessResult RunProcess(
     }
     result.started = true;
 
-    WindowsJobLimiter limiter;
-    int lastPercent = -1;
-    if (renderPolicy) {
-        std::wstring policyError;
-        if (!limiter.Assign(process.hProcess, policyError)) {
-            TerminateProcess(process.hProcess, 90);
-            result.error = L"无法限制 Blender 进程：" + policyError;
-        } else {
-            ResumeThread(process.hThread);
+    WindowsProcessTree processTree;
+    std::wstring containmentError;
+    if (!processTree.TryAssign(process.hProcess, containmentError)) {
+        LogWarning("Blender process-tree containment unavailable; continuing without it: " +
+                   WideToUtf8(containmentError));
+    }
+    auto terminateAndWait = [&](DWORD exitCode) {
+        bool terminated = processTree.Terminate(exitCode) ||
+            TerminateProcess(process.hProcess, exitCode);
+        if (!terminated) {
+            std::wstring terminateError = LastErrorMessage();
+            if (!result.error.empty()) result.error += L"；";
+            result.error += L"无法终止 Blender：" + terminateError;
         }
+        DWORD wait = WaitForSingleObject(process.hProcess, 5000);
+        if (wait != WAIT_OBJECT_0 && result.error.empty())
+            result.error = L"等待 Blender 退出超时";
+    };
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        result.error = L"无法恢复 Blender 进程：" + LastErrorMessage();
+        terminateAndWait(90);
     }
 
     if (result.error.empty()) {
         for (;;) {
-            if (renderPolicy) {
-                int wanted = IdleSeconds() >= renderPolicy->idleAfterSeconds
-                    ? 100
-                    : renderPolicy->activeCpuPercent;
-                if (wanted != lastPercent) {
-                    std::wstring policyError;
-                    if (!limiter.SetCpuPercent(wanted, policyError)) {
-                        result.error = policyError;
-                        TerminateProcess(process.hProcess, 91);
-                        break;
-                    }
-                    lastPercent = wanted;
-                }
-            }
             if (stopRequested && stopRequested->load()) {
-                TerminateProcess(process.hProcess, 92);
                 result.error = L"任务因应用退出而中止";
+                terminateAndWait(92);
                 break;
             }
             DWORD wait = WaitForSingleObject(
-                process.hProcess, (renderPolicy || stopRequested) ? 500 : INFINITE);
+                process.hProcess, stopRequested ? 500 : INFINITE);
             if (wait == WAIT_OBJECT_0) break;
             if (wait == WAIT_FAILED) {
                 result.error = LastErrorMessage();
+                terminateAndWait(93);
                 break;
             }
         }
@@ -408,10 +444,6 @@ for addon in bpy.context.preferences.addons:
     name = addon.module
     enabled_addons.append(name + '@' + addon_versions.get(name, 'unknown'))
 
-uses_optix_denoiser = (engine == 'CYCLES' and
-                       bool(getattr(bpy.context.scene.cycles, 'use_denoising', False)) and
-                       getattr(bpy.context.scene.cycles, 'denoiser', '') == 'OPTIX')
-uses_compositor = getattr(bpy.context.scene, 'compositing_node_group', None) is not None
 original_scene = bpy.context.scene
 primary_outputs = {str(frame): bpy.path.abspath(original_scene.render.frame_path(frame=frame))
                    for frame in range(validation_start, validation_end + 1, validation_step)}
@@ -431,8 +463,6 @@ report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}'
           'render_format': bpy.context.scene.render.image_settings.file_format,
           'file_extension': bpy.context.scene.render.file_extension,
           'use_file_extension': bpy.context.scene.render.use_file_extension,
-          'cpu_safe_while_active': (engine == 'CYCLES' and cycles_device == 'CPU' and
-                                    not uses_optix_denoiser and not uses_compositor),
           'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
           'addons': sorted(enabled_addons),
           'primary_outputs': primary_outputs,
@@ -891,6 +921,10 @@ double IdleSeconds() {
     return static_cast<double>(elapsed) / 1000.0;
 }
 
+bool IsComputerIdleForSharedWork(double idleSeconds, int idleAfterSeconds) {
+    return idleAfterSeconds >= 1 && idleSeconds >= idleAfterSeconds;
+}
+
 void InitializeLogging(const fs::path& dataDir) {
     std::scoped_lock lock(gLogMutex);
     gLogDirectory = dataDir / L"logs";
@@ -973,7 +1007,6 @@ Config ConfigStore::Load() {
         if (!config.pairingPending && config.clusterToken.size() < 16)
             config.clusterToken = NewRandomHex(16);
         config.shareEnabled = data.value("share_enabled", false);
-        config.activeCpuPercent = std::clamp(data.value("active_cpu_percent", 15), 1, 100);
         config.idleAfterSeconds = std::clamp(data.value("idle_after_seconds", 180), 1, 86400);
         config.httpPort = std::clamp(data.value("http_port", 8391), 1024, 65535);
         config.discoveryPort = std::clamp(data.value("discovery_port", 8390), 1024, 65535);
@@ -999,7 +1032,6 @@ bool ConfigStore::Save(const Config& config, std::wstring& error) {
         {"cluster_token", config.clusterToken},
         {"pairing_pending", config.pairingPending},
         {"share_enabled", config.shareEnabled},
-        {"active_cpu_percent", config.activeCpuPercent},
         {"idle_after_seconds", config.idleAfterSeconds},
         {"http_port", config.httpPort},
         {"discovery_port", config.discoveryPort},
@@ -1079,7 +1111,7 @@ bool GeneratePreviewImage(
         blender,
         {L"--background", L"--factory-startup", L"--disable-autoexec", L"--python",
          script.wstring(), L"--", source.wstring(), destination.wstring()},
-        work / L"generate-preview.log", nullptr, &stopRequested);
+        work / L"generate-preview.log", &stopRequested);
     if (stopRequested.load()) {
         error = L"预览生成已取消";
         return false;
@@ -1125,7 +1157,7 @@ PreflightReport PreflightBlend(
          {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
          prepared.wstring(), reportPath.wstring(), std::to_wstring(validationFrameStart),
          std::to_wstring(validationFrameEnd), std::to_wstring(validationFrameStep)},
-        log, nullptr, stopRequested);
+        log, stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
         report.summary = L"Blender 预检失败。请查看：" + log.wstring();
         if (!process.error.empty()) report.summary += L"\n" + process.error;
@@ -1143,7 +1175,6 @@ PreflightReport PreflightBlend(
             report.passed = false;
             report.warnings.push_back("The project output format has no safe file extension");
         }
-        report.cpuSafeWhileActive = data.value("cpu_safe_while_active", false);
         report.requiresGpu = data.value("requires_gpu", false);
         report.addons = data.value("addons", std::vector<std::string>{});
         json primaryOutputRows = data.value("primary_outputs", json::object());
@@ -1237,7 +1268,7 @@ bool CheckWorkerCompatibility(
         blender,
         {L"--background", L"--disable-autoexec", L"--python", script.wstring(), L"--",
          manifest.wstring(), report.wstring()},
-        log, &config, &stopRequested);
+        log, &stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(report)) {
         summary = !process.started
             ? L"Worker 无法启动 Blender 兼容性检查"
@@ -1295,7 +1326,6 @@ bool RenderBlenderFrame(
     int frame,
     const std::string& outputFormat,
     const std::string& outputExtension,
-    bool applySharingLimit,
     std::atomic<bool>& stopRequested,
     fs::path& output,
     std::wstring& error) {
@@ -1321,7 +1351,7 @@ bool RenderBlenderFrame(
         blender,
         {L"--background", L"--disable-autoexec", blend.wstring(), L"--render-output",
          prefix.wstring(), L"--render-frame", std::to_wstring(frame)},
-        log, applySharingLimit ? &config : nullptr, &stopRequested);
+        log, &stopRequested);
     if (!process.started || process.exitCode != 0) {
         error = process.error.empty()
             ? L"Blender 渲染失败，退出码 " + std::to_wstring(process.exitCode) + L"。日志：" +
@@ -1343,7 +1373,6 @@ bool RenderBlenderPackage(
     const std::vector<int>& frames,
     const std::string& outputFormat,
     const std::string& outputExtension,
-    bool applySharingLimit,
     bool stopAfterCurrentOnActivity,
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
@@ -1392,7 +1421,7 @@ bool RenderBlenderPackage(
                 return;
             }
             if (stopAfterCurrentOnActivity &&
-                IdleSeconds() < config.idleAfterSeconds) {
+                !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
                 finishCurrentThenStop = true;
                 // Detection and marker publication deliberately happen in the
                 // same thread, so no second polling interval can start another
@@ -1412,7 +1441,7 @@ bool RenderBlenderPackage(
          script.wstring(), L"--", outputDir.wstring(), manifest.wstring(),
          stopMarker.wstring(), Utf8ToWide(json(frames).dump()),
          Utf8ToWide(outputTargets.dump())},
-        log, applySharingLimit ? &config : nullptr, &stopRequested);
+        log, &stopRequested);
     processFinished = true;
     if (stopMarkerThread.joinable()) stopMarkerThread.join();
 
@@ -1644,51 +1673,6 @@ std::wstring TaskStateLabel(TaskState state) {
         case TaskState::Stopped: return L"已停止";
     }
     return L"未知";
-}
-
-WindowsJobLimiter::WindowsJobLimiter() {
-    handle_ = CreateJobObjectW(nullptr, nullptr);
-    if (!handle_) return;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(handle_, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-        CloseHandle(handle_);
-        handle_ = nullptr;
-    }
-}
-
-WindowsJobLimiter::~WindowsJobLimiter() {
-    if (handle_) CloseHandle(handle_);
-}
-
-bool WindowsJobLimiter::Assign(HANDLE process, std::wstring& error) {
-    if (!handle_) {
-        error = L"无法创建 Windows Job Object";
-        return false;
-    }
-    if (!AssignProcessToJobObject(handle_, process)) {
-        error = LastErrorMessage();
-        return false;
-    }
-    return true;
-}
-
-bool WindowsJobLimiter::SetCpuPercent(int percent, std::wstring& error) {
-    if (!handle_ || percent < 1 || percent > 100) {
-        error = L"CPU 百分比无效";
-        return false;
-    }
-    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION info{};
-    if (percent < 100) {
-        info.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE |
-                            JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-        info.CpuRate = static_cast<DWORD>(percent * 100);
-    }
-    if (!SetInformationJobObject(handle_, JobObjectCpuRateControlInformation, &info, sizeof(info))) {
-        error = LastErrorMessage();
-        return false;
-    }
-    return true;
 }
 
 }  // namespace rm

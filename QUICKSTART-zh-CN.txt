@@ -1,4 +1,4 @@
-RenderMesh 0.2.1（Windows x64）
+RenderMesh 0.2.2（Windows x64）
 
 无需安装、无需 Python、无需 .NET、无需管理员权限。
 
@@ -18,10 +18,10 @@ RenderMesh 0.2.1（Windows x64）
 
 默认策略：
 - 共享算力：关闭
-- Eevee / Cycles GPU：连续 180 秒无键鼠输入后才运行，键鼠恢复后完成当前帧，其余帧停止并重派
+- 所有远端渲染：连续 180 秒无键鼠输入后才接单，键鼠恢复后完成当前帧，其余帧停止并重派
 - Eevee：Worker 必须同时具备可用 Eevee 引擎和 Windows GPU 图形设备，否则拒绝任务
 - Cycles GPU：Worker 必须检测到已启用的非 CPU Cycles 设备，否则拒绝任务
-- 极少数 Cycles CPU：用户活跃时硬上限 15%，空闲时 100%
+- 不使用 CPU 限速；电脑活跃时不接受任何远端渲染任务
 
 数据和结果：%LOCALAPPDATA%\RenderMesh
 端口：UDP 8390（发现），TCP 8391（任务/结果）
