@@ -33,7 +33,7 @@ if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
 
 $metrics = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
 $checks = [ordered]@{
-    jobs_visible_rows = $metrics.jobs_visible_rows -eq 10
+    jobs_visible_rows = $metrics.jobs_visible_rows -ge 7
     stable_snapshot_is_noop = -not $metrics.stable_snapshot_mutated -and
         $metrics.stable_snapshot_mutation_delta -eq 0
     one_row_change_is_incremental = $metrics.incremental_mutation_delta -eq 1

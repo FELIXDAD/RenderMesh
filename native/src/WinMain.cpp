@@ -23,6 +23,7 @@ using namespace rm;
 constexpr UINT WM_RM_REFRESH = WM_APP + 1;
 constexpr UINT WM_RM_PREFLIGHT = WM_APP + 2;
 constexpr UINT WM_RM_PREVIEW_READY = WM_APP + 3;
+constexpr UINT WM_RM_INSPECTION = WM_APP + 4;
 constexpr UINT_PTR TIMER_HEARTBEAT = 1;
 constexpr UINT_PTR TIMER_BURST_REFRESH = 3;
 constexpr UINT_PTR TIMER_UI_TEST_REPORT = 4;
@@ -61,6 +62,13 @@ enum ControlId {
     ID_NAV_CONTRIBUTIONS,
     ID_NAV_SETTINGS,
     ID_CONTRIBUTION_LIST,
+    ID_LABEL_SOURCE,
+    ID_LABEL_JOB_NAME,
+    ID_LABEL_FRAME_START,
+    ID_LABEL_FRAME_END,
+    ID_LABEL_FRAME_STEP,
+    ID_TASK_HELP,
+    ID_TASK_QUEUE_LABEL,
     ID_DETAIL_FRAMES = 300,
     ID_DETAIL_SUMMARY,
     ID_DETAIL_PREVIEW,
@@ -77,6 +85,10 @@ HFONT gTitleFont = nullptr;
 std::thread gPreflight;
 std::atomic<bool> gPreflightRunning = false;
 std::atomic<bool> gPreflightStop = false;
+std::thread gInspection;
+std::atomic<bool> gInspectionRunning = false;
+std::atomic<bool> gInspectionStop = false;
+std::atomic<uint64_t> gInspectionGeneration = 0;
 HWND gDetailWindow = nullptr;
 std::string gDetailJobId;
 HBITMAP gPreviewBitmap = nullptr;
@@ -129,7 +141,15 @@ struct DashboardView {
 
 DashboardView gDashboardView;
 
-constexpr COLORREF kAccent = RGB(77, 69, 233);
+struct InspectionResult {
+    uint64_t generation = 0;
+    fs::path source;
+    BlendInspection inspection;
+};
+
+constexpr COLORREF kAccent = RGB(53, 226, 122);
+constexpr UINT_PTR kButtonSubclassId = 1;
+constexpr UINT_PTR kListSubclassId = 2;
 
 template <typename T>
 void SafeRelease(T*& value) {
@@ -336,6 +356,16 @@ std::wstring FrameNumbers(const std::vector<int>& frames) {
     return result;
 }
 
+std::wstring WorkerActivityText(const WorkerActivity& activity, int assigned) {
+    if (!activity.Active()) return assigned > 0 ? L"正在渲染" : L"—";
+    ui::WorkerActivityView view;
+    view.jobName = Utf8ToWide(activity.jobName);
+    view.frames = activity.frames;
+    view.completedFrames = activity.completedFrames;
+    view.rendering = activity.rendering;
+    return ui::FormatWorkerActivity(view);
+}
+
 std::optional<RenderJob> FindJob(const std::string& id) {
     if (!gApp) return std::nullopt;
     for (auto& job : gApp->Jobs()) if (job.id == id) return job;
@@ -373,7 +403,7 @@ void ApplyTheme() {
         ListView_SetTextColor(list, text);
         SetWindowTheme(list, gDarkTheme ? L"DarkMode_Explorer" : L"Explorer", nullptr);
         if (HWND header = ListView_GetHeader(list))
-            SetWindowTheme(header, gDarkTheme ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
+            SetWindowTheme(header, gDarkTheme ? L"" : L"Explorer", nullptr);
     }
     BOOL dark = gDarkTheme;
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -392,6 +422,28 @@ void ApplyTheme() {
 }
 
 HWND Item(int id) { return GetDlgItem(gWindow, id); }
+
+LRESULT CALLBACK ButtonSubclassProc(HWND window, UINT message, WPARAM wParam,
+                                    LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (message == WM_MOUSEMOVE && !GetPropW(window, L"RM_HOVER")) {
+        SetPropW(window, L"RM_HOVER", reinterpret_cast<HANDLE>(1));
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+        TrackMouseEvent(&tracking);
+        InvalidateRect(window, nullptr, FALSE);
+    } else if (message == WM_MOUSELEAVE) {
+        RemovePropW(window, L"RM_HOVER");
+        InvalidateRect(window, nullptr, FALSE);
+    } else if (message == WM_NCDESTROY) {
+        RemovePropW(window, L"RM_HOVER");
+        RemoveWindowSubclass(window, ButtonSubclassProc, kButtonSubclassId);
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void ConfigureOwnerButton(HWND button) {
+    if (button)
+        SetWindowSubclass(button, ButtonSubclassProc, kButtonSubclassId, 0);
+}
 
 std::wstring Text(HWND control) {
     int length = GetWindowTextLengthW(control);
@@ -434,6 +486,8 @@ HWND AddControl(
         WS_CHILD | WS_VISIBLE | style, x, y, width, height, gWindow,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : gFont), TRUE);
+    if (wcscmp(type, L"BUTTON") == 0 && (style & BS_OWNERDRAW) == BS_OWNERDRAW)
+        ConfigureOwnerButton(control);
     return control;
 }
 
@@ -467,6 +521,21 @@ void AddColumn(HWND list, int index, int width, const wchar_t* title) {
     ListView_InsertColumn(list, index, &column);
 }
 
+LRESULT HandleHeaderCustomDraw(NMCUSTOMDRAW* draw);
+
+LRESULT CALLBACK ListViewSubclassProc(HWND window, UINT message, WPARAM wParam,
+                                      LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (message == WM_NOTIFY) {
+        auto* header = reinterpret_cast<NMHDR*>(lParam);
+        if (header && header->hwndFrom == ListView_GetHeader(window) &&
+            header->code == NM_CUSTOMDRAW)
+            return HandleHeaderCustomDraw(reinterpret_cast<NMCUSTOMDRAW*>(lParam));
+    } else if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(window, ListViewSubclassProc, kListSubclassId);
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
 void SizeListForVisibleRows(HWND list, int rows) {
     RECT bounds{};
     GetWindowRect(list, &bounds);
@@ -493,13 +562,17 @@ void ConfigureList(HWND list) {
         }
     }
     if (gRowHeightImages) ListView_SetImageList(list, gRowHeightImages, LVSIL_SMALL);
+    if (HWND header = ListView_GetHeader(list))
+        SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+    SetWindowSubclass(list, ListViewSubclassProc, kListSubclassId, 0);
 }
 
 void InsertRow(HWND list, int index, const ui::Row& row) {
     if (row.cells.empty()) return;
     LVITEMW item{};
-    item.mask = LVIF_TEXT;
+    item.mask = LVIF_TEXT | LVIF_IMAGE;
     item.iItem = index;
+    item.iImage = 0;
     item.pszText = const_cast<wchar_t*>(row.cells[0].c_str());
     int inserted = ListView_InsertItem(list, &item);
     if (inserted < 0) return;
@@ -956,6 +1029,7 @@ void RefreshLists() {
         const HardwareInfo hardware = gApp->Hardware();
         const int idleSeconds = static_cast<int>(IdleSeconds());
         const int assigned = gApp->AssignedCount();
+        const WorkerActivity localActivity = gApp->CurrentActivity();
         std::wstring manualStatus = gApp->ManualPeerStatus();
         if (!manualStatus.empty()) SetText(ID_MANUAL_STATUS, manualStatus);
 
@@ -976,7 +1050,7 @@ void RefreshLists() {
                 config.shareEnabled ? (localIdle ? L"空闲 · 可接单" : L"活跃 · 等待")
                                     : L"未共享",
                 L"仅空闲",
-                std::to_wstring(assigned),
+                WorkerActivityText(localActivity, assigned),
                 Utf8ToWide(hardware.cpuModel),
                 localGpus.empty() ? L"未检测到" : localGpus,
                 LocalEndpointSummary(config.httpPort),
@@ -1003,7 +1077,7 @@ void RefreshLists() {
                                                L" 秒")
                         : L"未共享",
                     L"仅空闲",
-                    std::to_wstring(peer.assigned),
+                    WorkerActivityText(peer.activity, peer.assigned),
                     peer.cpuModel.empty() ? L"未报告" : Utf8ToWide(peer.cpuModel),
                     remoteGpus.empty() ? L"未报告" : remoteGpus,
                     Utf8ToWide(peer.address) + L":" + std::to_wstring(peer.httpPort),
@@ -1138,7 +1212,44 @@ void HandleQueuedRefresh() {
     RefreshLists();
 }
 
+void StopBlendInspection() {
+    gInspectionStop = true;
+    if (gInspection.joinable()) gInspection.join();
+    gInspectionRunning = false;
+    MSG stale{};
+    while (gWindow && PeekMessageW(&stale, gWindow, WM_RM_INSPECTION,
+                                   WM_RM_INSPECTION, PM_REMOVE))
+        delete reinterpret_cast<InspectionResult*>(stale.lParam);
+}
+
+void StartBlendInspection(const fs::path& source) {
+    StopBlendInspection();
+    gInspectionStop = false;
+    gInspectionRunning = true;
+    const uint64_t generation = ++gInspectionGeneration;
+    EnableWindow(Item(ID_SUBMIT), FALSE);
+    SetText(ID_PREFLIGHT, L"正在读取工程帧范围与合成器 File Output/AOV…");
+    Config config = gApp->GetConfig();
+    fs::path dataDir = gApp->DataDir();
+    gInspection = std::thread([source, generation, config, dataDir] {
+        auto* result = new InspectionResult;
+        result->generation = generation;
+        result->source = source;
+        result->inspection = InspectBlend(config, dataDir, source, gInspectionStop);
+        if (!PostMessageW(gWindow, WM_RM_INSPECTION,
+                          result->inspection.passed ? 1 : 0,
+                          reinterpret_cast<LPARAM>(result)))
+            delete result;
+        gInspectionRunning = false;
+    });
+}
+
 void StartSubmission() {
+    if (gInspectionRunning.load()) {
+        MessageBoxW(gWindow, L"正在读取工程设置，请稍候。", L"RenderMesh",
+                    MB_ICONINFORMATION);
+        return;
+    }
     if (gPreflightRunning.exchange(true)) {
         MessageBoxW(gWindow, L"已有工程正在预检。", L"RenderMesh", MB_ICONINFORMATION);
         return;
@@ -1198,7 +1309,7 @@ void BuildUi() {
     PageControl(0, Label(L"手动连接", 250, 202, 80, 24));
     PageControl(0, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
                               334, 198, 235, 28, ID_MANUAL_ENDPOINT));
-    PageControl(0, AddControl(L"BUTTON", L"连接", BS_PUSHBUTTON,
+    PageControl(0, AddControl(L"BUTTON", L"连接", BS_OWNERDRAW,
                               579, 197, 82, 30, ID_CONNECT_MANUAL));
     PageControl(0, Label(L"填写另一台电脑的局域网 IP:端口，不要填 127.0.0.1",
                          680, 202, 550, 24, ID_MANUAL_STATUS));
@@ -1207,37 +1318,36 @@ void BuildUi() {
         250, 238, 990, 454, ID_NODES));
     ConfigureList(nodes);
     AddColumn(nodes, 0, 170, L"电脑"); AddColumn(nodes, 1, 85, L"连接");
-    AddColumn(nodes, 2, 170, L"算力状态"); AddColumn(nodes, 3, 85, L"调度策略");
-    AddColumn(nodes, 4, 75, L"已分配"); AddColumn(nodes, 5, 220, L"CPU 型号");
+    AddColumn(nodes, 2, 150, L"算力状态"); AddColumn(nodes, 3, 85, L"调度策略");
+    AddColumn(nodes, 4, 280, L"已分配"); AddColumn(nodes, 5, 220, L"CPU 型号");
     AddColumn(nodes, 6, 240, L"GPU 型号"); AddColumn(nodes, 7, 210, L"地址");
 
     // 渲染任务页
     PageControl(1, Label(L"渲染任务", 248, 24, 300, 36, 0, gTitleFont));
-    PageControl(1, Label(L"工程文件", 250, 86, 80, 24));
+    PageControl(1, Label(L"工程文件", 250, 86, 80, 24, ID_LABEL_SOURCE));
     PageControl(1, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
                               334, 82, 790, 28, ID_SOURCE_PATH));
-    PageControl(1, AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON,
+    PageControl(1, AddControl(L"BUTTON", L"选择…", BS_OWNERDRAW,
                               1134, 81, 92, 30, ID_BROWSE_SOURCE));
-    PageControl(1, Label(L"任务名称", 250, 130, 80, 24));
+    PageControl(1, Label(L"任务名称", 250, 130, 80, 24, ID_LABEL_JOB_NAME));
     PageControl(1, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
                               334, 126, 300, 28, ID_JOB_NAME));
-    PageControl(1, Label(L"起始帧", 656, 130, 55, 24));
+    PageControl(1, Label(L"起始帧", 656, 130, 55, 24, ID_LABEL_FRAME_START));
     PageControl(1, AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER,
                               714, 126, 65, 28, ID_FRAME_START));
-    PageControl(1, Label(L"结束帧", 795, 130, 55, 24));
+    PageControl(1, Label(L"结束帧", 795, 130, 55, 24, ID_LABEL_FRAME_END));
     PageControl(1, AddControl(L"EDIT", L"100", WS_BORDER | ES_NUMBER,
                               853, 126, 65, 28, ID_FRAME_END));
-    PageControl(1, Label(L"步长", 934, 130, 42, 24));
+    PageControl(1, Label(L"步长", 934, 130, 42, 24, ID_LABEL_FRAME_STEP));
     PageControl(1, AddControl(L"EDIT", L"1", WS_BORDER | ES_NUMBER,
                               978, 126, 55, 28, ID_FRAME_STEP));
     PageControl(1, AddControl(L"BUTTON", L"预检并提交渲染", BS_OWNERDRAW,
                               1049, 124, 177, 34, ID_SUBMIT));
     PageControl(1, Label(L"输出格式由 Blender 工程决定；提交前检查并打包链接素材，同时执行低分辨率验证渲染。",
-                         250, 178, 976, 24));
+                         250, 178, 976, 24, ID_TASK_HELP));
     PageControl(1, AddControl(L"STATIC", L"等待选择工程", SS_LEFT,
                               250, 210, 976, 45, ID_PREFLIGHT));
-    PageControl(1, Label(L"任务队列（可见 10 个槽位，超出后滚动）",
-                         250, 274, 440, 26));
+    PageControl(1, Label(L"任务队列", 250, 274, 440, 26, ID_TASK_QUEUE_LABEL));
     HWND jobs = PageControl(1, AddControl(
         WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         250, 304, 976, 350, ID_JOBS));
@@ -1251,9 +1361,9 @@ void BuildUi() {
     GetWindowRect(jobs, &jobBounds);
     MapWindowPoints(HWND_DESKTOP, gWindow, reinterpret_cast<POINT*>(&jobBounds), 2);
     int jobActionY = jobBounds.bottom + 18;
-    PageControl(1, AddControl(L"BUTTON", L"打开任务详情", BS_PUSHBUTTON,
+    PageControl(1, AddControl(L"BUTTON", L"打开任务详情", BS_OWNERDRAW,
                               892, jobActionY, 160, 32, ID_JOB_DETAILS));
-    PageControl(1, AddControl(L"BUTTON", L"打开数据目录", BS_PUSHBUTTON,
+    PageControl(1, AddControl(L"BUTTON", L"打开数据目录", BS_OWNERDRAW,
                               1062, jobActionY, 164, 32, ID_OPEN_DATA));
 
     // 本机贡献页
@@ -1286,12 +1396,12 @@ void BuildUi() {
     PageControl(3, Label(L"Blender 程序", 270, 208, 155, 24));
     PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL,
                               445, 204, 650, 30, ID_BLENDER_PATH));
-    PageControl(3, AddControl(L"BUTTON", L"选择…", BS_PUSHBUTTON,
+    PageControl(3, AddControl(L"BUTTON", L"选择…", BS_OWNERDRAW,
                               1105, 203, 90, 32, ID_BROWSE_BLENDER));
     PageControl(3, Label(L"六位邀请码", 270, 262, 155, 24));
     PageControl(3, AddControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
                               445, 258, 240, 30, ID_CLUSTER_TOKEN));
-    PageControl(3, AddControl(L"BUTTON", L"复制", BS_PUSHBUTTON,
+    PageControl(3, AddControl(L"BUTTON", L"复制", BS_OWNERDRAW,
                               695, 257, 90, 32, ID_COPY_TOKEN));
     PageControl(3, Label(L"外观", 270, 316, 155, 24));
     HWND theme = PageControl(3, AddControl(L"COMBOBOX", L"",
@@ -1349,32 +1459,57 @@ void LayoutUi() {
                    std::max(24, static_cast<int>(next.right - next.left)),
                    std::max(20, static_cast<int>(next.bottom - next.top)), FALSE);
     }
+    const int left = 250;
+    const int right = std::max(left + 620, static_cast<int>(client.right - 24));
+    const int width = right - left;
+    auto move = [&](int id, int x, int y, int controlWidth, int height) {
+        if (HWND control = Item(id))
+            MoveWindow(control, x, y, std::max(20, controlWidth), height, FALSE);
+    };
+    move(ID_LABEL_SOURCE, left, 86, 76, 24);
+    move(ID_SOURCE_PATH, left + 84, 82, width - 84 - 104, 30);
+    move(ID_BROWSE_SOURCE, right - 96, 81, 96, 32);
+    move(ID_LABEL_JOB_NAME, left, 132, 76, 24);
+    move(ID_JOB_NAME, left + 84, 126, width - 84 - 204, 30);
+    move(ID_SUBMIT, right - 192, 124, 192, 36);
+    move(ID_LABEL_FRAME_START, left, 178, 58, 24);
+    move(ID_FRAME_START, left + 62, 172, 72, 30);
+    move(ID_LABEL_FRAME_END, left + 154, 178, 58, 24);
+    move(ID_FRAME_END, left + 216, 172, 72, 30);
+    move(ID_LABEL_FRAME_STEP, left + 308, 178, 44, 24);
+    move(ID_FRAME_STEP, left + 356, 172, 64, 30);
+    move(ID_TASK_HELP, left, 214, width, 24);
+    move(ID_PREFLIGHT, left, 240, width, 42);
+    move(ID_TASK_QUEUE_LABEL, left, 292, 280, 26);
+    move(ID_JOBS, left, 322, width, std::max(220, static_cast<int>(client.bottom - 386)));
+    move(ID_JOB_DETAILS, right - 342, client.bottom - 48, 160, 34);
+    move(ID_OPEN_DATA, right - 172, client.bottom - 48, 172, 34);
     InvalidateRect(gWindow, nullptr, FALSE);
 }
 
 void LayoutDetailWindow(HWND window) {
     RECT client{};
     GetClientRect(window, &client);
-    const int rightWidth = 330;
-    const int gap = 18;
-    const int margin = 22;
-    const int rightX = std::max(650, static_cast<int>(client.right - margin - rightWidth));
-    const int listWidth = std::max(560, rightX - margin - gap);
+    const int rightWidth = 286;
+    const int gap = 16;
+    const int margin = 20;
+    const int rightX = std::max(640, static_cast<int>(client.right - margin - rightWidth));
+    const int listWidth = std::max(590, rightX - margin - gap);
     if (HWND summary = GetDlgItem(window, ID_DETAIL_SUMMARY))
         MoveWindow(summary, margin, 18, client.right - margin * 2, 28, TRUE);
     if (HWND frames = GetDlgItem(window, ID_DETAIL_FRAMES))
         MoveWindow(frames, margin, 55, listWidth,
                    std::max(360, static_cast<int>(client.bottom - 77)), TRUE);
     if (HWND preview = GetDlgItem(window, ID_DETAIL_PREVIEW))
-        MoveWindow(preview, rightX, 55, rightWidth, 230, TRUE);
+        MoveWindow(preview, rightX, 55, rightWidth, 192, TRUE);
     if (HWND status = GetDlgItem(window, ID_DETAIL_PREVIEW_STATUS))
-        MoveWindow(status, rightX, 289, rightWidth, 20, TRUE);
+        MoveWindow(status, rightX, 255, rightWidth, 24, TRUE);
     for (const auto& [id, y] : std::array<std::pair<int, int>, 3>{
-             std::pair{ID_DETAIL_OPEN_OUTPUT, 321},
-             std::pair{ID_DETAIL_OPEN_SOURCE, 365},
-             std::pair{ID_DETAIL_STOP, 421}})
+             std::pair{ID_DETAIL_OPEN_OUTPUT, 294},
+             std::pair{ID_DETAIL_OPEN_SOURCE, 340},
+             std::pair{ID_DETAIL_STOP, 398}})
         if (HWND button = GetDlgItem(window, id))
-            MoveWindow(button, rightX, y, rightWidth, 34, TRUE);
+            MoveWindow(button, rightX, y, rightWidth, 38, TRUE);
 }
 
 void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
@@ -1382,10 +1517,14 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     int id = static_cast<int>(item.CtlID);
     bool share = id == ID_SHARE;
     bool primary = id == ID_SUBMIT || id == ID_SAVE_SETTINGS;
+    bool danger = id == ID_DETAIL_STOP;
     int navPage = id == ID_NAV_DASHBOARD ? 0 : id == ID_NAV_TASKS ? 1
         : id == ID_NAV_CONTRIBUTIONS ? 2 : id == ID_NAV_SETTINGS ? 3 : -1;
     bool selected = navPage == gCurrentPage;
     bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    bool focused = (item.itemState & ODS_FOCUS) != 0;
+    bool hovered = GetPropW(item.hwndItem, L"RM_HOVER") != nullptr;
     COLORREF surface = gDarkTheme ? RGB(31, 31, 40) : RGB(255, 255, 255);
     COLORREF parentSurface = (share || navPage >= 0)
         ? (gDarkTheme ? RGB(23, 24, 32) : RGB(252, 252, 254))
@@ -1393,11 +1532,18 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     HBRUSH parentBrush = CreateSolidBrush(parentSurface);
     FillRect(item.hDC, &rect, parentBrush);
     DeleteObject(parentBrush);
-    COLORREF hover = gDarkTheme ? RGB(47, 46, 64) : RGB(235, 234, 255);
-    COLORREF fill = primary || selected ? kAccent : pressed ? hover : surface;
+    COLORREF hover = gDarkTheme ? RGB(45, 51, 49) : RGB(237, 246, 241);
+    COLORREF fill = disabled ? (gDarkTheme ? RGB(38, 39, 43) : RGB(238, 239, 241))
+        : danger ? (pressed ? RGB(116, 36, 48) : hovered ? RGB(93, 38, 47) : RGB(69, 34, 41))
+        : primary || selected ? (pressed ? RGB(36, 190, 99) : kAccent)
+        : pressed || hovered ? hover : surface;
+    COLORREF border = disabled ? (gDarkTheme ? RGB(54, 55, 61) : RGB(216, 218, 222))
+        : danger ? RGB(196, 72, 88)
+        : primary || selected ? kAccent
+        : focused ? RGB(94, 236, 151)
+        : gDarkTheme ? RGB(61, 66, 69) : RGB(210, 218, 213);
     HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1,
-        primary || selected ? kAccent : gDarkTheme ? RGB(61, 61, 74) : RGB(222, 224, 232));
+    HPEN pen = CreatePen(PS_SOLID, focused ? 2 : 1, border);
     HGDIOBJ oldBrush = SelectObject(item.hDC, brush);
     HGDIOBJ oldPen = SelectObject(item.hDC, pen);
     RoundRect(item.hDC, rect.left, rect.top, rect.right, rect.bottom, 12, 12);
@@ -1435,8 +1581,10 @@ void DrawOwnerButton(const DRAWITEMSTRUCT& item) {
     }
     wchar_t text[128]{};
     GetWindowTextW(item.hwndItem, text, static_cast<int>(std::size(text)));
-    SetTextColor(item.hDC, primary || selected ? RGB(255, 255, 255)
-        : gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
+    SetTextColor(item.hDC, disabled ? (gDarkTheme ? RGB(115, 118, 123) : RGB(145, 149, 153))
+        : primary || selected ? RGB(8, 38, 23)
+        : danger ? RGB(255, 220, 224)
+        : gDarkTheme ? RGB(239, 241, 240) : RGB(31, 38, 34));
     DrawTextW(item.hDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -1460,7 +1608,15 @@ bool IsKnownListHeader(HWND header) {
 }
 
 LRESULT HandleHeaderCustomDraw(NMCUSTOMDRAW* draw) {
-    if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw->dwDrawStage == CDDS_PREPAINT) {
+        RECT bounds{};
+        GetClientRect(draw->hdr.hwndFrom, &bounds);
+        HBRUSH brush = CreateSolidBrush(
+            gDarkTheme ? RGB(38, 39, 50) : RGB(247, 248, 251));
+        FillRect(draw->hdc, &bounds, brush);
+        DeleteObject(brush);
+        return CDRF_NOTIFYITEMDRAW;
+    }
     if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
     const COLORREF fill = gDarkTheme ? RGB(38, 39, 50) : RGB(247, 248, 251);
     const COLORREF stroke = gDarkTheme ? RGB(58, 59, 73) : RGB(222, 224, 232);
@@ -1559,7 +1715,10 @@ void DrawStatusPill(const NMLVCUSTOMDRAW& draw, const ui::Row& row, int column,
     const int width = std::min(
         static_cast<int>(cell.right - cell.left - 14),
         std::max(56, static_cast<int>(measured.cx + 20)));
-    RECT pill{cell.left + 8, cell.top + 7, cell.left + 8 + width, cell.bottom - 7};
+    const int cellHeight = std::max(1L, cell.bottom - cell.top);
+    const int pillHeight = std::clamp(cellHeight - 10, 18, 24);
+    const int pillTop = cell.top + (cellHeight - pillHeight) / 2;
+    RECT pill{cell.left + 8, pillTop, cell.left + 8 + width, pillTop + pillHeight};
     COLORREF fill{}, text{};
     VisualColors(row.visualState, selected, fill, text);
     HBRUSH fillBrush = CreateSolidBrush(fill);
@@ -1588,7 +1747,8 @@ void DrawProgressCell(const NMLVCUSTOMDRAW& draw, const ui::Row& row, bool selec
     int completed = 0, total = 0;
     const std::wstring value = row.cells.size() > 3 ? row.cells[3] : L"0 / 0";
     swscanf_s(value.c_str(), L"%d / %d", &completed, &total);
-    RECT track{cell.left + 8, cell.top + 14, cell.right - 8, cell.bottom - 14};
+    const int trackTop = cell.top + std::max(0L, (cell.bottom - cell.top - 6) / 2);
+    RECT track{cell.left + 8, trackTop, cell.right - 8, trackTop + 6};
     HBRUSH trackBrush = CreateSolidBrush(gDarkTheme ? RGB(55, 56, 69) : RGB(230, 231, 237));
     FillRect(draw.nmcd.hdc, &track, trackBrush);
     DeleteObject(trackBrush);
@@ -1606,6 +1766,31 @@ void DrawProgressCell(const NMLVCUSTOMDRAW& draw, const ui::Row& row, bool selec
     HGDIOBJ oldFont = SelectObject(draw.nmcd.hdc, gFont);
     DrawTextW(draw.nmcd.hdc, value.c_str(), -1, &cell,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(draw.nmcd.hdc, oldFont);
+}
+
+void DrawTextCell(const NMLVCUSTOMDRAW& draw, const ui::Row& row, bool selected) {
+    RECT cell{};
+    ListView_GetSubItemRect(draw.nmcd.hdr.hwndFrom,
+                            static_cast<int>(draw.nmcd.dwItemSpec), draw.iSubItem,
+                            LVIR_BOUNDS, &cell);
+    const COLORREF background = ListRowBackground(
+        selected, static_cast<size_t>(draw.nmcd.dwItemSpec));
+    HBRUSH brush = CreateSolidBrush(background);
+    FillRect(draw.nmcd.hdc, &cell, brush);
+    DeleteObject(brush);
+    RECT textRect = cell;
+    textRect.left += draw.iSubItem == 0 ? 10 : 8;
+    textRect.right -= 8;
+    SetBkMode(draw.nmcd.hdc, TRANSPARENT);
+    SetTextColor(draw.nmcd.hdc, selected
+        ? (gDarkTheme ? RGB(255, 255, 255) : RGB(34, 42, 38))
+        : (gDarkTheme ? RGB(226, 229, 235) : RGB(42, 46, 44)));
+    HGDIOBJ oldFont = SelectObject(draw.nmcd.hdc, gFont);
+    const std::wstring value = draw.iSubItem < static_cast<int>(row.cells.size())
+        ? row.cells[static_cast<size_t>(draw.iSubItem)] : L"";
+    DrawTextW(draw.nmcd.hdc, value.c_str(), -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     SelectObject(draw.nmcd.hdc, oldFont);
 }
 
@@ -1642,6 +1827,8 @@ LRESULT HandleListCustomDraw(NMLVCUSTOMDRAW* draw) {
             DrawProgressCell(*draw, model->Rows()[index], selected);
             return CDRF_SKIPDEFAULT;
         }
+        DrawTextCell(*draw, model->Rows()[index], selected);
+        return CDRF_SKIPDEFAULT;
     }
     return CDRF_DODEFAULT;
 }
@@ -1802,14 +1989,14 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             SendMessageW(frames, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
             ConfigureList(frames);
             AddColumn(frames, 0, 55, L"帧");
-            AddColumn(frames, 1, 82, L"状态");
-            AddColumn(frames, 2, 135, L"渲染电脑");
-            AddColumn(frames, 3, 115, L"任务包");
-            AddColumn(frames, 4, 85, L"渲染时长");
-            AddColumn(frames, 5, 145, L"开始时间");
-            AddColumn(frames, 6, 145, L"结束时间");
-            AddColumn(frames, 7, 330, L"输出 / 错误");
-            HWND preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"",
+            AddColumn(frames, 1, 96, L"状态");
+            AddColumn(frames, 2, 130, L"渲染电脑");
+            AddColumn(frames, 3, 0, L"任务包");
+            AddColumn(frames, 4, 92, L"渲染时长");
+            AddColumn(frames, 5, 135, L"开始时间");
+            AddColumn(frames, 6, 135, L"结束时间");
+            AddColumn(frames, 7, 0, L"输出 / 错误");
+            HWND preview = CreateWindowExW(0, L"STATIC", L"",
                 WS_CHILD | WS_VISIBLE | SS_BITMAP | SS_CENTERIMAGE,
                 845, 55, 330, 230, window,
                 reinterpret_cast<HMENU>(ID_DETAIL_PREVIEW), GetModuleHandleW(nullptr), nullptr);
@@ -1821,10 +2008,11 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             SendMessageW(previewStatus, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
             auto button = [&](const wchar_t* text, int y, int id) {
                 HWND control = CreateWindowExW(0, L"BUTTON", text,
-                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 845, y, 330, 34, window,
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 845, y, 330, 36, window,
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                     GetModuleHandleW(nullptr), nullptr);
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(gFont), TRUE);
+                ConfigureOwnerButton(control);
             };
             button(L"在资源管理器中显示选中帧", 321, ID_DETAIL_OPEN_OUTPUT);
             button(L"在资源管理器中显示源 .blend", 365, ID_DETAIL_OPEN_SOURCE);
@@ -1892,6 +2080,9 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 RefreshJobDetail();
             }
             return 0;
+        case WM_DRAWITEM:
+            DrawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
         case WM_CLOSE:
             DestroyWindow(window);
             return 0;
@@ -1908,7 +2099,12 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
-            return reinterpret_cast<LRESULT>(gBackgroundBrush);
+            HWND control = reinterpret_cast<HWND>(lParam);
+            RECT rect{};
+            GetWindowRect(control, &rect);
+            MapWindowPoints(HWND_DESKTOP, window, reinterpret_cast<POINT*>(&rect), 2);
+            const bool onPageSurface = gCurrentPage != 0 && rect.left >= 220 && rect.top >= 72;
+            return reinterpret_cast<LRESULT>(onPageSurface ? gSurfaceBrush : gBackgroundBrush);
         }
         case WM_ERASEBKGND: {
             RECT client{};
@@ -2012,6 +2208,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                         SetText(ID_SOURCE_PATH, path);
                         if (Text(Item(ID_JOB_NAME)).empty())
                             SetText(ID_JOB_NAME, fs::path(path).stem().wstring());
+                        StartBlendInspection(path);
                     }
                     break;
                 }
@@ -2074,7 +2271,27 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             if (!wParam) MessageBoxW(window, result->c_str(), L"工程预检未通过", MB_ICONWARNING);
             return 0;
         }
+        case WM_RM_INSPECTION: {
+            std::unique_ptr<InspectionResult> result(
+                reinterpret_cast<InspectionResult*>(lParam));
+            if (gInspection.joinable()) gInspection.join();
+            if (!result || result->generation != gInspectionGeneration.load() ||
+                result->source != fs::path(Text(Item(ID_SOURCE_PATH))))
+                return 0;
+            if (result->inspection.passed) {
+                SetText(ID_FRAME_START, std::to_wstring(result->inspection.frameStart));
+                SetText(ID_FRAME_END, std::to_wstring(result->inspection.frameEnd));
+                SetText(ID_FRAME_STEP, std::to_wstring(result->inspection.frameStep));
+            }
+            SetText(ID_PREFLIGHT, result->inspection.summary);
+            EnableWindow(Item(ID_SUBMIT), TRUE);
+            return 0;
+        }
         case WM_CLOSE:
+            if (gInspectionRunning.load() || gInspection.joinable()) {
+                SetText(ID_PREFLIGHT, L"正在中止工程读取并安全退出…");
+                StopBlendInspection();
+            }
             if (gPreflightRunning.load()) {
                 gPreflightStop = true;
                 EnableWindow(window, FALSE);
@@ -2134,7 +2351,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     fs::path dataDir = DefaultDataDirectory();
     bool selfTest = false, headless = false, noDialog = false;
-    fs::path preflightSource, preflightPrepared, preflightReport, blenderOverride;
+    fs::path inspectSource, preflightSource, preflightPrepared, preflightReport, blenderOverride;
     fs::path renderSource, renderOutputDir, compatibilitySource;
     fs::path previewSource, previewOutput;
     int renderFrame = 1;
@@ -2146,6 +2363,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--no-dialog") noDialog = true;
         else if (arg == L"--headless") headless = true;
         else if (arg == L"--data-dir" && i + 1 < argumentCount) dataDir = arguments[++i];
+        else if (arg == L"--inspect" && i + 1 < argumentCount) inspectSource = arguments[++i];
         else if (arg == L"--preflight" && i + 1 < argumentCount) preflightSource = arguments[++i];
         else if (arg == L"--prepared" && i + 1 < argumentCount) preflightPrepared = arguments[++i];
         else if (arg == L"--report" && i + 1 < argumentCount) preflightReport = arguments[++i];
@@ -2186,6 +2404,36 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         return ok ? 0 : 1;
     }
 
+    if (!inspectSource.empty()) {
+        ConfigStore inspectStore(dataDir);
+        Config inspectConfig = inspectStore.Load();
+        if (!blenderOverride.empty()) inspectConfig.blenderPath = blenderOverride;
+        if (preflightReport.empty())
+            preflightReport = dataDir / L"verification" / L"inspection-result.json";
+        std::atomic<bool> inspectStop = false;
+        BlendInspection inspection = InspectBlend(
+            inspectConfig, dataDir, inspectSource, inspectStop);
+        json output = {
+            {"pass", inspection.passed},
+            {"frame_start", inspection.frameStart},
+            {"frame_end", inspection.frameEnd},
+            {"frame_step", inspection.frameStep},
+            {"summary", WideToUtf8(inspection.summary)},
+            {"compositor_outputs", json::array()},
+        };
+        for (const auto& target : inspection.compositorOutputs) {
+            json metadata = OutputTargetMetadata(target);
+            metadata["directory"] = WideToUtf8(target.directory.wstring());
+            output["compositor_outputs"].push_back(std::move(metadata));
+        }
+        std::error_code ignored;
+        fs::create_directories(preflightReport.parent_path(), ignored);
+        std::ofstream reportFile(preflightReport, std::ios::binary | std::ios::trunc);
+        reportFile << output.dump(2);
+        PrintToParentConsole(inspection.summary);
+        return inspection.passed && reportFile ? 0 : 7;
+    }
+
     if (!previewSource.empty()) {
         ConfigStore previewStore(dataDir);
         Config previewConfig = previewStore.Load();
@@ -2217,6 +2465,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             {"render_format", result.outputFormat},
             {"file_extension", result.outputExtension},
             {"requires_gpu", result.requiresGpu},
+            {"frame_start", result.frameStart},
+            {"frame_end", result.frameEnd},
+            {"frame_step", result.frameStep},
             {"prepared", WideToUtf8(result.preparedBlend.wstring())},
             {"summary", WideToUtf8(result.summary)}, {"warnings", result.warnings},
         };
@@ -2224,10 +2475,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         for (const auto& [frame, path] : result.primaryOutputs)
             output["primary_outputs"][std::to_string(frame)] = WideToUtf8(path.wstring());
         output["compositor_outputs"] = json::array();
-        for (const auto& target : result.compositorOutputs)
-            output["compositor_outputs"].push_back({
-                {"id", target.id}, {"name", target.name},
-                {"directory", WideToUtf8(target.directory.wstring())}});
+        for (const auto& target : result.compositorOutputs) {
+            json metadata = OutputTargetMetadata(target);
+            metadata["directory"] = WideToUtf8(target.directory.wstring());
+            output["compositor_outputs"].push_back(std::move(metadata));
+        }
         auto dependencies = [](const std::vector<DependencyItem>& values) {
             json rows = json::array();
             for (const auto& item : values)
@@ -2257,15 +2509,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             std::vector<OutputTarget> targets;
             if (!manifest.is_discarded()) {
                 renderFormat = manifest.value("render_format", renderFormat);
-                for (const auto& value : manifest.value("compositor_outputs", json::array()))
-                    targets.push_back({value.value("id", ""), value.value("name", ""), {}});
+                for (const auto& value : manifest.value("compositor_outputs", json::array())) {
+                    OutputTarget target;
+                    if (ParseOutputTargetMetadata(value, target))
+                        targets.push_back(std::move(target));
+                }
             }
             std::atomic<bool> finishCurrentThenStop = false;
             std::map<int, std::vector<RenderArtifact>> artifacts;
             ok = !manifest.is_discarded() && RenderBlenderPackage(
                 renderConfig, renderSource, renderOutputDir, {renderFrame}, renderFormat,
                 manifest.value("file_extension", ".png"), false, stopRequested,
-                finishCurrentThenStop, targets, artifacts, renderError);
+                finishCurrentThenStop, targets, {}, artifacts, renderError);
             if (ok && artifacts.contains(renderFrame)) {
                 auto primary = std::find_if(
                     artifacts[renderFrame].begin(), artifacts[renderFrame].end(),
@@ -2359,6 +2614,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     gApp->SetChangedCallback({});
     StopPreviewGeneration();
     gApp->Stop();
+    gInspectionStop = true;
+    if (gInspection.joinable()) gInspection.join();
     if (gPreflight.joinable()) gPreflight.join();
     ReleaseGraphics();
     if (gRowHeightImages) ImageList_Destroy(gRowHeightImages);

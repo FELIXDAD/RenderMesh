@@ -27,6 +27,8 @@ namespace rm {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+inline constexpr int kBlenderFrameMin = 0;
+inline constexpr int kBlenderFrameMax = 1048574;
 
 std::string WideToUtf8(const std::wstring& value);
 std::wstring Utf8ToWide(const std::string& value);
@@ -97,12 +99,23 @@ struct OutputTarget {
     std::string id;
     std::string name;
     fs::path directory;
+    std::vector<std::string> outputs;
+    std::string filePattern;
+    std::string sceneName;
+    std::vector<int> nodePath;
+    bool required = false;
 };
+json OutputTargetMetadata(const OutputTarget& target);
+json OutputTargetLocatorMetadata(const OutputTarget& target);
+bool ParseOutputTargetMetadata(const json& value, OutputTarget& target);
 
 struct RenderArtifact {
     std::string logicalPath;
     fs::path source;
 };
+
+using FrameCompletedCallback =
+    std::function<void(int, const std::vector<RenderArtifact>&)>;
 
 struct PreflightReport {
     bool passed = false;
@@ -111,6 +124,9 @@ struct PreflightReport {
     std::string outputFormat;
     std::string outputExtension;
     bool requiresGpu = false;
+    int frameStart = 1;
+    int frameEnd = 1;
+    int frameStep = 1;
     std::vector<DependencyItem> missing;
     std::vector<DependencyItem> unpacked;
     std::vector<std::string> warnings;
@@ -121,7 +137,21 @@ struct PreflightReport {
     std::wstring summary;
 };
 
+struct BlendInspection {
+    bool passed = false;
+    int frameStart = 1;
+    int frameEnd = 1;
+    int frameStep = 1;
+    std::vector<OutputTarget> compositorOutputs;
+    std::wstring summary;
+};
+
 fs::path FindBlender(const Config& config);
+BlendInspection InspectBlend(
+    const Config& config,
+    const fs::path& dataDir,
+    const fs::path& source,
+    std::atomic<bool>& stopRequested);
 bool GeneratePreviewImage(
     const Config& config,
     const fs::path& dataDir,
@@ -168,6 +198,7 @@ bool RenderBlenderPackage(
     std::atomic<bool>& stopRequested,
     std::atomic<bool>& finishCurrentThenStop,
     const std::vector<OutputTarget>& compositorOutputs,
+    const FrameCompletedCallback& frameCompleted,
     std::map<int, std::vector<RenderArtifact>>& completed,
     std::wstring& error);
 bool ValidateFramePackageCompletion(
@@ -239,6 +270,15 @@ struct ContributionRecord {
     std::chrono::system_clock::time_point endedAt{};
 };
 
+struct WorkerActivity {
+    std::string jobName;
+    std::vector<int> frames;
+    size_t completedFrames = 0;
+    bool rendering = false;
+
+    bool Active() const { return !jobName.empty() || !frames.empty(); }
+};
+
 struct Peer {
     int protocolVersion = 1;
     bool supportsProjectCache = false;
@@ -257,6 +297,7 @@ struct Peer {
     std::vector<std::string> gpuModels;
     std::string currentTaskId;
     bool currentTaskKnown = true;
+    WorkerActivity activity;
     bool manualRoute = false;
     std::chrono::steady_clock::time_point manualValidatedAt{};
     double idleSeconds = 0;
@@ -313,6 +354,7 @@ public:
     bool StopJob(const std::string& jobId, std::wstring& error);
     HardwareInfo Hardware() const;
     int AssignedCount() const;
+    WorkerActivity CurrentActivity() const;
     bool Running() const { return running_; }
 
     // In-process transport test seam. Production peers still come from UDP discovery.

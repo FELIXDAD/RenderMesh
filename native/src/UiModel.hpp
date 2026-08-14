@@ -33,6 +33,15 @@ struct CellChange {
     std::wstring value;
 };
 
+struct WorkerActivityView {
+    std::wstring jobName;
+    std::vector<int> frames;
+    size_t completedFrames = 0;
+    bool rendering = false;
+};
+
+std::wstring FormatWorkerActivity(const WorkerActivityView& activity);
+
 enum class OperationType { Insert, Erase, Move, Update };
 
 struct Operation {

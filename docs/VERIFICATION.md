@@ -43,6 +43,9 @@
 17. 对在线测试节点 `192.168.28.28:8391` 走真实 v2 缓存/兼容链路：同一 packed 工程最初查询返回 404；携带 `X-RM-Addons: []` 上传后，远端 Blender 兼容检查返回 201 `cached`；再次查询返回 200。测试节点为 Blender 5.2/Cycles GPU 环境，证明旧严格插件元数据不再阻止该工程进入远端缓存与接单路径。
 18. 0.2.3 双机最小探针复现远端返回 202 后任务包瞬时清零；结果回传为 `status=failed` 且错误为空。根因是 Blender 退出码为 0、但进度清单没有完成帧时 `RenderBlenderPackage` 仍返回成功。0.2.4 增加零帧/部分帧完成验证、10 秒内空产出自动重启一次，以及失败结果持久日志。回归自检先在旧行为上以 `Zero-output Blender package validation self-test failed` 返回 1，修复后返回 0；同一真实测试工程的主 PNG 与合成器 EXR 仍成功生成。
 19. 0.2.5 在隔离且完全空白的 `BLENDER_USER_CONFIG` 中走真实 Worker 链路：首次兼容检查在约 2 秒内生成 `userpref.blend` 和原子就绪文件，Blender 5.2/Cycles 检查只启用 `OPTIX:NVIDIA GeForce RTX 5090 D v2`；第二次运行前后偏好 SHA-256 不变。随后同一空配置起点完成真实单帧渲染，日志记录所选 OptiX 设备，并生成主 PNG 与合成器 EXR。内置测试先以 `Blender first-run readiness self-test not implemented` 返回 1，完成启动参数、就绪文件和单后端约束后返回 0。
+20. 0.2.6 使用 `D:\05_Documents\Desktop\测试.blend` 验证工程读取与 AOV 回传：无界面检查准确得到起止帧 `1–36`、步长 `1`，定位到节点路径 `4`，并读取 Blender 5.2 `file_output_items` 的 6 个输出项 `Output/Alpha/Mist/Emission/CryptoObject00/Noisy Image`。真实第 1 帧渲染返回 0，结果清单同时包含 4,612,054 字节主 PNG 与 6,213,778 字节多层 EXR `compositor/output-0/prepared.exr`；配置的 File Output 节点若未生成文件会明确失败，不再允许只有主图的假完整结果。
+21. 0.2.7 在公开 `NodeApp::SubmitPrepared` seam 上以不允许共享的 Windows 文件句柄独占 packed 工程 250 ms：旧实现稳定返回 `Transient locked-source submission self-test failed: 无法复制已打包工程`；加入仅针对瞬时文件竞争的 50 ms/最长 5 秒重试后，同一测试创建任务成功，完整内置自检返回 0。永久错误与超时仍返回原 Windows 错误，不会创建半任务。
+22. 0.2.8 在双 NodeApp 公共 seam 中把五帧 Worker 测试包设为逐帧可观察：旧实现必须等五帧结束，自检以 `per-frame result streaming self-test failed` 返回 1；改为运行中消费原子清单后，第 1 帧主图与 AOV 已在 Origin 落盘时后四帧仍未完成，完整自检返回 0。随后用 `D:\05_Documents\Desktop\测试.blend` 和 Blender 5.2 做真实第 1 帧验证，清单同时记录主 PNG 与 6,213,274 字节多层 EXR `compositor/output-0/测试_000001.exr`；原 `{blend_name}` 不再退化为缓存名 `source`，且固定文件名补帧号避免包内覆盖。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

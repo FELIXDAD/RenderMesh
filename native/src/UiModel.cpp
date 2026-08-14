@@ -21,7 +21,40 @@ std::vector<CellChange> ChangedCells(const Row& current, const Row& next) {
     return changes;
 }
 
+std::wstring CompactFrames(const std::vector<int>& frames) {
+    if (frames.empty()) return {};
+    std::wstring value;
+    size_t index = 0;
+    while (index < frames.size()) {
+        const int first = frames[index];
+        int last = first;
+        while (index + 1 < frames.size() && frames[index + 1] == last + 1) {
+            last = frames[++index];
+        }
+        if (!value.empty()) value += L", ";
+        value += std::to_wstring(first);
+        if (last != first) value += L"\u2013" + std::to_wstring(last);
+        ++index;
+    }
+    return value;
+}
+
 }  // namespace
+
+std::wstring FormatWorkerActivity(const WorkerActivityView& activity) {
+    if (activity.jobName.empty() && activity.frames.empty()) return L"\u2014";
+
+    std::wstring value;
+    if (!activity.rendering) value = L"\u51c6\u5907\u4e2d \u00b7 ";
+    value += activity.jobName.empty() ? L"\u672a\u547d\u540d\u4f5c\u4e1a" : activity.jobName;
+    if (!activity.frames.empty()) {
+        value += L" \u00b7 \u5e27 " + CompactFrames(activity.frames);
+        value += L" \u00b7 " + std::to_wstring(
+            std::min(activity.completedFrames, activity.frames.size())) + L"/" +
+            std::to_wstring(activity.frames.size());
+    }
+    return value;
+}
 
 std::vector<Operation> StableTableModel::Reconcile(std::vector<Row> next) {
     std::vector<Operation> operations;

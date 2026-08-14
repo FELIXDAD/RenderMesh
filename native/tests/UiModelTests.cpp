@@ -11,6 +11,7 @@ namespace {
 using rm::ui::OperationType;
 using rm::ui::Row;
 using rm::ui::StableTableModel;
+using rm::ui::WorkerActivityView;
 using namespace std::chrono_literals;
 
 Row MakeRow(std::wstring key, std::initializer_list<const wchar_t*> cells) {
@@ -141,6 +142,23 @@ void RefreshBurstIsCoalescedToOneDisplayFrame() {
            "an old snapshot should refresh immediately");
 }
 
+void ActiveWorkerShowsJobFramesAndProgress() {
+    WorkerActivityView activity;
+    activity.jobName = L"测试作业";
+    activity.frames = {1, 2, 3, 4, 5};
+    activity.completedFrames = 2;
+    activity.rendering = true;
+
+    Expect(rm::ui::FormatWorkerActivity(activity) ==
+               L"测试作业 · 帧 1–5 · 2/5",
+           "an active worker should expose the job, frame range, and package progress");
+}
+
+void EmptyWorkerActivityUsesAnEmDash() {
+    Expect(rm::ui::FormatWorkerActivity({}) == L"—",
+           "an idle worker should not show an assigned count");
+}
+
 }  // namespace
 
 int main() {
@@ -151,6 +169,8 @@ int main() {
     ReorderMovesOnlyTheStableEntity();
     RemovalErasesOnlyTheMissingEntity();
     RefreshBurstIsCoalescedToOneDisplayFrame();
+    ActiveWorkerShowsJobFramesAndProgress();
+    EmptyWorkerActivityUsesAnEmDash();
     std::cout << "UI_MODEL_TESTS_OK\n";
     return 0;
 }
