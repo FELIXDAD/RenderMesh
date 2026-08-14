@@ -30,7 +30,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md') -Destination $stage
 
-    $zip = Join-Path $distRoot 'RenderMesh-Windows-x64-0.2.4.zip'
+    $zip = Join-Path $distRoot 'RenderMesh-Windows-x64-0.2.5.zip'
     Compress-Archive -LiteralPath (Get-ChildItem -LiteralPath $stage).FullName `
         -DestinationPath $zip -CompressionLevel Optimal -Force
     $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $zip

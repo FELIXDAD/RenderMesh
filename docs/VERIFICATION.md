@@ -42,6 +42,7 @@
 16. 0.2.3 关闭插件清单审查：发起端不再采集或持久化插件字段，新版 Worker 忽略旧任务/缓存中的插件字段，新版 Origin 向旧 v6 Worker 发送空列表；内置回归自检验证带任意旧插件字段的缓存仍可命中。
 17. 对在线测试节点 `192.168.28.28:8391` 走真实 v2 缓存/兼容链路：同一 packed 工程最初查询返回 404；携带 `X-RM-Addons: []` 上传后，远端 Blender 兼容检查返回 201 `cached`；再次查询返回 200。测试节点为 Blender 5.2/Cycles GPU 环境，证明旧严格插件元数据不再阻止该工程进入远端缓存与接单路径。
 18. 0.2.3 双机最小探针复现远端返回 202 后任务包瞬时清零；结果回传为 `status=failed` 且错误为空。根因是 Blender 退出码为 0、但进度清单没有完成帧时 `RenderBlenderPackage` 仍返回成功。0.2.4 增加零帧/部分帧完成验证、10 秒内空产出自动重启一次，以及失败结果持久日志。回归自检先在旧行为上以 `Zero-output Blender package validation self-test failed` 返回 1，修复后返回 0；同一真实测试工程的主 PNG 与合成器 EXR 仍成功生成。
+19. 0.2.5 在隔离且完全空白的 `BLENDER_USER_CONFIG` 中走真实 Worker 链路：首次兼容检查在约 2 秒内生成 `userpref.blend` 和原子就绪文件，Blender 5.2/Cycles 检查只启用 `OPTIX:NVIDIA GeForce RTX 5090 D v2`；第二次运行前后偏好 SHA-256 不变。随后同一空配置起点完成真实单帧渲染，日志记录所选 OptiX 设备，并生成主 PNG 与合成器 EXR。内置测试先以 `Blender first-run readiness self-test not implemented` 返回 1，完成启动参数、就绪文件和单后端约束后返回 0。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

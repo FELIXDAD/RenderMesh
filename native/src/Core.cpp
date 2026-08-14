@@ -98,6 +98,7 @@ std::wstring QuoteArg(const std::wstring& value) {
 
 struct ProcessResult {
     bool started = false;
+    bool timedOut = false;
     DWORD exitCode = static_cast<DWORD>(-1);
     std::wstring error;
 };
@@ -149,11 +150,15 @@ ProcessResult RunProcess(
     const fs::path& executable,
     const std::vector<std::wstring>& arguments,
     const fs::path& logPath,
-    std::atomic<bool>* stopRequested = nullptr) {
+    std::atomic<bool>* stopRequested = nullptr,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) {
     ProcessResult result;
     fs::create_directories(logPath.parent_path());
+    SECURITY_ATTRIBUTES logSecurity{};
+    logSecurity.nLength = sizeof(logSecurity);
+    logSecurity.bInheritHandle = TRUE;
     HANDLE log = CreateFileW(
-        logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+        logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &logSecurity, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (log == INVALID_HANDLE_VALUE) {
         result.error = L"无法创建日志：" + LastErrorMessage();
@@ -211,6 +216,9 @@ ProcessResult RunProcess(
     }
 
     if (result.error.empty()) {
+        auto deadline = timeout > std::chrono::milliseconds::zero()
+            ? std::chrono::steady_clock::now() + timeout
+            : std::chrono::steady_clock::time_point::max();
         for (;;) {
             if (stopRequested && stopRequested->load()) {
                 result.error = L"任务因应用退出而中止";
@@ -218,11 +226,19 @@ ProcessResult RunProcess(
                 break;
             }
             DWORD wait = WaitForSingleObject(
-                process.hProcess, stopRequested ? 500 : INFINITE);
+                process.hProcess,
+                timeout > std::chrono::milliseconds::zero() ? 250 :
+                    stopRequested ? 500 : INFINITE);
             if (wait == WAIT_OBJECT_0) break;
             if (wait == WAIT_FAILED) {
                 result.error = LastErrorMessage();
                 terminateAndWait(93);
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                result.timedOut = true;
+                result.error = L"Blender 首次无界面初始化超时";
+                terminateAndWait(94);
                 break;
             }
         }
@@ -281,12 +297,146 @@ bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring
     return true;
 }
 
+const char* kBlenderBootstrapScript = R"PY(import bpy, os, sys
+
+args = sys.argv[sys.argv.index('--') + 1:]
+ready_path = args[0]
+config_dir = bpy.utils.user_resource('CONFIG')
+if not config_dir:
+    raise RuntimeError('Blender did not provide a user configuration directory')
+os.makedirs(config_dir, exist_ok=True)
+preferences = os.path.join(config_dir, 'userpref.blend')
+if not os.path.isfile(preferences):
+    result = bpy.ops.wm.save_userpref()
+    if 'FINISHED' not in result:
+        raise RuntimeError(f'Unable to save Blender user preferences: {result}')
+temporary = ready_path + '.tmp'
+with open(temporary, 'w', encoding='utf-8') as handle:
+    handle.write('RENDERMESH_BLENDER_READY\n')
+os.replace(temporary, ready_path)
+print('RENDERMESH_BLENDER_READY')
+)PY";
+
+std::mutex gBlenderReadinessMutex;
+std::set<std::wstring> gReadyBlenders;
+
+std::vector<std::wstring> BlenderBootstrapArguments(
+    const fs::path& script,
+    const fs::path& readyMarker) {
+    return {L"--background", L"--factory-startup", L"--disable-autoexec", L"-noaudio",
+            L"--python-exit-code", L"95", L"--python", script.wstring(), L"--",
+            readyMarker.wstring()};
+}
+
+std::wstring BlenderReadinessKey(const fs::path& blender) {
+    std::error_code error;
+    fs::path resolved = fs::weakly_canonical(blender, error);
+    if (error) {
+        error.clear();
+        resolved = fs::absolute(blender, error);
+    }
+    if (error) resolved = blender;
+    std::wstring key = resolved.wstring();
+    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value) {
+        return static_cast<wchar_t>(std::towlower(value));
+    });
+    error.clear();
+    auto modified = fs::last_write_time(blender, error);
+    if (!error) key += L"|" + std::to_wstring(
+        static_cast<long long>(modified.time_since_epoch().count()));
+    return key;
+}
+
+bool EnsureBlenderReady(
+    const fs::path& blender,
+    const fs::path& workDirectory,
+    std::atomic<bool>* stopRequested,
+    std::wstring& error) {
+    if (stopRequested && stopRequested->load()) {
+        error = L"Blender 初始化已取消";
+        return false;
+    }
+    const std::wstring key = BlenderReadinessKey(blender);
+    std::scoped_lock lock(gBlenderReadinessMutex);
+    if (gReadyBlenders.contains(key)) return true;
+    if (stopRequested && stopRequested->load()) {
+        error = L"Blender 初始化已取消";
+        return false;
+    }
+
+    fs::path tools = workDirectory / L"tools";
+    std::error_code directoryError;
+    fs::create_directories(tools, directoryError);
+    if (directoryError) {
+        error = L"无法创建 Blender 初始化目录：" + Utf8ToWide(directoryError.message());
+        return false;
+    }
+    fs::path script = tools / L"initialize-blender.py";
+    fs::path log = tools / L"initialize-blender.log";
+    fs::path readyMarker = tools / L"initialize-blender.ready";
+    {
+        std::ofstream output(script, std::ios::binary | std::ios::trunc);
+        output << kBlenderBootstrapScript;
+        if (!output) {
+            error = L"无法写入 Blender 初始化脚本";
+            return false;
+        }
+    }
+    std::error_code removeError;
+    fs::remove(readyMarker, removeError);
+    fs::remove(readyMarker.wstring() + L".tmp", removeError);
+    ProcessResult process = RunProcess(
+        blender, BlenderBootstrapArguments(script, readyMarker), log, stopRequested,
+        std::chrono::seconds(15));
+    if (!process.started || process.exitCode != 0) {
+        if (process.timedOut) {
+            error = L"Blender 首次无界面初始化超过 15 秒，进程已终止。日志：" + log.wstring();
+        } else if (!process.error.empty()) {
+            error = L"Blender 首次无界面初始化失败：" + process.error + L"。日志：" +
+                log.wstring();
+        } else {
+            error = L"Blender 首次无界面初始化失败，退出码 " +
+                std::to_wstring(process.exitCode) + L"。日志：" + log.wstring();
+        }
+        return false;
+    }
+    if (!fs::is_regular_file(readyMarker) ||
+        ReadText(readyMarker).find("RENDERMESH_BLENDER_READY") == std::string::npos) {
+        error = L"Blender 初始化未返回就绪标记。日志：" + log.wstring();
+        return false;
+    }
+    gReadyBlenders.insert(key);
+    LogInfo("Blender first-run readiness completed; executable=" + WideToUtf8(blender.wstring()));
+    return true;
+}
+
 const char* kPreflightScript = R"PY(import bpy, json, os, sys, glob, re, traceback
 
 args = sys.argv[sys.argv.index('--') + 1:]
 prepared, report_path = args[0], args[1]
 validation_start, validation_end, validation_step = map(int, args[2:5])
 warnings = []
+
+def enable_cycles_gpu():
+    preferences = bpy.context.preferences.addons['cycles'].preferences
+    preferred = getattr(preferences, 'compute_device_type', 'NONE')
+    backends = []
+    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
+        if backend and backend != 'NONE' and backend not in backends:
+            backends.append(backend)
+    failures = []
+    for backend in backends:
+        try:
+            preferences.compute_device_type = backend
+            preferences.get_devices()
+            devices = [device for device in preferences.devices if device.type == backend]
+            if devices:
+                for device in preferences.devices:
+                    device.use = device.type == backend
+                return sorted({f'{device.type}:{device.name}' for device in devices})
+        except Exception as exc:
+            failures.append(f'{backend}: {exc!r}')
+    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
 
 def path_key(path):
     return os.path.normcase(os.path.normpath(bpy.path.abspath(path)))
@@ -507,6 +657,8 @@ try:
             scene.render.resolution_y = min(max(1, scene.render.resolution_y), 64)
             scene.render.resolution_percentage = 100
             if scene.render.engine == 'CYCLES':
+                if getattr(scene.cycles, 'device', 'CPU') == 'GPU':
+                    print('RenderMesh Cycles GPU: ' + ', '.join(enable_cycles_gpu()))
                 scene.cycles.samples = 1
                 scene.cycles.use_denoising = False
             for validation_frame in range(validation_start, validation_end + 1, validation_step):
@@ -532,6 +684,28 @@ with open(manifest_path, 'r', encoding='utf-8') as f:
     manifest = json.load(f)
 version = f'{bpy.app.version[0]}.{bpy.app.version[1]}'
 result = {'pass': version == manifest.get('version'), 'version': version}
+
+def enable_cycles_gpu():
+    preferences = bpy.context.preferences.addons['cycles'].preferences
+    preferred = getattr(preferences, 'compute_device_type', 'NONE')
+    backends = []
+    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
+        if backend and backend != 'NONE' and backend not in backends:
+            backends.append(backend)
+    failures = []
+    for backend in backends:
+        try:
+            preferences.compute_device_type = backend
+            preferences.get_devices()
+            devices = [device for device in preferences.devices if device.type == backend]
+            if devices:
+                for device in preferences.devices:
+                    device.use = device.type == backend
+                return sorted({f'{device.type}:{device.name}' for device in devices})
+        except Exception as exc:
+            failures.append(f'{backend}: {exc!r}')
+    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
+
 engine = manifest.get('render_engine', '')
 try:
     if engine:
@@ -545,11 +719,7 @@ result['gpu_devices'] = []
 if manifest.get('requires_gpu', False):
     if engine == 'CYCLES':
         try:
-            cycles_preferences = bpy.context.preferences.addons['cycles'].preferences
-            cycles_preferences.get_devices()
-            result['gpu_devices'] = sorted({f'{device.type}:{device.name}'
-                                            for device in cycles_preferences.devices
-                                            if device.type != 'CPU' and device.use})
+            result['gpu_devices'] = enable_cycles_gpu()
         except Exception as exc:
             result['gpu_error'] = repr(exc)
     elif engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:
@@ -608,6 +778,28 @@ error = ''
 primary_dir = os.path.join(output_dir, 'primary')
 compositor_root = os.path.join(output_dir, 'compositor')
 os.makedirs(primary_dir, exist_ok=True)
+
+def enable_cycles_gpu():
+    preferences = bpy.context.preferences.addons['cycles'].preferences
+    preferred = getattr(preferences, 'compute_device_type', 'NONE')
+    backends = []
+    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
+        if backend and backend != 'NONE' and backend not in backends:
+            backends.append(backend)
+    failures = []
+    for backend in backends:
+        try:
+            preferences.compute_device_type = backend
+            preferences.get_devices()
+            devices = [device for device in preferences.devices if device.type == backend]
+            if devices:
+                for device in preferences.devices:
+                    device.use = device.type == backend
+                return sorted({f'{device.type}:{device.name}' for device in devices})
+        except Exception as exc:
+            failures.append(f'{backend}: {exc!r}')
+    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
+
 tree = getattr(scene, 'compositing_node_group', None)
 nodes = [node for node in tree.nodes if node.type == 'OUTPUT_FILE'] if tree else []
 if len(nodes) != len(targets):
@@ -645,6 +837,8 @@ def persist():
                   ensure_ascii=False, indent=2)
     os.replace(temporary, manifest_path)
 try:
+    if scene.render.engine == 'CYCLES' and getattr(scene.cycles, 'device', 'CPU') == 'GPU':
+        print('RenderMesh Cycles GPU: ' + ', '.join(enable_cycles_gpu()))
     for index, frame in enumerate(frames):
         if index and os.path.exists(stop_path):
             break
@@ -1060,6 +1254,7 @@ bool GeneratePreviewImage(
         error = L"未找到 Blender，无法生成该格式的预览";
         return false;
     }
+    if (!EnsureBlenderReady(blender, dataDir, &stopRequested, error)) return false;
     std::error_code ignored;
     fs::create_directories(destination.parent_path(), ignored);
     fs::remove(destination, ignored);
@@ -1106,6 +1301,7 @@ PreflightReport PreflightBlend(
         report.summary = L"未找到 Blender。请先安装 Blender，或在设置中选择 blender.exe。";
         return report;
     }
+    if (!EnsureBlenderReady(blender, dataDir, stopRequested, report.summary)) return report;
     if (source.extension() != L".blend") {
         report.summary = L"只能提交 .blend 工程文件。";
         return report;
@@ -1208,6 +1404,7 @@ bool CheckWorkerCompatibility(
         summary = L"Worker 未安装 Blender";
         return false;
     }
+    if (!EnsureBlenderReady(blender, dataDir, &stopRequested, summary)) return false;
     fs::path tools = dataDir / L"tools";
     fs::create_directories(tools);
     fs::path script = tools / L"compatibility.py";
@@ -1292,6 +1489,7 @@ bool RenderBlenderFrame(
         error = L"未找到 Blender";
         return false;
     }
+    if (!EnsureBlenderReady(blender, outputDir, &stopRequested, error)) return false;
     fs::create_directories(outputDir);
     fs::path prefix = outputDir / L"frame_######";
     fs::path log = outputDir / (L"frame_" + std::to_wstring(frame) + L".log");
@@ -1348,6 +1546,7 @@ bool RenderBlenderPackage(
         error = L"未找到 Blender";
         return false;
     }
+    if (!EnsureBlenderReady(blender, outputDir, &stopRequested, error)) return false;
     fs::create_directories(outputDir);
     fs::path script = outputDir / L"render-package.py";
     fs::path manifest = outputDir / L"render-package.json";
@@ -1467,6 +1666,34 @@ bool ValidateFramePackageCompletion(
                 : L"Blender 只完成了 " + std::to_wstring(completedFrames) + L" / " +
                       std::to_wstring(requestedFrames) + L" 帧";
         }
+        return false;
+    }
+    return true;
+}
+
+bool RunBlenderReadinessSelfTest(std::wstring& report) {
+    fs::path script = L"C:\\RenderMesh Test\\initialize-blender.py";
+    fs::path marker = L"C:\\RenderMesh Test\\initialize-blender.ready";
+    const auto arguments = BlenderBootstrapArguments(script, marker);
+    const std::vector<std::wstring> expected = {
+        L"--background", L"--factory-startup", L"--disable-autoexec", L"-noaudio",
+        L"--python-exit-code", L"95", L"--python", script.wstring(), L"--",
+        marker.wstring()};
+    std::string bootstrap = kBlenderBootstrapScript;
+    auto strictGpuSelection = [](const std::string& value) {
+        return value.find("device.type == backend") != std::string::npos &&
+            value.find("device.use = device.type == backend") != std::string::npos;
+    };
+    if (arguments != expected ||
+        bootstrap.find("userpref.blend") == std::string::npos ||
+        bootstrap.find("os.path.isfile(preferences)") == std::string::npos ||
+        bootstrap.find("bpy.ops.wm.save_userpref()") == std::string::npos ||
+        bootstrap.find("os.replace(temporary, ready_path)") == std::string::npos ||
+        bootstrap.find("RENDERMESH_BLENDER_READY") == std::string::npos ||
+        !strictGpuSelection(kPreflightScript) ||
+        !strictGpuSelection(kCompatibilityScript) ||
+        !strictGpuSelection(kBatchRenderScript)) {
+        report = L"Blender first-run readiness launch contract self-test failed";
         return false;
     }
     return true;

@@ -3264,6 +3264,7 @@ bool RunSelfTest(std::wstring& report) {
             report = L"Quick zero-output Blender retry self-test failed";
             return false;
         }
+        if (!RunBlenderReadinessSelfTest(report)) return false;
         fs::path root = fs::temp_directory_path() / (L"RenderMesh-SelfTest-" +
             Utf8ToWide(NewRandomHex(4)));
         fs::create_directories(root);

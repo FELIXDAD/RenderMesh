@@ -175,6 +175,7 @@ bool ValidateFramePackageCompletion(
     size_t completedFrames,
     bool stoppedAfterCurrent,
     std::wstring& error);
+bool RunBlenderReadinessSelfTest(std::wstring& report);
 bool WriteResultBundle(
     const fs::path& destination,
     const std::vector<RenderArtifact>& artifacts,
