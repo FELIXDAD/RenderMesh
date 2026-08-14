@@ -64,6 +64,11 @@ $fullResetCalls = Get-ChildItem -LiteralPath (Join-Path $nativeRoot 'src') -File
 if ($fullResetCalls) {
     throw 'A full ListView reset call was reintroduced into the native UI.'
 }
+$legacyControls = Get-ChildItem -LiteralPath (Join-Path $nativeRoot 'src') -File |
+    Select-String -Pattern 'BS_PUSHBUTTON|DarkMode_ItemsView'
+if ($legacyControls) {
+    throw 'A legacy default button or header theme was reintroduced into the native UI.'
+}
 
 [pscustomobject]@{
     Result = 'UI_REGRESSION_OK'
@@ -73,4 +78,5 @@ if ($fullResetCalls) {
     ScrollAnchorPreserved = $metrics.scroll_anchor_preserved
     SelectionPreserved = $metrics.selection_preserved
     FullResetCalls = 0
+    LegacyControlStyles = 0
 }

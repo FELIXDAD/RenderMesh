@@ -4046,7 +4046,10 @@ bool RunSelfTest(std::wstring& report) {
                                 current.back().frames[index].state != TaskState::Completed;
                         WorkerActivity workerProgress = worker.CurrentActivity();
                         streamedFirstFrame = firstComplete && laterIncomplete &&
-                            workerProgress.rendering && workerProgress.completedFrames > 0 &&
+                            workerProgress.rendering &&
+                            workerProgress.jobName == "two-node-self-test" &&
+                            workerProgress.frames == std::vector<int>{1, 2, 3, 4, 5} &&
+                            workerProgress.completedFrames > 0 &&
                             workerProgress.completedFrames < workerProgress.frames.size() &&
                             fs::exists(current.back().frames[0].output) &&
                             fs::exists(finalOutputRoot / L"compositor" / L"ViewLayer" /

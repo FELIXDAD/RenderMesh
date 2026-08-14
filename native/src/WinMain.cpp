@@ -29,6 +29,7 @@ constexpr UINT_PTR TIMER_BURST_REFRESH = 3;
 constexpr UINT_PTR TIMER_UI_TEST_REPORT = 4;
 constexpr UINT IDLE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr int UI_TEST_BURST_NOTIFICATIONS = 100;
+constexpr int IDI_RENDERMESH = 101;
 
 enum ControlId {
     ID_SHARE = 100,
@@ -1482,6 +1483,8 @@ void LayoutUi() {
     move(ID_PREFLIGHT, left, 240, width, 42);
     move(ID_TASK_QUEUE_LABEL, left, 292, 280, 26);
     move(ID_JOBS, left, 322, width, std::max(220, static_cast<int>(client.bottom - 386)));
+    if (HWND jobs = Item(ID_JOBS))
+        ListView_SetColumnWidth(jobs, 6, std::max(155, width - 730));
     move(ID_JOB_DETAILS, right - 342, client.bottom - 48, 160, 34);
     move(ID_OPEN_DATA, right - 172, client.bottom - 48, 172, 34);
     InvalidateRect(gWindow, nullptr, FALSE);
@@ -2099,12 +2102,7 @@ LRESULT CALLBACK DetailWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
-            HWND control = reinterpret_cast<HWND>(lParam);
-            RECT rect{};
-            GetWindowRect(control, &rect);
-            MapWindowPoints(HWND_DESKTOP, window, reinterpret_cast<POINT*>(&rect), 2);
-            const bool onPageSurface = gCurrentPage != 0 && rect.left >= 220 && rect.top >= 72;
-            return reinterpret_cast<LRESULT>(onPageSurface ? gSurfaceBrush : gBackgroundBrush);
+            return reinterpret_cast<LRESULT>(gBackgroundBrush);
         }
         case WM_ERASEBKGND: {
             RECT client{};
@@ -2316,7 +2314,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, gDarkTheme ? RGB(239, 239, 247) : RGB(31, 31, 38));
-            return reinterpret_cast<LRESULT>(gBackgroundBrush);
+            HWND control = reinterpret_cast<HWND>(lParam);
+            RECT rect{};
+            GetWindowRect(control, &rect);
+            MapWindowPoints(HWND_DESKTOP, window, reinterpret_cast<POINT*>(&rect), 2);
+            const bool onPageSurface = gCurrentPage != 0 && rect.left >= 220 && rect.top >= 72;
+            return reinterpret_cast<LRESULT>(onPageSurface ? gSurfaceBrush : gBackgroundBrush);
         }
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX: {
@@ -2589,7 +2592,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     windowClass.hInstance = instance;
     windowClass.lpszClassName = L"RenderMeshNativeWindow";
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = reinterpret_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(IDI_RENDERMESH), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&windowClass);
     WNDCLASSW detailClass = windowClass;

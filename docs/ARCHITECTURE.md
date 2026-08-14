@@ -79,6 +79,10 @@ blender --background --disable-autoexec source.blend
 
 本机用户自己提交并由本机兜底执行的任务不受闲置状态影响。所有别人发来的共享任务，无论 Eevee、Cycles GPU 还是 Cycles CPU，都只能在 Worker 达到闲置阈值后接单；检测到键鼠恢复后写入停止标记，Blender 完成当前帧才退出，已完成帧正常回传，包内其余帧请求 Origin 重派。应用退出仍会立即终止 Blender。Cycles GPU 还要求 Worker 检测到已启用的非 CPU Cycles 设备。RenderMesh 不创建 CPU rate-control Job Object，也不对 Blender 设置 CPU 百分比硬上限；它只尝试把 Blender 放入启用 `KILL_ON_JOB_CLOSE` 的生命周期 Job，失败时降级为直接管理主进程，避免受管电脑因 Job 嵌套限制而拒绝渲染。
 
+## 节点活动展示
+
+协议 v7 在既有发现心跳中增加并签名 Worker 当前作业名、帧包、完成数和渲染阶段。服务器页因此可以在“已分配”列显示每台电脑正在渲染的作业和帧进度，不传输工程绝对路径，也不增加轮询频率。旧节点继续退化为仅显示“正在渲染”。
+
 ## 生产化后续
 
 1. 增加独立心跳与可续期租约，缩短当前基于发现广播的 20 秒故障恢复时间。
