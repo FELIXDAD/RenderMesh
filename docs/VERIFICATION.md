@@ -1,6 +1,6 @@
 # 验证记录
 
-验证日期：2026-08-13，Windows x64。
+验证日期：2026-08-14，Windows x64。
 
 ## 原生程序自检
 
@@ -17,6 +17,7 @@
 - 错误类型的节点 JSON 会被拒绝而不会终止后台线程；旧版 Worker 不报告任务 ID 时，`assigned=1` 的长帧不会被误判为掉线，恢复空闲后仍可触发重派；
 - 模拟 Worker 接单后离线，Origin 在租约宽限期后自动把该帧恢复 Pending，并由本机完成；
 - 旧 Worker 使用已经失效的 attempt token 迟到回传时，Origin 返回 409，不会覆盖重派结果。
+- 模拟 Worker 确定性不兼容与暂时忙碌：七帧任务都只请求一次该节点，随后分别按任务屏蔽或 5 秒退避，并立即以本机 5+2 包完成；不存在每 250 ms 重传工程的重试风暴。
 
 ## 真实 Blender 5.2 LTS
 
@@ -32,9 +33,9 @@
 7. 无摄像机工程旁预放一个旧 `frame_000099.png`：请求第 1 帧返回失败，不会把旧帧误认为新结果。
 8. 图片序列缺少中间帧 `seq_0002.png`：预检精确报告缺失帧并返回 3；序列完整但 Blender 无法完整 pack 时报告全部 unpacked 路径并阻止分发。
 9. Eevee 工程被识别为 GPU 主路径，远端 Worker 在电脑活跃时拒绝接单；Cycles GPU 同样只在空闲状态运行，并要求 Worker 检测到已启用的非 CPU Cycles 设备。
-   本机 Cycles GPU 探测报告 `CUDA:NVIDIA GeForce RTX 5090 D v2` 和 `OPTIX:NVIDIA GeForce RTX 5090 D v2`，兼容性检查返回 0。
+   Eevee 兼容性检查成功完成 1×1 真实渲染上下文探针并报告 `NVIDIA Corporation:NVIDIA GeForce RTX 5090 D v2`；本机 Cycles GPU 探测报告 `CUDA:NVIDIA GeForce RTX 5090 D v2` 和 `OPTIX:NVIDIA GeForce RTX 5090 D v2`，两种兼容性检查均返回 0。
 10. 提交前在发起端对提交范围内每一帧执行低分辨率真实渲染，并检查材质、世界、灯光、合成器和节点组；测试工程返回 `validation_render=true` 和准确的 `validation_frames`。无相机或插件/节点/引擎执行异常时预检返回 3，不创建任务。
-11. 用户提供的 `D:\05_Documents\Desktop\测试.blend` 在 Blender 5.2 便携版预检通过：Eevee、PNG、11 个当前启用插件环境条目、`missing=0`、`unpacked=0`，第 1 帧工程主输出映射为 `D:\05_Documents\Desktop\tmp\0001.png`。该工程没有 File Output 节点。
+11. 用户于 2026-08-14 更新的 `D:\05_Documents\Desktop\测试.blend` 在 Blender 5.2 预检通过：Cycles GPU、PNG、11 个当前启用插件环境条目、`missing=0`、`unpacked=0`，主输出映射为 `D:\05_Documents\Desktop\tmp\####.png`，并检测到映射至 `tmp\AOV` 的 File Output 节点。本机真实提交 1–7 帧后只启动两个 Blender 进程（5+2），七张 PNG 和合成器 EXR 均发布到工程目录。
 12. 另建 Blender 5.2 合成器工程，一次 Blender 启动同时生成主 PNG 和 File Output OpenEXR；清单准确记录 `primary` 与 `compositor/output-0/rgba_.exr`，并保留原节点输出目录。
 13. 将上述真实 OpenEXR 交给桌面端预览转换路径，Blender 5.2 成功生成可由 WIC 显示的 PNG 缩略图。
 14. GUI 运行时度量验证任务 ListView 的 `LVM_GETCOUNTPERPAGE=10`，主共享开关文字在 150% DPI 的可用区域内完整显示。

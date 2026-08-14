@@ -202,6 +202,21 @@ std::string ReadText(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), {});
 }
 
+std::string ReadTextTail(const fs::path& path, std::streamoff maximumBytes) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return {};
+    std::streamoff size = input.tellg();
+    if (size < 0) return {};
+    std::streamoff start = std::max<std::streamoff>(0, size - maximumBytes);
+    input.seekg(start);
+    std::string text(std::istreambuf_iterator<char>(input), {});
+    if (start > 0) {
+        size_t firstLine = text.find('\n');
+        if (firstLine != std::string::npos) text.erase(0, firstLine + 1);
+    }
+    return text;
+}
+
 bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring& error) {
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
@@ -530,15 +545,43 @@ except Exception:
 result['render_engine'] = engine
 result['pass'] = result['pass'] and result['engine_available']
 result['gpu_devices'] = []
-if engine == 'CYCLES' and manifest.get('requires_gpu', False):
-    try:
-        cycles_preferences = bpy.context.preferences.addons['cycles'].preferences
-        cycles_preferences.get_devices()
-        result['gpu_devices'] = sorted({f'{device.type}:{device.name}'
-                                        for device in cycles_preferences.devices
-                                        if device.type != 'CPU' and device.use})
-    except Exception:
-        result['gpu_devices'] = []
+if manifest.get('requires_gpu', False):
+    if engine == 'CYCLES':
+        try:
+            cycles_preferences = bpy.context.preferences.addons['cycles'].preferences
+            cycles_preferences.get_devices()
+            result['gpu_devices'] = sorted({f'{device.type}:{device.name}'
+                                            for device in cycles_preferences.devices
+                                            if device.type != 'CPU' and device.use})
+        except Exception as exc:
+            result['gpu_error'] = repr(exc)
+    elif engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:
+        try:
+            scene = bpy.context.scene
+            scene.use_nodes = False
+            scene.world = None
+            scene.render.use_sequencer = False
+            scene.render.resolution_x = 1
+            scene.render.resolution_y = 1
+            scene.render.resolution_percentage = 100
+            for obj in list(scene.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+            camera_data = bpy.data.cameras.new('__RenderMesh_Eevee_Probe_Camera')
+            camera = bpy.data.objects.new('__RenderMesh_Eevee_Probe_Camera', camera_data)
+            scene.collection.objects.link(camera)
+            scene.camera = camera
+            bpy.ops.render.render(write_still=False)
+            result['gpu_devices'] = ['EEVEE_RENDER_CONTEXT']
+            try:
+                import gpu
+                renderer = gpu.platform.renderer_get()
+                vendor = gpu.platform.vendor_get()
+                if renderer:
+                    result['gpu_devices'] = [f'{vendor}:{renderer}']
+            except Exception:
+                pass
+        except Exception as exc:
+            result['gpu_error'] = repr(exc)
     result['pass'] = result['pass'] and bool(result['gpu_devices'])
 with open(report_path, 'w', encoding='utf-8') as f:
     json.dump(result, f, ensure_ascii=False, indent=2)
@@ -1186,13 +1229,23 @@ bool CheckWorkerCompatibility(
                        {"requires_gpu", requiresGpu},
                        {"addons", requiredAddons}}.dump(2);
     }
+    // Compatibility only depends on the worker's Blender installation, enabled
+    // add-ons and GPU devices. Do not open the submitted project here: an older
+    // Blender may abort before the script can produce the actionable version
+    // mismatch report, and loading the full scene wastes memory before dispatch.
     ProcessResult process = RunProcess(
         blender,
-        {L"--background", L"--disable-autoexec", blend.wstring(), L"--python", script.wstring(),
-         L"--", manifest.wstring(), report.wstring()},
+        {L"--background", L"--disable-autoexec", L"--python", script.wstring(), L"--",
+         manifest.wstring(), report.wstring()},
         log, &config, &stopRequested);
     if (!process.started || process.exitCode != 0 || !fs::exists(report)) {
-        summary = L"Worker 环境检查失败：" + log.wstring();
+        summary = !process.started
+            ? L"Worker 无法启动 Blender 兼容性检查"
+            : L"Worker 的 Blender 兼容性检查异常退出（代码 " +
+                std::to_wstring(process.exitCode) + L"）";
+        std::string tail = ReadTextTail(log, 4096);
+        if (!tail.empty()) summary += L"\n" + Utf8ToWide(tail);
+        else summary += L"；日志：" + log.wstring();
         return false;
     }
     try {
@@ -1218,6 +1271,13 @@ bool CheckWorkerCompatibility(
         }
         if (requiresGpu && expectedEngine == "CYCLES" && gpuDevices.empty()) {
             summary = L"Worker 没有已启用的 Cycles GPU 渲染设备";
+            return false;
+        }
+        if (requiresGpu && expectedEngine.starts_with("BLENDER_EEVEE") &&
+            gpuDevices.empty()) {
+            summary = L"Worker 没有可供 Eevee 使用的 GPU 图形设备";
+            std::string gpuError = data.value("gpu_error", std::string{});
+            if (!gpuError.empty()) summary += L"：" + Utf8ToWide(gpuError);
             return false;
         }
         summary = L"Worker 环境兼容";

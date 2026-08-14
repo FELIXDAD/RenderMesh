@@ -737,6 +737,9 @@ struct NodeApp::Impl {
     mutable std::mutex stateMutex;
     std::mutex persistMutex;
     std::map<std::string, Peer> peers;
+    std::set<std::pair<std::string, std::string>> rejectedJobPeers;
+    std::map<std::pair<std::string, std::string>, std::chrono::steady_clock::time_point>
+        jobPeerBackoff;
     std::vector<RenderJob> jobs;
     std::vector<ContributionRecord> contributions;
     std::mutex callbackMutex;
@@ -2127,10 +2130,14 @@ struct NodeApp::Impl {
         discoverySocket.store(INVALID_SOCKET);
     }
 
-    std::optional<Peer> AvailablePeer() {
+    std::optional<Peer> AvailablePeer(const std::string& jobId = {}) {
         std::scoped_lock lock(stateMutex);
         auto now = std::chrono::steady_clock::now();
         for (const auto& [id, peer] : peers) {
+            if (!jobId.empty() && rejectedJobPeers.contains({jobId, peer.nodeId})) continue;
+            auto backoff = jobPeerBackoff.find({jobId, peer.nodeId});
+            if (!jobId.empty() && backoff != jobPeerBackoff.end() && now < backoff->second)
+                continue;
             bool locallyLeased = std::any_of(jobs.begin(), jobs.end(), [&](const RenderJob& job) {
                 return std::any_of(job.frames.begin(), job.frames.end(),
                     [&](const FrameTask& frame) {
@@ -2152,7 +2159,7 @@ struct NodeApp::Impl {
         verifier.set_read_timeout(5, 0);
         auto proofResponse = verifier.Get("/v1/prove?challenge=" + challenge);
         if (!proofResponse || proofResponse->status != 200) {
-            error = "worker failed fresh ownership proof";
+            error = "retry: worker failed fresh ownership proof";
             return false;
         }
         json proof = json::parse(proofResponse->body, nullptr, false);
@@ -2160,7 +2167,7 @@ struct NodeApp::Impl {
             "worker-proof|" + peer.nodeId + "|" + challenge);
         if (proof.is_discarded() || proof.value("node_id", "") != peer.nodeId ||
             !ConstantTimeEqual(proof.value("proof", ""), expectedProof)) {
-            error = "worker ownership proof was invalid";
+            error = "permanent: worker ownership proof was invalid";
             return false;
         }
         return true;
@@ -2198,7 +2205,10 @@ struct NodeApp::Impl {
         }
         if (status->status == 200) return true;
         if (status->status != 404) {
-            error = status->body.empty() ? "project cache query failed" : status->body;
+            std::string detail = status->body.empty() ? "project cache query failed" : status->body;
+            error = (status->status >= 500 && status->status != 507) ||
+                    status->status == 409 || status->status == 425
+                ? "retry: " + detail : "permanent: " + detail;
             return false;
         }
         httplib::Headers uploadHeaders = {
@@ -2213,8 +2223,17 @@ struct NodeApp::Impl {
         auto upload = PostFile(peer.address, peer.httpPort, "/v2/cache", uploadHeaders,
                                job.preparedBlend, &stopRequested, 3600, jobCancelled);
         if (!upload || (upload->status != 200 && upload->status != 201)) {
-            error = upload && !upload->body.empty() ? upload->body
-                : "project cache upload failed";
+            if (!upload) {
+                error = "retry: project cache upload failed: " +
+                    httplib::to_string(upload.error());
+                return false;
+            }
+            std::string detail = upload->body.empty()
+                ? "project cache upload failed" : upload->body;
+            bool transient = (upload->status >= 500 && upload->status != 507) ||
+                upload->status == 425 ||
+                (upload->status == 409 && detail == "worker is busy");
+            error = (transient ? "retry: " : "permanent: ") + detail;
             return false;
         }
         return true;
@@ -2226,7 +2245,7 @@ struct NodeApp::Impl {
         // Legacy single-frame transport returns only the primary image. Never
         // silently mark a compositor job complete without its File Output files.
         if (!job.compositorOutputs.empty()) {
-            error = "worker single-frame protocol cannot return compositor outputs";
+            error = "permanent: worker single-frame protocol cannot return compositor outputs";
             return false;
         }
         Config config = owner->GetConfig();
@@ -2260,11 +2279,14 @@ struct NodeApp::Impl {
                               job.preparedBlend, &stopRequested, 3600, jobCancelled);
         }
         if (!result) {
-            error = "network error: " + httplib::to_string(result.error());
+            error = "retry: network error: " + httplib::to_string(result.error());
             return false;
         }
         if (result->status != 202) {
-            error = result->body.empty() ? "worker rejected task" : result->body;
+            std::string detail = result->body.empty() ? "worker rejected task" : result->body;
+            bool transient = (result->status >= 500 && result->status != 507) ||
+                result->status == 404 || result->status == 409 || result->status == 425;
+            error = (transient ? "retry: " : "permanent: ") + detail;
             LogWarning("worker rejected task " + frame.taskId + "; node=" + peer.nodeId);
             return false;
         }
@@ -2278,11 +2300,11 @@ struct NodeApp::Impl {
         std::string& error, std::atomic<bool>* jobCancelled) {
         if (!peer.supportsFramePackages || !peer.supportsProjectCache || frames.empty() ||
             frames.size() > 5 || frames.size() != attemptTokens.size()) {
-            error = "worker does not support frame packages";
+            error = "permanent: worker does not support frame packages";
             return false;
         }
         if (!job.compositorOutputs.empty() && !peer.supportsResultBundles) {
-            error = "worker does not support compositor result bundles";
+            error = "permanent: worker does not support compositor result bundles";
             return false;
         }
         Config config = owner->GetConfig();
@@ -2325,7 +2347,11 @@ struct NodeApp::Impl {
             return false;
         }
         if (result->status != 202) {
-            error = result->body.empty() ? "worker rejected package" : result->body;
+            std::string detail = result->body.empty() ? "worker rejected package" : result->body;
+            bool transient = (result->status >= 500 && result->status != 507) ||
+                result->status == 404 ||
+                result->status == 409 || result->status == 425;
+            error = (transient ? "retry: " : "permanent: ") + detail;
             LogWarning("worker rejected package " + packageId + "; node=" + peer.nodeId);
             return false;
         }
@@ -2373,13 +2399,10 @@ struct NodeApp::Impl {
                 PersistJobs();
                 Notify();
             }
-            auto peer = AvailablePeer();
-            // An older package-capable worker cannot be told to stop. Give it one
-            // frame per package so stopping a job never leaves four extra frames
-            // running in a mixed-version cluster.
-            const size_t wantedFrames = !peer ||
-                    (peer->supportsFramePackages && peer->supportsPackageCancellation)
-                ? 5 : 1;
+            // Reserve the v6/local package size first. Once the job is known we
+            // select a peer that has not rejected this job, then shrink to one
+            // frame only when that actual peer lacks package cancellation.
+            constexpr size_t wantedFrames = 5;
             size_t jobIndex = 0;
             std::vector<size_t> frameIndices;
             RenderJob jobCopy;
@@ -2412,9 +2435,24 @@ struct NodeApp::Impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
+            // The first peer lookup determines the preferred package size before
+            // a pending job is selected. Re-evaluate it now that the job is known
+            // so a deterministic rejection from this peer is fenced for the rest
+            // of this job while other compatible peers remain eligible.
+            auto peer = AvailablePeer(jobCopy.id);
+            if (peer && frameIndices.size() > 1 &&
+                (!peer->supportsFramePackages || !peer->supportsPackageCancellation)) {
+                std::scoped_lock lock(stateMutex);
+                for (size_t index = 1; index < frameIndices.size(); ++index) {
+                    if (jobIndex < jobs.size() && frameIndices[index] < jobs[jobIndex].frames.size() &&
+                        jobs[jobIndex].frames[frameIndices[index]].state == TaskState::Dispatching)
+                        jobs[jobIndex].frames[frameIndices[index]].state = TaskState::Pending;
+                }
+                frameIndices.resize(1);
+                frameCopies.resize(1);
+            }
             auto jobCancelled = JobCancellation(jobCopy.id);
             bool handled = false;
-            bool deferredRemote = false;
             if (peer) {
                 std::string dispatchError;
                 std::string packageId = peer->supportsFramePackages
@@ -2468,7 +2506,22 @@ struct NodeApp::Impl {
                     }
                     handled = true;
                 } else {
+                    bool retryable = dispatchError.starts_with("retry: ");
+                    bool explicitlyPermanent = dispatchError.starts_with("permanent: ");
+                    bool permanentlyRejected = !retryable && !jobCancelled->load();
+                    std::string visibleError = dispatchError;
+                    if (explicitlyPermanent) visibleError.erase(0, 11);
+                    else if (visibleError.starts_with("retry: ")) visibleError.erase(0, 7);
                     std::scoped_lock lock(stateMutex);
+                    if (!jobCancelled->load()) {
+                        auto decision = std::make_pair(jobCopy.id, peer->nodeId);
+                        if (permanentlyRejected) rejectedJobPeers.emplace(decision);
+                        else if (retryable)
+                            jobPeerBackoff[decision] = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(5);
+                    }
+                    LogWarning("worker unavailable for job " + jobCopy.id + "; node=" +
+                               peer->nodeId + "; " + visibleError.substr(0, 2048));
                     size_t restored = 0;
                     for (size_t index = 0; index < frameIndices.size(); ++index) {
                         if (jobIndex >= jobs.size() ||
@@ -2477,9 +2530,7 @@ struct NodeApp::Impl {
                         auto& frame = jobs[jobIndex].frames[frameIndices[index]];
                         if (frame.state == TaskState::Assigned &&
                             frame.attemptToken == attemptTokens[index]) {
-                            deferredRemote = dispatchError.starts_with("retry:");
-                            frame.state = deferredRemote ? TaskState::Pending
-                                                         : TaskState::Dispatching;
+                            frame.state = TaskState::Dispatching;
                             frame.assignedNodeId.clear();
                             frame.assignedNodeName.clear();
                             frame.assignedPackageId.clear();
@@ -2487,7 +2538,7 @@ struct NodeApp::Impl {
                             frame.attemptToken.clear();
                             frame.startedAt = {};
                             frame.endedAt = {};
-                            frame.error = dispatchError;
+                            frame.error = visibleError;
                             ++restored;
                         }
                     }
@@ -2495,10 +2546,22 @@ struct NodeApp::Impl {
                     // response reaches the client. Never locally duplicate those.
                     if (restored != frameIndices.size()) handled = true;
                 }
-                if (deferredRemote) {
-                    handled = true;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+            // A rejected/backed-off peer is not the same as having no remote
+            // capacity. Put the reservation back so the next eligible peer gets
+            // the package before the local worker is considered.
+            if (!handled && peer && !jobCancelled->load() &&
+                AvailablePeer(jobCopy.id).has_value()) {
+                std::scoped_lock lock(stateMutex);
+                for (size_t frameIndex : frameIndices) {
+                    if (jobIndex >= jobs.size() ||
+                        frameIndex >= jobs[jobIndex].frames.size())
+                        continue;
+                    auto& frame = jobs[jobIndex].frames[frameIndex];
+                    if (frame.state == TaskState::Dispatching)
+                        frame.state = TaskState::Pending;
                 }
+                handled = true;
             }
             int expectedAssigned = 0;
             if (!handled && !jobCancelled->load() &&
@@ -3716,6 +3779,179 @@ bool RunSelfTest(std::wstring& report) {
                             (record.jobId == jobId && record.completedFrames.size() == 5);
                     clusterOk = historyReloaded;
                     origin.RemovePeerForTest(workerConfig.nodeId);
+                    httplib::Server incompatibleServer;
+                    std::atomic<int> incompatibleUploads{0};
+                    std::atomic<int> cacheStatusQueries{0};
+                    std::atomic<bool> transientBusy{false};
+                    incompatibleServer.Get("/v1/prove", [&](const httplib::Request& request,
+                                                              httplib::Response& response) {
+                        std::string challenge = request.has_param("challenge")
+                            ? request.get_param_value("challenge") : "";
+                        response.set_content(json{
+                            {"node_id", "selftest-incompatible-worker"},
+                            {"proof", HmacSha256(sharedToken,
+                                "worker-proof|selftest-incompatible-worker|" + challenge)},
+                        }.dump(), "application/json");
+                    });
+                    incompatibleServer.Get("/v2/cache/status", [&] (
+                        const httplib::Request&, httplib::Response& response) {
+                        ++cacheStatusQueries;
+                        response.status = transientBusy.load() ? 425 : 404;
+                        if (transientBusy.load())
+                            response.set_content("computer is active", "text/plain");
+                    });
+                    incompatibleServer.Post("/v2/cache", [&](const httplib::Request&,
+                                                               httplib::Response& response) {
+                        ++incompatibleUploads;
+                        response.status = 409;
+                        response.set_content("Blender version mismatch", "text/plain");
+                    });
+                    int incompatiblePort = incompatibleServer.bind_to_any_port("127.0.0.1");
+                    std::thread incompatibleThread;
+                    if (incompatiblePort > 0)
+                        incompatibleThread = std::thread(
+                            [&] { incompatibleServer.listen_after_bind(); });
+                    Peer incompatiblePeer;
+                    incompatiblePeer.nodeId = "selftest-incompatible-worker";
+                    incompatiblePeer.name = "SELFTEST-INCOMPATIBLE-WORKER";
+                    incompatiblePeer.address = "127.0.0.1";
+                    incompatiblePeer.httpPort = incompatiblePort;
+                    incompatiblePeer.protocolVersion = 6;
+                    incompatiblePeer.shareEnabled = true;
+                    incompatiblePeer.trusted = true;
+                    incompatiblePeer.supportsProjectCache = true;
+                    incompatiblePeer.supportsFramePackages = true;
+                    incompatiblePeer.supportsResultBundles = true;
+                    incompatiblePeer.supportsPackageCancellation = true;
+                    origin.InjectPeerForTest(std::move(incompatiblePeer));
+                    std::string incompatibleJob = origin.SubmitPrepared(
+                        "incompatible-worker-self-test", preflight, 40, 46, 1, submitError);
+                    bool fellBackWithoutRetryStorm = false;
+                    auto incompatibleDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(4);
+                    while (!incompatibleJob.empty() &&
+                           std::chrono::steady_clock::now() < incompatibleDeadline) {
+                        auto current = origin.Jobs();
+                        if (!current.empty() && current.back().id == incompatibleJob) {
+                            bool completeLocally = current.back().frames.size() == 7;
+                            for (const auto& frame : current.back().frames)
+                                completeLocally = completeLocally &&
+                                    frame.state == TaskState::Completed &&
+                                    frame.assignedNodeId == originConfig.nodeId;
+                            if (completeLocally) {
+                                fellBackWithoutRetryStorm = incompatibleUploads.load() == 1 &&
+                                    current.back().frames[0].dispatchAttempts == 1 &&
+                                    current.back().frames[5].dispatchAttempts == 0 &&
+                                    current.back().frames[6].dispatchAttempts == 0;
+                                break;
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                    int queriesBeforeBusyJob = cacheStatusQueries.load();
+                    transientBusy = true;
+                    std::string busyJob = origin.SubmitPrepared(
+                        "busy-worker-self-test", preflight, 50, 56, 1, submitError);
+                    bool busyPeerFellBackLocally = false;
+                    auto busyDeadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(4);
+                    while (!busyJob.empty() &&
+                           std::chrono::steady_clock::now() < busyDeadline) {
+                        auto current = origin.Jobs();
+                        if (!current.empty() && current.back().id == busyJob) {
+                            bool completeLocally = current.back().frames.size() == 7;
+                            for (const auto& frame : current.back().frames)
+                                completeLocally = completeLocally &&
+                                    frame.state == TaskState::Completed &&
+                                    frame.assignedNodeId == originConfig.nodeId;
+                            if (completeLocally) {
+                                busyPeerFellBackLocally =
+                                    cacheStatusQueries.load() - queriesBeforeBusyJob == 1 &&
+                                    incompatibleUploads.load() == 1 &&
+                                    current.back().frames[0].dispatchAttempts == 1 &&
+                                    current.back().frames[5].dispatchAttempts == 0 &&
+                                    current.back().frames[6].dispatchAttempts == 0;
+                                break;
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    }
+                    fs::path alternateRoot = root / L"alternate-worker";
+                    ConfigStore alternateStore(alternateRoot);
+                    Config alternateConfig = alternateStore.Load();
+                    httplib::Server alternatePortProbe;
+                    int alternatePort = alternatePortProbe.bind_to_any_port("127.0.0.1");
+                    alternatePortProbe.stop();
+                    alternateConfig.nodeName = "SELFTEST-COMPATIBLE-WORKER";
+                    alternateConfig.nodeId = "selftest-z-compatible-worker";
+                    alternateConfig.clusterToken = sharedToken;
+                    alternateConfig.httpPort = alternatePort;
+                    alternateConfig.discoveryPort = 0;
+                    alternateConfig.shareEnabled = true;
+                    NodeApp alternateWorker(
+                        std::move(alternateStore), alternateConfig, true);
+                    std::wstring alternateStartError;
+                    bool alternateStarted = alternatePort > 0 &&
+                        alternateWorker.Start(alternateStartError);
+                    bool triedSecondWorkerBeforeLocal = false;
+                    if (alternateStarted) {
+                        Peer alternatePeer;
+                        alternatePeer.nodeId = alternateConfig.nodeId;
+                        alternatePeer.name = alternateConfig.nodeName;
+                        alternatePeer.address = "127.0.0.1";
+                        alternatePeer.httpPort = alternatePort;
+                        alternatePeer.protocolVersion = 6;
+                        alternatePeer.shareEnabled = true;
+                        alternatePeer.trusted = true;
+                        alternatePeer.supportsProjectCache = true;
+                        alternatePeer.supportsFramePackages = true;
+                        alternatePeer.supportsResultBundles = true;
+                        alternatePeer.supportsPackageCancellation = true;
+                        origin.InjectPeerForTest(std::move(alternatePeer));
+                        transientBusy = false;
+                        int uploadsBeforeMultiPeer = incompatibleUploads.load();
+                        std::string multiPeerJob = origin.SubmitPrepared(
+                            "second-worker-self-test", preflight, 60, 66, 1, submitError);
+                        auto multiPeerDeadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(4);
+                        while (!multiPeerJob.empty() &&
+                               std::chrono::steady_clock::now() < multiPeerDeadline) {
+                            auto current = origin.Jobs();
+                            if (!current.empty() && current.back().id == multiPeerJob) {
+                                bool allComplete = current.back().frames.size() == 7;
+                                for (const auto& frame : current.back().frames)
+                                    allComplete = allComplete &&
+                                        frame.state == TaskState::Completed;
+                                if (allComplete) {
+                                    triedSecondWorkerBeforeLocal =
+                                        incompatibleUploads.load() - uploadsBeforeMultiPeer == 1;
+                                    for (size_t index = 0; index < 5; ++index)
+                                        triedSecondWorkerBeforeLocal =
+                                            triedSecondWorkerBeforeLocal &&
+                                            current.back().frames[index].assignedNodeId ==
+                                                alternateConfig.nodeId;
+                                    break;
+                                }
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                        }
+                        origin.RemovePeerForTest(alternateConfig.nodeId);
+                    }
+                    alternateWorker.Stop();
+                    incompatibleServer.stop();
+                    if (incompatibleThread.joinable()) incompatibleThread.join();
+                    origin.RemovePeerForTest("selftest-incompatible-worker");
+                    clusterOk = clusterOk && fellBackWithoutRetryStorm &&
+                        busyPeerFellBackLocally && triedSecondWorkerBeforeLocal;
+                    if (!fellBackWithoutRetryStorm || !busyPeerFellBackLocally ||
+                        !triedSecondWorkerBeforeLocal)
+                        error = L"worker rejection fallback self-test failed; uploads=" +
+                            std::to_wstring(incompatibleUploads.load()) + L"; busy_queries=" +
+                            std::to_wstring(cacheStatusQueries.load() - queriesBeforeBusyJob) +
+                            L"; second_worker=" +
+                            std::to_wstring(triedSecondWorkerBeforeLocal);
+                }
+                if (clusterOk) {
                     httplib::Server lostServer;
                     lostServer.Get("/v1/prove", [&](const httplib::Request& request,
                                                      httplib::Response& response) {
