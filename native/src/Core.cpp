@@ -1440,6 +1440,35 @@ bool RenderBlenderPackage(
         }
         return false;
     }
+    if (!ValidateFramePackageCompletion(
+            frames.size(), completed.size(), finishCurrentThenStop.load(), error)) {
+        std::string tail = ReadTextTail(log, 4096);
+        if (!tail.empty()) error += L"\n" + Utf8ToWide(tail);
+        else error += L"；日志：" + log.wstring();
+        return false;
+    }
+    return true;
+}
+
+bool ValidateFramePackageCompletion(
+    size_t requestedFrames,
+    size_t completedFrames,
+    bool stoppedAfterCurrent,
+    std::wstring& error) {
+    if (!requestedFrames || completedFrames > requestedFrames) {
+        if (error.empty()) error = L"渲染任务包完成帧计数无效";
+        return false;
+    }
+    if (stoppedAfterCurrent) return true;
+    if (completedFrames != requestedFrames) {
+        if (error.empty()) {
+            error = completedFrames == 0
+                ? L"Blender 已退出，但没有完成任何请求帧"
+                : L"Blender 只完成了 " + std::to_wstring(completedFrames) + L" / " +
+                      std::to_wstring(requestedFrames) + L" 帧";
+        }
+        return false;
+    }
     return true;
 }
 

@@ -41,6 +41,7 @@
 15. 双机实测发现测试 Worker 无法应用 Windows CPU Job 限速时，旧策略会以内部代码 91 终止 Blender 兼容检查。0.2.2 移除 CPU 百分比限速器和界面设置，兼容检查及所有远端渲染统一只在闲置状态运行；策略边界由内置自检覆盖。Blender 仍使用不含 CPU rate control 的 `KILL_ON_JOB_CLOSE` 生命周期 Job，受管环境无法加入时不会阻止渲染。
 16. 0.2.3 关闭插件清单审查：发起端不再采集或持久化插件字段，新版 Worker 忽略旧任务/缓存中的插件字段，新版 Origin 向旧 v6 Worker 发送空列表；内置回归自检验证带任意旧插件字段的缓存仍可命中。
 17. 对在线测试节点 `192.168.28.28:8391` 走真实 v2 缓存/兼容链路：同一 packed 工程最初查询返回 404；携带 `X-RM-Addons: []` 上传后，远端 Blender 兼容检查返回 201 `cached`；再次查询返回 200。测试节点为 Blender 5.2/Cycles GPU 环境，证明旧严格插件元数据不再阻止该工程进入远端缓存与接单路径。
+18. 0.2.3 双机最小探针复现远端返回 202 后任务包瞬时清零；结果回传为 `status=failed` 且错误为空。根因是 Blender 退出码为 0、但进度清单没有完成帧时 `RenderBlenderPackage` 仍返回成功。0.2.4 增加零帧/部分帧完成验证、10 秒内空产出自动重启一次，以及失败结果持久日志。回归自检先在旧行为上以 `Zero-output Blender package validation self-test failed` 返回 1，修复后返回 0；同一真实测试工程的主 PNG 与合成器 EXR 仍成功生成。
 
 测试使用 Blender 官方便携构建 `5.2.0 LTS fbe6228777e7`；该大型测试工具不包含在发布 ZIP 中。
 

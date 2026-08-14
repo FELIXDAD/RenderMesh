@@ -33,6 +33,20 @@ namespace {
 constexpr auto kPeerTimeout = std::chrono::seconds(8);
 constexpr uint64_t kMaxTransferBytes = 100ull * 1024 * 1024 * 1024;
 
+bool ShouldRetryQuickEmptyPackage(
+    bool remote,
+    bool rendered,
+    bool outputsEmpty,
+    bool stoppedAfterCurrent,
+    bool appStopping,
+    bool packageCancelled,
+    std::chrono::steady_clock::duration renderDuration,
+    const std::wstring& error) {
+    return remote && !rendered && outputsEmpty && !stoppedAfterCurrent && !appStopping &&
+        !packageCancelled && renderDuration < std::chrono::seconds(10) &&
+        error.starts_with(L"Blender 已退出，但没有完成任何请求帧");
+}
+
 bool ConstantTimeEqual(const std::string& left, const std::string& right) {
     size_t size = std::max(left.size(), right.size());
     unsigned char diff = static_cast<unsigned char>(left.size() ^ right.size());
@@ -59,7 +73,13 @@ bool SafeSha256(const std::string& value) {
 }
 
 std::string HeaderDisplayText(std::string value, size_t limit = 256) {
-    if (value.size() > limit) value.resize(limit);
+    if (value.size() > limit) {
+        size_t cut = limit;
+        while (cut > 0 &&
+               (static_cast<unsigned char>(value[cut]) & 0xc0) == 0x80)
+            --cut;
+        value.resize(cut);
+    }
     value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char ch) {
         return ch < 0x20 || ch == 0x7f;
     }), value.end());
@@ -1698,6 +1718,11 @@ struct NodeApp::Impl {
                     response.status = 422;
                     return;
                 }
+                if (status != "completed") {
+                    LogWarning("worker reported " + status + " result; task=" + taskId +
+                               "; error=" + HeaderDisplayText(
+                                   request.get_header_value("X-RM-Error")));
+                }
                 bool resultBundle = request.get_header_value("X-RM-Result-Bundle") == "1";
                 fs::path stagingRoot;
                 std::string targetJobId;
@@ -2623,7 +2648,7 @@ struct NodeApp::Impl {
             {"X-RM-Token", config.clusterToken}, {"X-RM-Task", frame.taskId},
             {"X-RM-Attempt", frame.attemptToken},
             {"X-RM-Status", retry ? "retry" : success ? "completed" : "failed"},
-            {"X-RM-Error", WideToUtf8(renderError)},
+            {"X-RM-Error", HeaderDisplayText(WideToUtf8(renderError), 2048)},
         };
         if (success && item.resultBundles)
             headers.emplace("X-RM-Result-Bundle", "1");
@@ -2743,10 +2768,27 @@ struct NodeApp::Impl {
                 std::atomic<bool> finishCurrentThenStop = false;
                 std::vector<int> frameNumbers;
                 for (const auto& frame : item.frames) frameNumbers.push_back(frame.frame);
-                RenderBlenderPackage(
+                auto renderStartedAt = std::chrono::steady_clock::now();
+                bool rendered = RenderBlenderPackage(
                     renderConfig, item.blend, item.outputDir, frameNumbers,
                     item.outputFormat, item.outputExtension, item.remote, stopRequested,
                     finishCurrentThenStop, item.compositorOutputs, outputs, renderError);
+                auto renderDuration = std::chrono::steady_clock::now() - renderStartedAt;
+                bool quickEmptyExit = ShouldRetryQuickEmptyPackage(
+                    item.remote, rendered, outputs.empty(), finishCurrentThenStop.load(),
+                    stopRequested.load(), PackageCancelled(cancellationId), renderDuration,
+                    renderError);
+                if (quickEmptyExit) {
+                    LogWarning("Blender exited without a frame; retrying package once; package=" +
+                               cancellationId);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    renderError.clear();
+                    outputs.clear();
+                    RenderBlenderPackage(
+                        renderConfig, item.blend, item.outputDir, frameNumbers,
+                        item.outputFormat, item.outputExtension, item.remote, stopRequested,
+                        finishCurrentThenStop, item.compositorOutputs, outputs, renderError);
+                }
                 retryAfterIdle = finishCurrentThenStop.load();
             }
             if (item.remote) {
@@ -3200,6 +3242,26 @@ bool RunSelfTest(std::wstring& report) {
             packages[1] != std::vector<int>({11, 13}) ||
             !BuildFramePackages({1, 2}, 0).empty()) {
             report = L"Five-frame package partition self-test failed";
+            return false;
+        }
+        std::wstring missingFrameError;
+        std::wstring stoppedPackageError;
+        if (ValidateFramePackageCompletion(1, 0, false, missingFrameError) ||
+            missingFrameError.empty() ||
+            !ValidateFramePackageCompletion(5, 1, true, stoppedPackageError)) {
+            report = L"Zero-output Blender package validation self-test failed";
+            return false;
+        }
+        if (!ShouldRetryQuickEmptyPackage(
+                true, false, true, false, false, false,
+                std::chrono::seconds(1), missingFrameError) ||
+            ShouldRetryQuickEmptyPackage(
+                true, false, true, false, false, false,
+                std::chrono::seconds(10), missingFrameError) ||
+            ShouldRetryQuickEmptyPackage(
+                true, false, true, true, false, false,
+                std::chrono::seconds(1), missingFrameError)) {
+            report = L"Quick zero-output Blender retry self-test failed";
             return false;
         }
         fs::path root = fs::temp_directory_path() / (L"RenderMesh-SelfTest-" +

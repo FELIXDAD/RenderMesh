@@ -170,6 +170,11 @@ bool RenderBlenderPackage(
     const std::vector<OutputTarget>& compositorOutputs,
     std::map<int, std::vector<RenderArtifact>>& completed,
     std::wstring& error);
+bool ValidateFramePackageCompletion(
+    size_t requestedFrames,
+    size_t completedFrames,
+    bool stoppedAfterCurrent,
+    std::wstring& error);
 bool WriteResultBundle(
     const fs::path& destination,
     const std::vector<RenderArtifact>& artifacts,
