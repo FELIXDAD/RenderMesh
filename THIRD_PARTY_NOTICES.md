@@ -2,14 +2,6 @@
 
 RenderMesh vendors the following libraries:
 
-## cpp-httplib 0.53.0
-
-Copyright 2026 yhirose
-
-Source: https://github.com/yhirose/cpp-httplib
-
-MIT License: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the conditions in the upstream license. The software is provided "AS IS", without warranty of any kind.
-
 ## JSON for Modern C++ 3.12.0
 
 Copyright 2013-2025 Niels Lohmann
@@ -18,15 +10,17 @@ Source: https://github.com/nlohmann/json
 
 MIT License: Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the conditions in the upstream license. The software is provided "AS IS", without warranty of any kind.
 
-## SQLite 3.53.4
+## Microsoft Fluent UI System Icons
 
-Source: https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+Copyright (c) 2020 Microsoft Corporation
 
-SQLite is in the public domain and is statically compiled into RenderMesh. The
-upstream project provides additional warranty-of-title documentation at
-https://www.sqlite.org/copyright.html.
+Source: https://github.com/microsoft/fluentui-system-icons
 
-## MIT License text applying to both libraries
+The small checkmark, sync, and error badge geometry used by the RenderMesh tray
+status icons is adapted from Microsoft Fluent UI System Icons under the MIT
+License.
+
+## MIT License text
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

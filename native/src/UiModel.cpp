@@ -45,7 +45,7 @@ std::wstring FormatWorkerActivity(const WorkerActivityView& activity) {
     if (activity.jobName.empty() && activity.frames.empty()) return L"\u2014";
 
     std::wstring value;
-    if (!activity.rendering) value = L"\u51c6\u5907\u4e2d \u00b7 ";
+    if (!activity.rendering) value = L"\u6392\u961f\u4e2d \u00b7 ";
     value += activity.jobName.empty() ? L"\u672a\u547d\u540d\u4f5c\u4e1a" : activity.jobName;
     if (!activity.frames.empty()) {
         value += L" \u00b7 \u5e27 " + CompactFrames(activity.frames);

@@ -8,11 +8,16 @@
 #include <array>
 #include <cstring>
 #include <cwctype>
-#include <fstream>
-#include <iomanip>
 #include <mutex>
 #include <set>
-#include <sstream>
+
+// libc++abi's default terminate handler demangles the type of an uncaught
+// exception before printing it. A GUI process has nowhere to print it, and the
+// demangler is ~125 KB, so report "invalid name" (-2) instead of linking it.
+extern "C" char* __cxa_demangle(const char*, char*, size_t*, int* status) {
+    if (status) *status = -2;
+    return nullptr;
+}
 
 namespace rm {
 
@@ -56,9 +61,14 @@ void WriteLogLine(const char* level, const std::string& message) {
     std::string clean = message;
     std::replace(clean.begin(), clean.end(), '\r', ' ');
     std::replace(clean.begin(), clean.end(), '\n', ' ');
-    std::ofstream output(gLogPath, std::ios::binary | std::ios::app);
-    if (output)
-        output << LogTimestamp() << " [" << level << "] " << clean << "\r\n";
+    const std::string line = LogTimestamp() + " [" + level + "] " + clean + "\r\n";
+    HANDLE output = CreateFileW(gLogPath.c_str(), FILE_APPEND_DATA,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (output == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(output, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(output);
 }
 
 std::string InviteCodeFromToken(const std::string& token) {
@@ -74,8 +84,11 @@ std::string InviteCodeFromToken(const std::string& token) {
     return code;
 }
 
-std::wstring QuoteArg(const std::wstring& value) {
-    if (value.find_first_of(L" \t\"") == std::wstring::npos) return value;
+}  // namespace
+
+std::wstring QuoteCommandLineArgument(const std::wstring& value) {
+    // An empty argument must stay visible as "" or the arguments shift.
+    if (!value.empty() && value.find_first_of(L" \t\"") == std::wstring::npos) return value;
     std::wstring out = L"\"";
     size_t slashes = 0;
     for (wchar_t ch : value) {
@@ -96,12 +109,7 @@ std::wstring QuoteArg(const std::wstring& value) {
     return out;
 }
 
-struct ProcessResult {
-    bool started = false;
-    bool timedOut = false;
-    DWORD exitCode = static_cast<DWORD>(-1);
-    std::wstring error;
-};
+namespace {
 
 class WindowsProcessTree {
 public:
@@ -146,13 +154,15 @@ private:
     bool assigned_ = false;
 };
 
+}  // namespace
+
 ProcessResult RunProcess(
     const fs::path& executable,
     const std::vector<std::wstring>& arguments,
     const fs::path& logPath,
-    std::atomic<bool>* stopRequested = nullptr,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds::zero(),
-    const std::function<void()>& progress = {}) {
+    std::atomic<bool>* stopRequested,
+    std::chrono::milliseconds timeout,
+    const std::function<void()>& progress) {
     ProcessResult result;
     fs::create_directories(logPath.parent_path());
     SECURITY_ATTRIBUTES logSecurity{};
@@ -166,10 +176,10 @@ ProcessResult RunProcess(
         return result;
     }
 
-    std::wstring command = QuoteArg(executable.wstring());
+    std::wstring command = QuoteCommandLineArgument(executable.wstring());
     for (const auto& arg : arguments) {
         command.push_back(L' ');
-        command += QuoteArg(arg);
+        command += QuoteCommandLineArgument(arg);
     }
     std::vector<wchar_t> buffer(command.begin(), command.end());
     buffer.push_back(L'\0');
@@ -252,19 +262,13 @@ ProcessResult RunProcess(
     return result;
 }
 
-std::string ReadText(const fs::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    return std::string(std::istreambuf_iterator<char>(input), {});
-}
-
-std::string ReadTextTail(const fs::path& path, std::streamoff maximumBytes) {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
+std::string ReadFileTail(const fs::path& path, uint64_t maximumBytes) {
+    File input = File::OpenRead(path);
     if (!input) return {};
-    std::streamoff size = input.tellg();
-    if (size < 0) return {};
-    std::streamoff start = std::max<std::streamoff>(0, size - maximumBytes);
-    input.seekg(start);
-    std::string text(std::istreambuf_iterator<char>(input), {});
+    const uint64_t size = input.Size();
+    const uint64_t start = size > maximumBytes ? size - maximumBytes : 0;
+    std::string text(static_cast<size_t>(size - start), '\0');
+    if (!input.Seek(start) || !input.ReadExact(text.data(), text.size())) return {};
     if (start > 0) {
         size_t firstLine = text.find('\n');
         if (firstLine != std::string::npos) text.erase(0, firstLine + 1);
@@ -272,832 +276,6 @@ std::string ReadTextTail(const fs::path& path, std::streamoff maximumBytes) {
     return text;
 }
 
-bool WriteTextAtomic(const fs::path& path, const std::string& text, std::wstring& error) {
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
-    fs::path temporary = path;
-    temporary += L".tmp";
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        if (!output) {
-            error = L"无法写入配置临时文件";
-            return false;
-        }
-        output.write(text.data(), static_cast<std::streamsize>(text.size()));
-        output.flush();
-        if (!output) {
-            error = L"配置写入不完整";
-            return false;
-        }
-    }
-    if (!MoveFileExW(
-            temporary.c_str(), path.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        error = L"无法原子替换配置：" + LastErrorMessage();
-        DeleteFileW(temporary.c_str());
-        return false;
-    }
-    return true;
-}
-
-const char* kBlenderBootstrapScript = R"PY(import bpy, os, sys
-
-args = sys.argv[sys.argv.index('--') + 1:]
-ready_path = args[0]
-config_dir = bpy.utils.user_resource('CONFIG')
-if not config_dir:
-    raise RuntimeError('Blender did not provide a user configuration directory')
-os.makedirs(config_dir, exist_ok=True)
-preferences = os.path.join(config_dir, 'userpref.blend')
-if not os.path.isfile(preferences):
-    result = bpy.ops.wm.save_userpref()
-    if 'FINISHED' not in result:
-        raise RuntimeError(f'Unable to save Blender user preferences: {result}')
-temporary = ready_path + '.tmp'
-with open(temporary, 'w', encoding='utf-8') as handle:
-    handle.write('RENDERMESH_BLENDER_READY\n')
-os.replace(temporary, ready_path)
-print('RENDERMESH_BLENDER_READY')
-)PY";
-
-std::mutex gBlenderReadinessMutex;
-std::set<std::wstring> gReadyBlenders;
-
-std::vector<std::wstring> BlenderBootstrapArguments(
-    const fs::path& script,
-    const fs::path& readyMarker) {
-    return {L"--background", L"--factory-startup", L"--disable-autoexec", L"-noaudio",
-            L"--python-exit-code", L"95", L"--python", script.wstring(), L"--",
-            readyMarker.wstring()};
-}
-
-std::wstring BlenderReadinessKey(const fs::path& blender) {
-    std::error_code error;
-    fs::path resolved = fs::weakly_canonical(blender, error);
-    if (error) {
-        error.clear();
-        resolved = fs::absolute(blender, error);
-    }
-    if (error) resolved = blender;
-    std::wstring key = resolved.wstring();
-    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value) {
-        return static_cast<wchar_t>(std::towlower(value));
-    });
-    error.clear();
-    auto modified = fs::last_write_time(blender, error);
-    if (!error) key += L"|" + std::to_wstring(
-        static_cast<long long>(modified.time_since_epoch().count()));
-    return key;
-}
-
-bool EnsureBlenderReady(
-    const fs::path& blender,
-    const fs::path& workDirectory,
-    std::atomic<bool>* stopRequested,
-    std::wstring& error) {
-    if (stopRequested && stopRequested->load()) {
-        error = L"Blender 初始化已取消";
-        return false;
-    }
-    const std::wstring key = BlenderReadinessKey(blender);
-    std::scoped_lock lock(gBlenderReadinessMutex);
-    if (gReadyBlenders.contains(key)) return true;
-    if (stopRequested && stopRequested->load()) {
-        error = L"Blender 初始化已取消";
-        return false;
-    }
-
-    fs::path tools = workDirectory / L"tools";
-    std::error_code directoryError;
-    fs::create_directories(tools, directoryError);
-    if (directoryError) {
-        error = L"无法创建 Blender 初始化目录：" + Utf8ToWide(directoryError.message());
-        return false;
-    }
-    fs::path script = tools / L"initialize-blender.py";
-    fs::path log = tools / L"initialize-blender.log";
-    fs::path readyMarker = tools / L"initialize-blender.ready";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kBlenderBootstrapScript;
-        if (!output) {
-            error = L"无法写入 Blender 初始化脚本";
-            return false;
-        }
-    }
-    std::error_code removeError;
-    fs::remove(readyMarker, removeError);
-    fs::remove(readyMarker.wstring() + L".tmp", removeError);
-    ProcessResult process = RunProcess(
-        blender, BlenderBootstrapArguments(script, readyMarker), log, stopRequested,
-        std::chrono::seconds(15));
-    if (!process.started || process.exitCode != 0) {
-        if (process.timedOut) {
-            error = L"Blender 首次无界面初始化超过 15 秒，进程已终止。日志：" + log.wstring();
-        } else if (!process.error.empty()) {
-            error = L"Blender 首次无界面初始化失败：" + process.error + L"。日志：" +
-                log.wstring();
-        } else {
-            error = L"Blender 首次无界面初始化失败，退出码 " +
-                std::to_wstring(process.exitCode) + L"。日志：" + log.wstring();
-        }
-        return false;
-    }
-    if (!fs::is_regular_file(readyMarker) ||
-        ReadText(readyMarker).find("RENDERMESH_BLENDER_READY") == std::string::npos) {
-        error = L"Blender 初始化未返回就绪标记。日志：" + log.wstring();
-        return false;
-    }
-    gReadyBlenders.insert(key);
-    LogInfo("Blender first-run readiness completed; executable=" + WideToUtf8(blender.wstring()));
-    return true;
-}
-
-const char* kCompositorMetadataPython = R"PY(def compositor_tree(scene):
-    return (getattr(scene, 'compositing_node_group', None) or
-            getattr(scene, 'node_tree', None))
-
-def output_item_labels(node):
-    labels = []
-    modern_items = getattr(node, 'file_output_items', None)
-    if modern_items is not None:
-        labels.extend(str(item.name) for item in modern_items if getattr(item, 'name', ''))
-    for collection_name in ('file_slots', 'layer_slots'):
-        collection = getattr(node, collection_name, None)
-        if collection is not None:
-            for item in collection:
-                name = str(getattr(item, 'name', '') or '')
-                path = str(getattr(item, 'path', '') or '')
-                label = name if not path or path == name else f'{name}: {path}'
-                if label:
-                    labels.append(label)
-    if not labels:
-        labels.extend(str(socket.name) for socket in node.inputs
-                      if socket.identifier != '__extend__' and socket.name)
-    return list(dict.fromkeys(labels))
-
-def discover_compositor_outputs(scene):
-    rows = []
-    tree = compositor_tree(scene)
-    if tree is None:
-        return rows
-    visited = set()
-    def visit(current_tree, parent_path, parent_active):
-        pointer = current_tree.as_pointer()
-        if pointer in visited:
-            return
-        visited.add(pointer)
-        for index, node in enumerate(current_tree.nodes):
-            node_path = parent_path + [index]
-            if node.type == 'OUTPUT_FILE':
-                base_directory = getattr(node, 'base_path', None)
-                if base_directory is None:
-                    base_directory = getattr(node, 'directory', None)
-                if not base_directory:
-                    base_directory = '//'
-                rows.append({
-                    'id': f'output-{len(rows)}',
-                    'name': node.name,
-                    'directory': bpy.path.abspath(base_directory),
-                    'outputs': output_item_labels(node),
-                    'file_pattern': str(getattr(node, 'file_name', '') or ''),
-                    'scene': scene.name,
-                    'node_path': node_path,
-                    'required': bool(parent_active and
-                                     getattr(scene.render, 'use_compositing', True) and
-                                     not getattr(node, 'mute', False)),
-                })
-            child_tree = getattr(node, 'node_tree', None)
-            if child_tree is not None:
-                visit(child_tree, node_path,
-                      parent_active and not getattr(node, 'mute', False))
-        visited.remove(pointer)
-    visit(tree, [], True)
-    return rows
-)PY";
-
-const std::string kInspectBlendScript = std::string(R"PY(import bpy, json, os, sys
-)PY") + kCompositorMetadataPython + R"PY(
-args = sys.argv[sys.argv.index('--') + 1:]
-report_path = args[0]
-scene = bpy.context.scene
-report = {
-    'pass': True,
-    'scene_name': scene.name,
-    'frame_start': int(scene.frame_start),
-    'frame_end': int(scene.frame_end),
-    'frame_step': int(scene.frame_step),
-    'compositor_outputs': discover_compositor_outputs(scene),
-}
-temporary = report_path + '.tmp'
-with open(temporary, 'w', encoding='utf-8') as handle:
-    json.dump(report, handle, ensure_ascii=False, indent=2)
-os.replace(temporary, report_path)
-)PY";
-
-const std::string kPreflightScript = std::string(R"PY(import bpy, json, os, sys, glob, re, traceback
-
-args = sys.argv[sys.argv.index('--') + 1:]
-prepared, report_path = args[0], args[1]
-validation_start, validation_end, validation_step = map(int, args[2:5])
-warnings = []
-)PY") + kCompositorMetadataPython + R"PY(
-
-def enable_cycles_gpu():
-    preferences = bpy.context.preferences.addons['cycles'].preferences
-    preferred = getattr(preferences, 'compute_device_type', 'NONE')
-    backends = []
-    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
-        if backend and backend != 'NONE' and backend not in backends:
-            backends.append(backend)
-    failures = []
-    for backend in backends:
-        try:
-            preferences.compute_device_type = backend
-            preferences.get_devices()
-            devices = [device for device in preferences.devices if device.type == backend]
-            if devices:
-                for device in preferences.devices:
-                    device.use = device.type == backend
-                return sorted({f'{device.type}:{device.name}' for device in devices})
-        except Exception as exc:
-            failures.append(f'{backend}: {exc!r}')
-    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
-
-def path_key(path):
-    return os.path.normcase(os.path.normpath(bpy.path.abspath(path)))
-
-runtime_roots = []
-for resource_kind in ('SYSTEM', 'LOCAL'):
-    try:
-        value = bpy.utils.resource_path(resource_kind)
-        if value:
-            runtime_roots.append(path_key(value))
-    except Exception:
-        pass
-
-def is_runtime_resource(path):
-    key = path_key(path)
-    for root in runtime_roots:
-        try:
-            if os.path.commonpath([key, root]) == root:
-                return True
-        except ValueError:
-            pass
-    # A .blend can remember the absolute install path of Blender's Essentials
-    # asset library. Another worker with the same major.minor version may have
-    # Blender installed elsewhere, so accept it only when the same path suffix
-    # exists in this runtime's own datafiles/assets tree.
-    marker = os.sep + 'datafiles' + os.sep + 'assets' + os.sep
-    marker_index = key.lower().find(marker.lower())
-    if marker_index >= 0:
-        suffix = key[marker_index + len(marker):]
-        for root in runtime_roots:
-            equivalent = os.path.join(root, 'datafiles', 'assets', suffix)
-            if os.path.isfile(equivalent):
-                return True
-    return False
-
-def expected_paths(path, item=None):
-    if not path:
-        return []
-    path = bpy.path.abspath(path)
-    if '<UDIM>' in path:
-        if item is not None:
-            expected = sorted({getattr(tile, 'number', None)
-                               for tile in getattr(item, 'tiles', [])})
-            expected = [tile for tile in expected if tile]
-            if expected:
-                return [path.replace('<UDIM>', str(tile)) for tile in expected]
-        tiles = sorted(glob.glob(path.replace('<UDIM>', '*')))
-        return tiles or [path]
-    if '####' in path:
-        duration = max(1, int(getattr(item, 'frame_duration', 1)))
-        return [path.replace('####', f'{frame:04d}') for frame in range(1, duration + 1)]
-    if item is not None and getattr(item, 'source', '') == 'SEQUENCE':
-        match = re.search(r'(\d+)(?=\.[^.]+$)', path)
-        if match:
-            width = len(match.group(1))
-            start = int(match.group(1))
-            expression = re.compile(
-                '^' + re.escape(path[:match.start(1)]) + r'(\d{' + str(width) + '})' +
-                re.escape(path[match.end(1):]) + '$', re.IGNORECASE)
-            discovered = []
-            for candidate in glob.glob(path[:match.start(1)] + '*' + path[match.end(1):]):
-                found = expression.match(candidate)
-                if found:
-                    discovered.append(int(found.group(1)))
-            for packed in list(getattr(item, 'packed_files', []) or []):
-                packed_path = bpy.path.abspath(getattr(packed, 'filepath', '') or '')
-                found = expression.match(packed_path)
-                if found:
-                    discovered.append(int(found.group(1)))
-            duration = max(1, int(getattr(item, 'frame_duration', 1)))
-            if discovered:
-                duration = max(duration, max(discovered) - start + 1)
-            return [path[:match.start(1)] + f'{start + index:0{width}d}' + path[match.end(1):]
-                    for index in range(duration)]
-    return [path]
-
-def packed_path_keys(item, candidates):
-    keys = set()
-    packed_files = list(getattr(item, 'packed_files', []) or [])
-    for packed in packed_files:
-        filepath = getattr(packed, 'filepath', '') or ''
-        if filepath:
-            keys.add(path_key(filepath))
-        tile_number = int(getattr(packed, 'tile_number', 0) or 0)
-        if tile_number:
-            for candidate in candidates:
-                if str(tile_number) in os.path.basename(candidate):
-                    keys.add(path_key(candidate))
-    # packed_file represents the sole source for ordinary, non-sequence images.
-    if getattr(item, 'packed_file', None) and len(candidates) == 1:
-        keys.add(path_key(candidates[0]))
-    return keys
-
-def dependency_state(path, item=None):
-    candidates = expected_paths(path, item)
-    packed = packed_path_keys(item, candidates) if item is not None else set()
-    missing = [candidate for candidate in candidates
-               if path_key(candidate) not in packed and not os.path.exists(candidate)]
-    unpacked = [candidate for candidate in candidates
-                if path_key(candidate) not in packed and os.path.exists(candidate)]
-    return candidates, missing, unpacked
-
-def gather():
-    rows = []
-    groups = [
-        ('image', bpy.data.images), ('font', bpy.data.fonts),
-        ('sound', bpy.data.sounds), ('movie', bpy.data.movieclips),
-        ('library', bpy.data.libraries), ('cache', bpy.data.cache_files),
-        ('volume', getattr(bpy.data, 'volumes', [])),
-    ]
-    for kind, values in groups:
-        for item in values:
-            path = getattr(item, 'filepath', '') or ''
-            if not path or path in {'<builtin>', '<generated>'}:
-                continue
-            candidates, missing, unpacked = dependency_state(path, item)
-            packed = bool(candidates) and not missing and not unpacked
-            rows.append({
-                'kind': kind, 'owner': getattr(item, 'name', ''),
-                'path': bpy.path.abspath(path), 'packed': packed,
-                'exists': not missing, 'missing_paths': missing,
-                'unpacked_paths': unpacked,
-            })
-    known = {os.path.normcase(os.path.normpath(x['path'])) for x in rows}
-    try:
-        # Blender's own path inventory catches external references that do not
-        # live in one of the common datablock collections above. packed=True
-        # means already-packed paths are skipped.
-        for path in bpy.utils.blend_paths(absolute=True, packed=True, local=False):
-            # Files shipped inside this exact Blender runtime are guaranteed by
-            # the already-enforced major.minor version match and are not project
-            # assets (for example Essentials brush libraries).
-            if is_runtime_resource(path):
-                continue
-            key = os.path.normcase(os.path.normpath(path))
-            if key not in known:
-                _, missing, unpacked = dependency_state(path)
-                rows.append({'kind': 'external', 'owner': '', 'path': path,
-                             'packed': False, 'exists': not missing,
-                             'missing_paths': missing,
-                             'unpacked_paths': unpacked})
-                known.add(key)
-    except Exception as exc:
-        warnings.append(f'blend_paths: {exc}')
-    return rows
-
-engine = bpy.context.scene.render.engine
-cycles_device = getattr(bpy.context.scene.cycles, 'device', 'CPU') if engine == 'CYCLES' else ''
-
-original_scene = bpy.context.scene
-primary_outputs = {str(frame): bpy.path.abspath(original_scene.render.frame_path(frame=frame))
-                   for frame in range(validation_start, validation_end + 1, validation_step)}
-compositor_outputs = discover_compositor_outputs(original_scene)
-report = {'pass': False, 'version': f'{bpy.app.version[0]}.{bpy.app.version[1]}',
-          'scene_name': original_scene.name,
-          'render_engine': engine,
-          'render_format': bpy.context.scene.render.image_settings.file_format,
-          'file_extension': bpy.context.scene.render.file_extension,
-          'use_file_extension': bpy.context.scene.render.use_file_extension,
-          'requires_gpu': engine != 'CYCLES' or cycles_device == 'GPU',
-          'frame_start': int(original_scene.frame_start),
-          'frame_end': int(original_scene.frame_end),
-          'frame_step': int(original_scene.frame_step),
-          'primary_outputs': primary_outputs,
-          'compositor_outputs': compositor_outputs,
-          'missing': [], 'unpacked': [], 'warnings': warnings,
-          'validation_render': False, 'validation_frames': 0, 'validation_error': ''}
-active_frame = None
-try:
-    before = gather()
-    report['missing'] = [dict(x, path=missing) for x in before
-                         for missing in x.get('missing_paths', [])]
-    if not report['missing']:
-        try:
-            bpy.ops.file.pack_libraries()
-        except Exception as exc:
-            warnings.append(f'pack_libraries: {exc}')
-        try:
-            bpy.ops.file.pack_all()
-        except Exception as exc:
-            warnings.append(f'pack_all: {exc}')
-        bpy.ops.wm.save_as_mainfile(filepath=prepared, copy=True)
-        after = gather()
-        report['missing'] = [dict(x, path=missing) for x in after
-                             for missing in x.get('missing_paths', [])]
-        report['unpacked'] = [dict(x, path=unpacked) for x in after
-                              for unpacked in x.get('unpacked_paths', [])]
-        assets_ok = not report['missing'] and not report['unpacked'] and os.path.isfile(prepared)
-        if assets_ok:
-            undefined_nodes = []
-            node_trees = list(bpy.data.node_groups)
-            node_trees.extend(material.node_tree for material in bpy.data.materials
-                              if getattr(material, 'node_tree', None))
-            node_trees.extend(world.node_tree for world in bpy.data.worlds
-                              if getattr(world, 'node_tree', None))
-            node_trees.extend(light.node_tree for light in bpy.data.lights
-                              if getattr(light, 'node_tree', None))
-            node_trees.extend(scene.compositing_node_group for scene in bpy.data.scenes
-                              if getattr(scene, 'compositing_node_group', None))
-            seen_trees = set()
-            for tree in node_trees:
-                if tree.as_pointer() in seen_trees:
-                    continue
-                seen_trees.add(tree.as_pointer())
-                for node in tree.nodes:
-                    if getattr(node, 'bl_idname', '') == 'NodeUndefined' or node.type == 'UNDEFINED':
-                        undefined_nodes.append(f'{tree.name}/{node.name}')
-            if undefined_nodes:
-                raise RuntimeError('Undefined nodes, likely missing add-on: ' +
-                                   ', '.join(undefined_nodes[:12]))
-            scene = bpy.context.scene
-            scene.render.resolution_x = min(max(1, scene.render.resolution_x), 64)
-            scene.render.resolution_y = min(max(1, scene.render.resolution_y), 64)
-            scene.render.resolution_percentage = 100
-            if scene.render.engine == 'CYCLES':
-                if getattr(scene.cycles, 'device', 'CPU') == 'GPU':
-                    print('RenderMesh Cycles GPU: ' + ', '.join(enable_cycles_gpu()))
-                scene.cycles.samples = 1
-                scene.cycles.use_denoising = False
-            for validation_frame in range(validation_start, validation_end + 1, validation_step):
-                scene.frame_set(validation_frame)
-                render_result = bpy.ops.render.render(write_still=False)
-                if 'FINISHED' not in render_result:
-                    raise RuntimeError(
-                        f'Validation render for frame {validation_frame} returned {render_result}')
-                report['validation_frames'] += 1
-            report['validation_render'] = True
-            report['pass'] = True
-except Exception:
-    report['validation_error'] = traceback.format_exc()
-    warnings.append(report['validation_error'])
-with open(report_path, 'w', encoding='utf-8') as f:
-    json.dump(report, f, ensure_ascii=False, indent=2)
-)PY";
-
-const char* kCompatibilityScript = R"PY(import bpy, json, sys
-args = sys.argv[sys.argv.index('--') + 1:]
-manifest_path, report_path = args[0], args[1]
-with open(manifest_path, 'r', encoding='utf-8') as f:
-    manifest = json.load(f)
-version = f'{bpy.app.version[0]}.{bpy.app.version[1]}'
-result = {'pass': version == manifest.get('version'), 'version': version}
-
-def enable_cycles_gpu():
-    preferences = bpy.context.preferences.addons['cycles'].preferences
-    preferred = getattr(preferences, 'compute_device_type', 'NONE')
-    backends = []
-    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
-        if backend and backend != 'NONE' and backend not in backends:
-            backends.append(backend)
-    failures = []
-    for backend in backends:
-        try:
-            preferences.compute_device_type = backend
-            preferences.get_devices()
-            devices = [device for device in preferences.devices if device.type == backend]
-            if devices:
-                for device in preferences.devices:
-                    device.use = device.type == backend
-                return sorted({f'{device.type}:{device.name}' for device in devices})
-        except Exception as exc:
-            failures.append(f'{backend}: {exc!r}')
-    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
-
-engine = manifest.get('render_engine', '')
-try:
-    if engine:
-        bpy.context.scene.render.engine = engine
-    result['engine_available'] = True
-except Exception:
-    result['engine_available'] = False
-result['render_engine'] = engine
-result['pass'] = result['pass'] and result['engine_available']
-result['gpu_devices'] = []
-if manifest.get('requires_gpu', False):
-    if engine == 'CYCLES':
-        try:
-            result['gpu_devices'] = enable_cycles_gpu()
-        except Exception as exc:
-            result['gpu_error'] = repr(exc)
-    elif engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:
-        try:
-            scene = bpy.context.scene
-            scene.use_nodes = False
-            scene.world = None
-            scene.render.use_sequencer = False
-            scene.render.resolution_x = 1
-            scene.render.resolution_y = 1
-            scene.render.resolution_percentage = 100
-            for obj in list(scene.objects):
-                bpy.data.objects.remove(obj, do_unlink=True)
-            camera_data = bpy.data.cameras.new('__RenderMesh_Eevee_Probe_Camera')
-            camera = bpy.data.objects.new('__RenderMesh_Eevee_Probe_Camera', camera_data)
-            scene.collection.objects.link(camera)
-            scene.camera = camera
-            bpy.ops.render.render(write_still=False)
-            result['gpu_devices'] = ['EEVEE_RENDER_CONTEXT']
-            try:
-                import gpu
-                renderer = gpu.platform.renderer_get()
-                vendor = gpu.platform.vendor_get()
-                if renderer:
-                    result['gpu_devices'] = [f'{vendor}:{renderer}']
-            except Exception:
-                pass
-        except Exception as exc:
-            result['gpu_error'] = repr(exc)
-    result['pass'] = result['pass'] and bool(result['gpu_devices'])
-with open(report_path, 'w', encoding='utf-8') as f:
-    json.dump(result, f, ensure_ascii=False, indent=2)
-)PY";
-
-const char* kPreviewScript = R"PY(import bpy, os, sys
-
-args = sys.argv[sys.argv.index('--') + 1:]
-source, destination = args
-image = bpy.data.images.load(source, check_existing=False)
-scene = bpy.context.scene
-scene.render.image_settings.file_format = 'PNG'
-scene.render.image_settings.color_mode = 'RGBA'
-os.makedirs(os.path.dirname(destination), exist_ok=True)
-image.save_render(destination, scene=scene)
-)PY";
-
-const char* kBatchRenderScript = R"PY(import bpy, json, os, re, shutil, sys, traceback
-args = sys.argv[sys.argv.index('--') + 1:]
-output_dir, manifest_path, stop_path, frames_json, targets_json = args[:5]
-frames = json.loads(frames_json)
-targets = json.loads(targets_json)
-scene = bpy.context.scene
-completed = []
-artifacts = {}
-error = ''
-primary_dir = os.path.join(output_dir, 'primary')
-compositor_root = os.path.join(output_dir, 'compositor')
-os.makedirs(primary_dir, exist_ok=True)
-
-def enable_cycles_gpu():
-    preferences = bpy.context.preferences.addons['cycles'].preferences
-    preferred = getattr(preferences, 'compute_device_type', 'NONE')
-    backends = []
-    for backend in (preferred, 'OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
-        if backend and backend != 'NONE' and backend not in backends:
-            backends.append(backend)
-    failures = []
-    for backend in backends:
-        try:
-            preferences.compute_device_type = backend
-            preferences.get_devices()
-            devices = [device for device in preferences.devices if device.type == backend]
-            if devices:
-                for device in preferences.devices:
-                    device.use = device.type == backend
-                return sorted({f'{device.type}:{device.name}' for device in devices})
-        except Exception as exc:
-            failures.append(f'{backend}: {exc!r}')
-    raise RuntimeError('No usable Cycles GPU device: ' + '; '.join(failures))
-
-def compositor_tree(value):
-    return (getattr(value, 'compositing_node_group', None) or
-            getattr(value, 'node_tree', None))
-
-def node_at_path(value, path):
-    tree = compositor_tree(value)
-    node = None
-    for index in path:
-        if tree is None or not isinstance(index, int) or index < 0 or index >= len(tree.nodes):
-            return None
-        node = tree.nodes[index]
-        tree = getattr(node, 'node_tree', None)
-    return node
-
-legacy_tree = compositor_tree(scene)
-legacy_nodes = ([node for node in legacy_tree.nodes if node.type == 'OUTPUT_FILE']
-                if legacy_tree else [])
-if any('node_path' not in target for target in targets) and len(legacy_nodes) != len(targets):
-    raise RuntimeError(f'Compositor output count changed: expected {len(targets)}, '
-                       f'have {len(legacy_nodes)}')
-resolved_nodes = []
-for index, target in enumerate(targets):
-    exact_locator = 'node_path' in target
-    node = (node_at_path(scene, target.get('node_path', []))
-            if exact_locator else legacy_nodes[index])
-    if (node is None or node.type != 'OUTPUT_FILE' or
-            (exact_locator and target.get('required', False) and
-             getattr(node, 'mute', False))):
-        raise RuntimeError(f'Compositor File Output node changed: {target.get("name", index)}')
-    expected_scene = target.get('scene', '')
-    if expected_scene and expected_scene != scene.name:
-        raise RuntimeError(f'Compositor scene changed: expected {expected_scene}, have {scene.name}')
-    identifier = target.get('id', '')
-    if not identifier or '/' in identifier or '\\' in identifier or identifier in {'.', '..'}:
-        raise RuntimeError('Invalid compositor output identifier')
-    sandbox_directory = os.path.join(compositor_root, identifier)
-    if hasattr(node, 'base_path'):
-        node.base_path = sandbox_directory
-    elif hasattr(node, 'directory'):
-        node.directory = sandbox_directory
-    else:
-        raise RuntimeError(f'File Output node {node.name} has no writable directory')
-    configured_name = target.get('file_pattern', '')
-    if configured_name and hasattr(node, 'file_name'):
-        node.file_name = configured_name
-    resolved_nodes.append((node, target, exact_locator))
-
-def file_state(root):
-    result = {}
-    if not os.path.isdir(root):
-        return result
-    for current, _, names in os.walk(root):
-        for name in names:
-            path = os.path.join(current, name)
-            try:
-                stat = os.stat(path)
-                result[path] = (stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                pass
-    return result
-
-def persist():
-    temporary = manifest_path + '.tmp'
-    with open(temporary, 'w', encoding='utf-8') as handle:
-        json.dump({'completed': completed, 'artifacts': artifacts, 'error': error}, handle,
-                  ensure_ascii=False, indent=2)
-    os.replace(temporary, manifest_path)
-try:
-    if scene.render.engine == 'CYCLES' and getattr(scene.cycles, 'device', 'CPU') == 'GPU':
-        print('RenderMesh Cycles GPU: ' + ', '.join(enable_cycles_gpu()))
-    for index, frame in enumerate(frames):
-        if index and os.path.exists(stop_path):
-            break
-        active_frame = int(frame)
-        print(f'RENDERMESH_FRAME_BEGIN {active_frame}', flush=True)
-        scene.frame_set(int(frame))
-        before = file_state(primary_dir)
-        before.update(file_state(compositor_root))
-        scene.render.filepath = os.path.join(primary_dir, f'frame_{int(frame):06d}')
-        result = bpy.ops.render.render(write_still=True)
-        if 'FINISHED' not in result:
-            raise RuntimeError(f'Render frame {frame} returned {result}')
-        after = file_state(primary_dir)
-        after.update(file_state(compositor_root))
-        changed = sorted(path for path, state in after.items() if before.get(path) != state)
-        frame_artifacts = []
-        capture_dir = os.path.join(output_dir, 'captured', str(int(frame)))
-        os.makedirs(capture_dir, exist_ok=True)
-        for artifact_index, path in enumerate(changed):
-            if os.path.commonpath([os.path.abspath(path), os.path.abspath(primary_dir)]) == \
-                    os.path.abspath(primary_dir):
-                logical = 'primary'
-            else:
-                relative = os.path.relpath(path, compositor_root).replace(os.sep, '/')
-                stem, logical_extension = os.path.splitext(relative)
-                frame_pattern = rf'(?<!\d)0*{int(frame)}(?!\d)'
-                if re.search(frame_pattern, os.path.basename(stem)) is None:
-                    relative = f'{stem}_{int(frame):06d}{logical_extension}'
-                logical = 'compositor/' + relative
-            extension = os.path.splitext(path)[1]
-            captured = os.path.join(capture_dir, f'{artifact_index:04d}{extension}')
-            shutil.copy2(path, captured)
-            frame_artifacts.append({
-                'logical': logical,
-                'source': os.path.relpath(captured, output_dir).replace(os.sep, '/'),
-            })
-        if not any(value['logical'] == 'primary' for value in frame_artifacts):
-            raise RuntimeError(f'Primary render output missing for frame {frame}')
-        for _, target, exact_locator in resolved_nodes:
-            if not exact_locator or not target.get('required', False):
-                continue
-            prefix = 'compositor/' + target['id'] + '/'
-            if not any(value['logical'].startswith(prefix) for value in frame_artifacts):
-                raise RuntimeError(
-                    f'File Output node {target.get("name", target["id"])} produced no file '
-                    f'for frame {frame}')
-        artifacts[str(int(frame))] = frame_artifacts
-        completed.append(int(frame))
-        print(f'RENDERMESH_FRAME_END {active_frame} completed', flush=True)
-        persist()
-        active_frame = None
-except Exception:
-    error = traceback.format_exc()
-    if active_frame is not None:
-        print(f'RENDERMESH_FRAME_END {active_frame} failed', flush=True)
-    persist()
-    raise
-persist()
-)PY";
-
-constexpr size_t kMaxFrameLogBytes = 4 * 1024 * 1024;
-
-std::string SanitizeBlenderLog(std::string_view value) {
-    std::string clean;
-    clean.reserve(std::min(value.size(), kMaxFrameLogBytes));
-    for (size_t index = 0; index < value.size(); ++index) {
-        unsigned char ch = static_cast<unsigned char>(value[index]);
-        if (ch == 0x1b) {
-            if (index + 1 < value.size() && value[index + 1] == '[') {
-                index += 2;
-                while (index < value.size()) {
-                    unsigned char code = static_cast<unsigned char>(value[index]);
-                    if (code >= 0x40 && code <= 0x7e) break;
-                    ++index;
-                }
-            }
-            continue;
-        }
-        if (ch == '\r' || ch == '\n' || ch == '\t' || ch >= 0x20)
-            clean.push_back(static_cast<char>(ch));
-    }
-    if (clean.size() <= kMaxFrameLogBytes) return clean;
-    constexpr size_t headBytes = 256 * 1024;
-    constexpr std::string_view notice =
-        "\n\n--- RenderMesh: log exceeded 4 MiB; middle section omitted ---\n\n";
-    const size_t tailBytes = kMaxFrameLogBytes - headBytes - notice.size();
-    return clean.substr(0, headBytes) + std::string(notice) +
-        clean.substr(clean.size() - tailBytes);
-}
-
-bool WriteFrameLogFile(const fs::path& destination, const std::string& contents) {
-    std::string previous;
-    {
-        std::ifstream old(destination, std::ios::binary);
-        if (old) previous.assign(std::istreambuf_iterator<char>(old), {});
-    }
-    if (previous == contents) return false;
-    std::error_code ignored;
-    fs::create_directories(destination.parent_path(), ignored);
-    fs::path temporary = destination;
-    temporary += L".tmp";
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        output.flush();
-        if (!output) {
-            fs::remove(temporary, ignored);
-            return false;
-        }
-    }
-    if (!MoveFileExW(temporary.c_str(), destination.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        fs::remove(temporary, ignored);
-        return false;
-    }
-    return true;
-}
-
-bool UpdateFrameLogSnapshot(
-    const fs::path& packageLog, const fs::path& destination,
-    int frame, bool& complete) {
-    complete = false;
-    std::ifstream input(packageLog, std::ios::binary);
-    if (!input) return false;
-    std::string contents((std::istreambuf_iterator<char>(input)), {});
-    const std::string beginMarker = "RENDERMESH_FRAME_BEGIN " + std::to_string(frame);
-    const std::string endMarker = "RENDERMESH_FRAME_END " + std::to_string(frame) + " ";
-    const size_t begin = contents.find(beginMarker);
-    if (begin == std::string::npos) return false;
-    size_t contentStart = contents.find('\n', begin);
-    contentStart = contentStart == std::string::npos ? contents.size() : contentStart + 1;
-    const size_t end = contents.find(endMarker, contentStart);
-    complete = end != std::string::npos;
-    const size_t segmentEnd = complete ? end : contents.size();
-    std::string segment;
-    if (begin == contents.find("RENDERMESH_FRAME_BEGIN "))
-        segment.append(contents, 0, begin);
-    if (segmentEnd > contentStart)
-        segment.append(contents, contentStart, segmentEnd - contentStart);
-    segment = SanitizeBlenderLog(segment);
-    const std::string heading = "RenderMesh Blender log - frame " +
-        std::to_string(frame) + (complete ? " - complete\n\n" : " - rendering\n\n");
-    segment.insert(0, heading);
-    return WriteFrameLogFile(destination, segment);
-}
-
-}  // namespace
 
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -1138,10 +316,13 @@ std::string NewRandomHex(size_t bytes) {
                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
         throw std::runtime_error("BCryptGenRandom failed");
     }
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned char value : data) output << std::setw(2) << static_cast<int>(value);
-    return output.str();
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string text;
+    for (unsigned char value : data) {
+        text.push_back(kHex[value >> 4]);
+        text.push_back(kHex[value & 15]);
+    }
+    return text;
 }
 
 std::string NewInviteCode() {
@@ -1237,6 +418,101 @@ bool ParseOutputTargetMetadata(const json& value, OutputTarget& target) {
     }
 }
 
+json PreflightReportToJson(const PreflightReport& report) {
+    auto dependencies = [](const std::vector<DependencyItem>& values) {
+        json rows = json::array();
+        for (const auto& item : values)
+            rows.push_back({{"kind", item.kind}, {"owner", item.owner}, {"path", item.path}});
+        return rows;
+    };
+    json primary = json::object();
+    for (const auto& [frame, path] : report.primaryOutputs)
+        primary[std::to_string(frame)] = WideToUtf8(path.wstring());
+    json outputs = json::array();
+    for (const auto& target : report.compositorOutputs) {
+        json metadata = OutputTargetMetadata(target);
+        metadata["directory"] = WideToUtf8(target.directory.wstring());
+        outputs.push_back(std::move(metadata));
+    }
+    return {
+        {"pass", report.passed},
+        {"can_ignore_asset_warnings", report.canIgnoreAssetWarnings},
+        {"asset_warnings_ignored", report.assetWarningsIgnored},
+        {"validation_skipped_by_user", report.validationSkippedByUser},
+        {"software", report.software},
+        {"scene_name", report.sceneName},
+        {"version", report.softwareVersion},
+        {"render_engine", report.renderEngine},
+        {"render_format", report.outputFormat},
+        {"file_extension", report.outputExtension},
+        {"requires_gpu", report.requiresGpu},
+        {"frame_start", report.frameStart},
+        {"frame_end", report.frameEnd},
+        {"frame_step", report.frameStep},
+        {"packed", report.packedCount},
+        {"bundled", report.bundledCount},
+        {"pending_changes", report.pendingChanges},
+        {"missing", dependencies(report.missing)},
+        {"unpacked", dependencies(report.unpacked)},
+        {"warnings", report.warnings},
+        {"primary_outputs", std::move(primary)},
+        {"compositor_outputs", std::move(outputs)},
+        {"source", WideToUtf8(report.sourceProject.wstring())},
+        {"prepared", WideToUtf8(report.preparedProject.wstring())},
+        {"prepared_copy", report.preparedCopy},
+        {"summary", WideToUtf8(report.summary)},
+    };
+}
+
+bool PreflightReportFromJson(const json& value, PreflightReport& report) {
+    if (!value.is_object()) return false;
+    try {
+        report = {};
+        report.passed = value.value("pass", false);
+        report.canIgnoreAssetWarnings = value.value("can_ignore_asset_warnings", false);
+        report.assetWarningsIgnored = value.value("asset_warnings_ignored", false);
+        report.validationSkippedByUser = value.value("validation_skipped_by_user", false);
+        report.software = value.value("software", "blender");
+        report.sceneName = value.value("scene_name", "");
+        report.softwareVersion = value.value("version", "");
+        report.renderEngine = value.value("render_engine", "");
+        report.outputFormat = value.value("render_format", "");
+        report.outputExtension = value.value("file_extension", "");
+        report.requiresGpu = value.value("requires_gpu", false);
+        report.frameStart = value.value("frame_start", 1);
+        report.frameEnd = value.value("frame_end", 1);
+        report.frameStep = value.value("frame_step", 1);
+        report.packedCount = value.value("packed", 0);
+        report.bundledCount = value.value("bundled", 0);
+        report.pendingChanges = value.value("pending_changes", 0);
+        for (const char* key : {"missing", "unpacked"}) {
+            auto& rows = std::string_view(key) == "missing" ? report.missing : report.unpacked;
+            for (const auto& item : value.value(key, json::array()))
+                rows.push_back({item.value("kind", ""), item.value("owner", ""),
+                                item.value("path", "")});
+        }
+        report.warnings = value.value("warnings", std::vector<std::string>{});
+        const json primary = value.value("primary_outputs", json::object());
+        for (const auto& [frame, path] : primary.items())
+            if (path.is_string())
+                report.primaryOutputs[std::atoi(frame.c_str())] =
+                    Utf8ToWide(path.get<std::string>());
+        for (const auto& row : value.value("compositor_outputs", json::array())) {
+            OutputTarget target;
+            if (!ParseOutputTargetMetadata(row, target)) return false;
+            target.directory = Utf8ToWide(row.value("directory", ""));
+            report.compositorOutputs.push_back(std::move(target));
+        }
+        report.sourceProject = Utf8ToWide(value.value("source", ""));
+        report.preparedProject = Utf8ToWide(value.value("prepared", ""));
+        report.preparedCopy = value.value("prepared_copy", false);
+        report.summary = Utf8ToWide(value.value("summary", ""));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::vector<std::vector<int>> BuildFramePackages(
     const std::vector<int>& frames, size_t packageSize) {
     std::vector<std::vector<int>> result;
@@ -1249,102 +525,367 @@ std::vector<std::vector<int>> BuildFramePackages(
     return result;
 }
 
-std::string Sha256Prefix(const std::string& value, size_t chars) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0, resultSize = 0;
-    std::array<unsigned char, 32> digest{};
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
-        return {};
-    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                      reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
-    std::vector<unsigned char> object(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) == 0) {
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-                       static_cast<ULONG>(value.size()), 0);
-        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+bool ParseFrameSelection(
+    const std::wstring& expression,
+    const std::vector<int>& allowedFrames,
+    std::vector<int>& selectedFrames,
+    std::wstring& error) {
+    selectedFrames.clear();
+    error.clear();
+    if (expression.empty() || allowedFrames.empty()) {
+        error = L"请填写至少一个测试帧";
+        return false;
     }
-    if (hash) BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
-    return output.str().substr(0, chars);
+    const std::set<int> allowed(allowedFrames.begin(), allowedFrames.end());
+    std::set<int> selected;
+    auto trim = [](std::wstring value) {
+        value.erase(value.begin(), std::find_if_not(value.begin(), value.end(),
+            [](wchar_t ch) { return std::iswspace(ch) != 0; }));
+        value.erase(std::find_if_not(value.rbegin(), value.rend(),
+            [](wchar_t ch) { return std::iswspace(ch) != 0; }).base(), value.end());
+        return value;
+    };
+    auto parseNumber = [&](const std::wstring& value, int& parsed) {
+        if (value.empty() || !std::all_of(value.begin(), value.end(),
+                [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }))
+            return false;
+        try {
+            size_t consumed = 0;
+            long long number = std::stoll(value, &consumed, 10);
+            if (consumed != value.size() || number < kBlenderFrameMin ||
+                number > kBlenderFrameMax)
+                return false;
+            parsed = static_cast<int>(number);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+    size_t begin = 0;
+    while (begin <= expression.size()) {
+        size_t comma = expression.find(L',', begin);
+        std::wstring token = trim(expression.substr(
+            begin, comma == std::wstring::npos ? std::wstring::npos : comma - begin));
+        if (token.empty()) {
+            error = L"测试帧格式无效，请使用半角逗号分隔";
+            return false;
+        }
+        size_t dash = token.find(L'-');
+        int first = 0;
+        int last = 0;
+        if (dash == std::wstring::npos) {
+            if (!parseNumber(token, first)) {
+                error = L"测试帧包含无效数字";
+                return false;
+            }
+            last = first;
+        } else {
+            if (token.find(L'-', dash + 1) != std::wstring::npos ||
+                !parseNumber(trim(token.substr(0, dash)), first) ||
+                !parseNumber(trim(token.substr(dash + 1)), last) || last < first) {
+                error = L"测试帧范围格式无效";
+                return false;
+            }
+        }
+        for (int frame = first; frame <= last; ++frame) {
+            if (!allowed.contains(frame)) {
+                error = L"测试帧必须位于渲染范围内并符合步长";
+                return false;
+            }
+            selected.insert(frame);
+            if (selected.size() > 100000) {
+                error = L"测试帧数量超过 100000，已拒绝";
+                return false;
+            }
+            if (frame == kBlenderFrameMax) break;
+        }
+        if (comma == std::wstring::npos) break;
+        begin = comma + 1;
+    }
+    selectedFrames.assign(selected.begin(), selected.end());
+    return !selectedFrames.empty();
 }
 
-std::string Sha256File(const fs::path& path, std::atomic<bool>* stopRequested) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return {};
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0, resultSize = 0;
-    std::array<unsigned char, 32> digest{};
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
-        return {};
-    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                      reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
-    std::vector<unsigned char> object(objectSize);
-    bool ok = BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) == 0;
-    // Windows GUI threads commonly have a 1 MiB stack. Keep the streaming
-    // buffer on the heap so hashing a project cannot exhaust that stack.
-    std::vector<char> buffer(256 * 1024);
-    while (ok && input) {
-        if (stopRequested && stopRequested->load()) {
-            ok = false;
-            break;
-        }
-        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        std::streamsize count = input.gcount();
-        if (count > 0)
-            ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()),
-                                static_cast<ULONG>(count), 0) == 0;
+File File::OpenRead(const fs::path& path) {
+    return File(CreateFileW(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+}
+
+File File::Create(const fs::path& path) {
+    return File(CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+}
+
+File File::OpenWrite(const fs::path& path) {
+    return File(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+}
+
+bool File::Read(void* data, size_t size, size_t& read) {
+    DWORD count = 0;
+    const BOOL ok = ReadFile(handle_, data,
+                             static_cast<DWORD>(std::min<size_t>(size, 64u << 20)), &count,
+                             nullptr);
+    read = count;
+    return ok != FALSE;
+}
+
+bool File::ReadExact(void* data, size_t size) {
+    auto* bytes = static_cast<char*>(data);
+    while (size) {
+        size_t read = 0;
+        if (!Read(bytes, size, read) || read == 0) return false;
+        bytes += read;
+        size -= read;
     }
-    ok = ok && !input.bad() &&
-        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
+    return true;
+}
+
+bool File::Write(const void* data, size_t size) {
+    const auto* bytes = static_cast<const char*>(data);
+    while (size) {
+        DWORD written = 0;
+        const DWORD wanted = static_cast<DWORD>(std::min<size_t>(size, 64u << 20));
+        if (!WriteFile(handle_, bytes, wanted, &written, nullptr) || written == 0) return false;
+        bytes += written;
+        size -= written;
+    }
+    return true;
+}
+
+bool File::Seek(uint64_t offset) {
+    LARGE_INTEGER position{};
+    position.QuadPart = static_cast<LONGLONG>(offset);
+    return SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN) != FALSE;
+}
+
+uint64_t File::Size() const {
+    LARGE_INTEGER size{};
+    return GetFileSizeEx(handle_, &size) ? static_cast<uint64_t>(size.QuadPart) : 0;
+}
+
+void File::Close() {
+    if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+    handle_ = INVALID_HANDLE_VALUE;
+}
+
+bool ReadFileText(const fs::path& path, std::string& contents) {
+    contents.clear();
+    File input = File::OpenRead(path);
+    if (!input) return false;
+    contents.resize(static_cast<size_t>(input.Size()));
+    if (!input.ReadExact(contents.data(), contents.size())) {
+        contents.clear();
+        return false;
+    }
+    return true;
+}
+
+std::string ReadFileText(const fs::path& path) {
+    std::string contents;
+    ReadFileText(path, contents);
+    return contents;
+}
+
+bool WriteFileText(const fs::path& path, std::string_view contents) {
+    File output = File::Create(path);
+    return output && output.Write(contents);
+}
+
+bool WriteFileAtomic(const fs::path& path, std::string_view contents,
+                     std::wstring& error, bool durable) {
+    std::error_code ignored;
+    fs::create_directories(path.parent_path(), ignored);
+    fs::path temporary = path;
+    temporary += L".tmp";
+    {
+        File output = File::Create(temporary);
+        if (!output || !output.Write(contents) || (durable && !output.Flush())) {
+            error = L"无法写入文件：" + path.wstring() + L"（" + LastErrorMessage() + L"）";
+            output.Close();
+            DeleteFileW(temporary.c_str());
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = L"无法替换文件：" + LastErrorMessage();
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+std::string HexDigest(const unsigned char* digest, size_t size) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string text(size * 2, '0');
+    for (size_t index = 0; index < size; ++index) {
+        text[index * 2] = kHex[digest[index] >> 4];
+        text[index * 2 + 1] = kHex[digest[index] & 15];
+    }
+    return text;
+}
+
+std::string HashWithKey(const std::string* key, std::string_view value) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                    key ? BCRYPT_ALG_HANDLE_HMAC_FLAG : 0) != 0)
+        return {};
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::array<unsigned char, 32> digest{};
+    bool ok = BCryptCreateHash(
+        algorithm, &hash, nullptr, 0,
+        key ? reinterpret_cast<PUCHAR>(const_cast<char*>(key->data())) : nullptr,
+        key ? static_cast<ULONG>(key->size()) : 0, 0) == 0;
+    ok = ok && BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                              static_cast<ULONG>(value.size()), 0) == 0;
+    ok = ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0;
     if (hash) BCryptDestroyHash(hash);
     BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (!ok) return {};
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
-    return output.str();
+    return ok ? HexDigest(digest.data(), digest.size()) : std::string{};
+}
+
+}  // namespace
+
+Sha256::Sha256() {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    ok_ = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+        BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) == 0;
+    algorithm_ = algorithm;
+    hash_ = hash;
+}
+
+Sha256::~Sha256() {
+    if (hash_) BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(hash_));
+    if (algorithm_) BCryptCloseAlgorithmProvider(static_cast<BCRYPT_ALG_HANDLE>(algorithm_), 0);
+}
+
+bool Sha256::Update(const void* data, size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    while (ok_ && size) {
+        const ULONG chunk = static_cast<ULONG>(std::min<size_t>(size, 1u << 30));
+        ok_ = BCryptHashData(static_cast<BCRYPT_HASH_HANDLE>(hash_),
+                             const_cast<PUCHAR>(bytes), chunk, 0) == 0;
+        bytes += chunk;
+        size -= chunk;
+    }
+    return ok_;
+}
+
+std::string Sha256::Finish() {
+    std::array<unsigned char, 32> digest{};
+    ok_ = ok_ && BCryptFinishHash(static_cast<BCRYPT_HASH_HANDLE>(hash_), digest.data(),
+                                  static_cast<ULONG>(digest.size()), 0) == 0;
+    return ok_ ? HexDigest(digest.data(), digest.size()) : std::string{};
+}
+
+std::string Sha256Prefix(std::string_view value, size_t chars) {
+    return HashWithKey(nullptr, value).substr(0, chars);
 }
 
 std::string HmacSha256(const std::string& key, const std::string& value) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0, resultSize = 0;
-    std::array<unsigned char, 32> digest{};
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr,
-                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
-        return {};
-    BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                      reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0);
-    std::vector<unsigned char> object(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize,
-                         reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
-                         static_cast<ULONG>(key.size()), 0) == 0) {
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
-                       static_cast<ULONG>(value.size()), 0);
-        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    return HashWithKey(&key, value);
+}
+
+std::string Sha256File(const fs::path& path, std::atomic<bool>* stopRequested) {
+    File input = File::OpenRead(path);
+    if (!input) return {};
+    Sha256 hash;
+    // Heap buffer: GUI threads have a 1 MiB stack.
+    std::vector<char> buffer(4u << 20);
+    for (;;) {
+        if (stopRequested && stopRequested->load()) return {};
+        size_t read = 0;
+        if (!input.Read(buffer.data(), buffer.size(), read)) return {};
+        if (read == 0) break;
+        if (!hash.Update(buffer.data(), read)) return {};
     }
-    if (hash) BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    std::ostringstream output;
-    output << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) output << std::setw(2) << static_cast<int>(byte);
-    return output.str();
+    return hash.Finish();
+}
+
+std::string CopyFileWithSha256(const fs::path& source, const fs::path& destination,
+                               std::atomic<bool>* cancel, std::wstring& error) {
+    File input = File::OpenRead(source);
+    if (!input) {
+        error = L"无法读取：" + source.wstring() + L"（" + LastErrorMessage() + L"）";
+        return {};
+    }
+    std::error_code ignored;
+    fs::create_directories(destination.parent_path(), ignored);
+    File output = File::Create(destination);
+    if (!output) {
+        error = L"无法写入：" + destination.wstring() + L"（" + LastErrorMessage() + L"）";
+        return {};
+    }
+    Sha256 hash;
+    std::vector<char> buffer(4u << 20);
+    for (;;) {
+        if (cancel && cancel->load()) {
+            error = L"操作已取消";
+            break;
+        }
+        size_t read = 0;
+        if (!input.Read(buffer.data(), buffer.size(), read)) {
+            error = L"读取失败：" + LastErrorMessage();
+            break;
+        }
+        if (read == 0) return hash.Finish();
+        if (!hash.Update(buffer.data(), read) || !output.Write(buffer.data(), read)) {
+            error = L"写入失败：" + LastErrorMessage();
+            break;
+        }
+    }
+    output.Close();
+    DeleteFileW(destination.c_str());
+    return {};
+}
+
+fs::path ExecutablePath() {
+    std::vector<wchar_t> path(32768);
+    DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    return fs::path(std::wstring(path.data(), size));
 }
 
 fs::path ExecutableDirectory() {
-    std::vector<wchar_t> path(32768);
-    DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    return fs::path(std::wstring(path.data(), size)).parent_path();
+    return ExecutablePath().parent_path();
+}
+
+bool IsNewerAppVersion(const std::string& candidate, const std::string& current) {
+    auto parse = [](const std::string& value) -> std::optional<std::array<uint32_t, 4>> {
+        if (value.empty() || value.size() > 32) return std::nullopt;
+        std::array<uint32_t, 4> parts{};
+        size_t part = 0;
+        size_t start = 0;
+        while (start < value.size() && part < parts.size()) {
+            const size_t end = value.find('.', start);
+            const size_t length = (end == std::string::npos ? value.size() : end) - start;
+            if (length == 0 || length > 6) return std::nullopt;
+            uint32_t number = 0;
+            for (size_t index = start; index < start + length; ++index) {
+                if (value[index] < '0' || value[index] > '9') return std::nullopt;
+                number = number * 10 + static_cast<uint32_t>(value[index] - '0');
+            }
+            parts[part++] = number;
+            if (end == std::string::npos) return parts;
+            start = end + 1;
+        }
+        return std::nullopt;
+    };
+    const auto candidateParts = parse(candidate);
+    const auto currentParts = parse(current);
+    return candidateParts && currentParts && *candidateParts > *currentParts;
 }
 
 fs::path DefaultDataDirectory() {
+    // FOLDERID_LocalAppData, defined locally instead of linking libuuid.
+    constexpr KNOWNFOLDERID kLocalAppData = {
+        0xf1b32785, 0x6fba, 0x4fcf, {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
     PWSTR value = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &value))) {
+    if (SUCCEEDED(SHGetKnownFolderPath(kLocalAppData, 0, nullptr, &value))) {
         fs::path result = fs::path(value) / L"RenderMesh";
         CoTaskMemFree(value);
         return result;
@@ -1396,7 +937,7 @@ HardwareInfo QueryHardwareInfo() {
     if (result.cpuModel.empty()) result.cpuModel = "Unknown CPU";
 
     IDXGIFactory1* factory = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(IID_IDXGIFactory1,
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1),
                                      reinterpret_cast<void**>(&factory)))) {
         for (UINT index = 0;; ++index) {
             IDXGIAdapter1* adapter = nullptr;
@@ -1422,8 +963,58 @@ HardwareInfo QueryHardwareInfo() {
 ConfigStore::ConfigStore(fs::path dataDir)
     : dataDir_(std::move(dataDir)), configPath_(dataDir_ / L"config.json") {}
 
+namespace {
+
+bool ValidRenderSoftwareProfileId(const std::string& value) {
+    return !value.empty() && value.size() <= 128 &&
+        std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return std::isalnum(ch) || ch == '-' || ch == '_';
+        });
+}
+
+void NormalizeRenderSoftwareProfiles(Config& config) {
+    std::erase_if(config.renderSoftwareProfiles, [](const RenderSoftwareProfile& profile) {
+        return !ValidRenderSoftwareProfileId(profile.id) || profile.name.empty() ||
+            profile.renderSystem.empty() || profile.renderSoftware.empty();
+    });
+    if (config.renderSoftwareProfiles.empty()) {
+        config.renderSoftwareProfiles.push_back({
+            "default-blender", "Blender", "Windows", "Blender", config.blenderPath});
+    }
+    auto selected = std::find_if(
+        config.renderSoftwareProfiles.begin(), config.renderSoftwareProfiles.end(),
+        [&](const RenderSoftwareProfile& profile) {
+            return profile.id == config.lastRenderSoftwareProfileId;
+        });
+    if (selected == config.renderSoftwareProfiles.end()) {
+        selected = config.renderSoftwareProfiles.begin();
+        config.lastRenderSoftwareProfileId = selected->id;
+    }
+    config.blenderPath = selected->installPath;
+}
+
+} // namespace
+
+bool SetActiveProfileExecutable(
+    Config& config, const fs::path& executable, std::wstring& error) {
+    NormalizeRenderSoftwareProfiles(config);
+    auto selected = std::find_if(
+        config.renderSoftwareProfiles.begin(), config.renderSoftwareProfiles.end(),
+        [&](const RenderSoftwareProfile& profile) {
+            return profile.id == config.lastRenderSoftwareProfileId;
+        });
+    if (selected == config.renderSoftwareProfiles.end()) {
+        error = L"当前渲染软件配置无效";
+        return false;
+    }
+    selected->installPath = executable;
+    config.blenderPath = executable;
+    return true;
+}
+
 Config ConfigStore::Load() {
     Config config;
+    config.projectStoragePath = dataDir_;
     wchar_t hostname[256]{};
     DWORD hostnameSize = 256;
     GetComputerNameW(hostname, &hostnameSize);
@@ -1432,12 +1023,13 @@ Config ConfigStore::Load() {
     config.inviteCode = NewInviteCode();
     config.clusterToken = NewRandomHex(16);
     if (!fs::exists(configPath_)) {
+        NormalizeRenderSoftwareProfiles(config);
         std::wstring ignored;
         Save(config, ignored);
         return config;
     }
     try {
-        json data = json::parse(ReadText(configPath_));
+        json data = json::parse(ReadFileText(configPath_));
         config.nodeId = data.value("node_id", config.nodeId);
         config.nodeName = data.value("node_name", config.nodeName);
         config.clusterToken = data.value("cluster_token", config.clusterToken);
@@ -1445,659 +1037,93 @@ Config ConfigStore::Load() {
         if (!IsInviteCode(config.inviteCode))
             config.inviteCode = InviteCodeFromToken(config.clusterToken);
         config.pairingPending = data.value("pairing_pending", false);
-        if (!config.pairingPending && config.clusterToken.size() < 16)
+        if (config.clusterToken.size() < 16)
             config.clusterToken = NewRandomHex(16);
         config.shareEnabled = data.value("share_enabled", false);
         config.idleAfterSeconds = std::clamp(data.value("idle_after_seconds", 180), 1, 86400);
         config.httpPort = std::clamp(data.value("http_port", 8391), 1024, 65535);
         config.discoveryPort = std::clamp(data.value("discovery_port", 8390), 1024, 65535);
         config.blenderPath = Utf8ToWide(data.value("blender_path", std::string{}));
+        for (const auto& row : data.value("render_software_profiles", json::array())) {
+            RenderSoftwareProfile profile;
+            profile.id = row.value("id", "");
+            profile.name = row.value("name", "");
+            profile.renderSystem = row.value("render_system", "Windows");
+            profile.renderSoftware = row.value("render_software", "Blender");
+            profile.installPath = Utf8ToWide(row.value("install_path", ""));
+            config.renderSoftwareProfiles.push_back(std::move(profile));
+        }
+        config.lastRenderSoftwareProfileId =
+            data.value("last_render_software_profile_id", std::string{});
         config.manualPeerEndpoint = data.value("manual_peer_endpoint", std::string{});
         config.theme = data.value("theme", "system");
         if (config.theme != "system" && config.theme != "light" && config.theme != "dark")
             config.theme = "system";
+        config.closeBehavior = data.value("close_behavior", "ask");
+        if (config.closeBehavior != "ask" && config.closeBehavior != "exit" &&
+            config.closeBehavior != "tray")
+            config.closeBehavior = "ask";
+        config.autoStart = data.value("auto_start", false);
+        config.silentAutoStart = config.autoStart &&
+            data.value("silent_auto_start", false);
+        config.projectStoragePath = Utf8ToWide(
+            data.value("project_storage_path",
+                       WideToUtf8(dataDir_.wstring())));
+        // Identity values generated above must be the same in every process
+        // that reads this folder (desktop window, serve, command line).
+        if (!data.contains("node_id") || !data.contains("cluster_token") ||
+            !data.contains("invite_code")) {
+            NormalizeRenderSoftwareProfiles(config);
+            std::wstring ignored;
+            Save(config, ignored);
+        }
     } catch (...) {
         fs::path backup = configPath_;
         backup += L".broken";
         std::error_code ec;
         fs::rename(configPath_, backup, ec);
     }
+    NormalizeRenderSoftwareProfiles(config);
     return config;
 }
 
 bool ConfigStore::Save(const Config& config, std::wstring& error) {
+    Config normalized = config;
+    if (normalized.projectStoragePath.empty())
+        normalized.projectStoragePath = dataDir_;
+    if (!normalized.autoStart) normalized.silentAutoStart = false;
+    NormalizeRenderSoftwareProfiles(normalized);
+    json profiles = json::array();
+    for (const auto& profile : normalized.renderSoftwareProfiles) {
+        profiles.push_back({
+            {"id", profile.id}, {"name", profile.name},
+            {"render_system", profile.renderSystem},
+            {"render_software", profile.renderSoftware},
+            {"install_path", WideToUtf8(profile.installPath.wstring())},
+        });
+    }
     json data = {
-        {"node_id", config.nodeId},
-        {"node_name", config.nodeName},
-        {"invite_code", config.inviteCode},
-        {"cluster_token", config.clusterToken},
-        {"pairing_pending", config.pairingPending},
-        {"share_enabled", config.shareEnabled},
-        {"idle_after_seconds", config.idleAfterSeconds},
-        {"http_port", config.httpPort},
-        {"discovery_port", config.discoveryPort},
-        {"blender_path", WideToUtf8(config.blenderPath.wstring())},
-        {"manual_peer_endpoint", config.manualPeerEndpoint},
-        {"theme", config.theme},
+        {"node_id", normalized.nodeId},
+        {"node_name", normalized.nodeName},
+        {"invite_code", normalized.inviteCode},
+        {"cluster_token", normalized.clusterToken},
+        {"pairing_pending", normalized.pairingPending},
+        {"share_enabled", normalized.shareEnabled},
+        {"idle_after_seconds", normalized.idleAfterSeconds},
+        {"http_port", normalized.httpPort},
+        {"discovery_port", normalized.discoveryPort},
+        {"blender_path", WideToUtf8(normalized.blenderPath.wstring())},
+        {"render_software_profiles", profiles},
+        {"last_render_software_profile_id", normalized.lastRenderSoftwareProfileId},
+        {"manual_peer_endpoint", normalized.manualPeerEndpoint},
+        {"theme", normalized.theme},
+        {"close_behavior", normalized.closeBehavior},
+        {"auto_start", normalized.autoStart},
+        {"silent_auto_start", normalized.silentAutoStart},
+        {"project_storage_path",
+         WideToUtf8(normalized.projectStoragePath.wstring())},
     };
-    return WriteTextAtomic(configPath_, data.dump(2), error);
-}
-
-fs::path FindBlender(const Config& config) {
-    std::vector<fs::path> candidates;
-    if (!config.blenderPath.empty()) {
-        std::wstring filename = config.blenderPath.filename().wstring();
-        std::transform(filename.begin(), filename.end(), filename.begin(),
-                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-        if (filename == L"blender-launcher.exe")
-            candidates.push_back(config.blenderPath.parent_path() / L"blender.exe");
-        candidates.push_back(config.blenderPath);
-    }
-    candidates.push_back(ExecutableDirectory() / L"Blender" / L"blender.exe");
-    wchar_t found[32768]{};
-    if (SearchPathW(nullptr, L"blender.exe", nullptr, 32768, found, nullptr) > 0)
-        candidates.emplace_back(found);
-    for (const wchar_t* variable : {L"ProgramFiles", L"ProgramFiles(x86)"}) {
-        wchar_t root[32768]{};
-        DWORD length = GetEnvironmentVariableW(variable, root, 32768);
-        if (!length) continue;
-        fs::path foundation = fs::path(root) / L"Blender Foundation";
-        std::error_code ec;
-        if (!fs::is_directory(foundation, ec)) continue;
-        std::vector<fs::path> installs;
-        for (const auto& entry : fs::directory_iterator(foundation, ec)) {
-            fs::path executable = entry.path() / L"blender.exe";
-            if (fs::is_regular_file(executable, ec)) installs.push_back(executable);
-        }
-        std::sort(installs.rbegin(), installs.rend());
-        candidates.insert(candidates.end(), installs.begin(), installs.end());
-    }
-    std::error_code ec;
-    for (const auto& candidate : candidates)
-        if (fs::is_regular_file(candidate, ec)) return fs::absolute(candidate, ec);
-    return {};
-}
-
-BlendInspection InspectBlend(
-    const Config& config,
-    const fs::path& dataDir,
-    const fs::path& source,
-    std::atomic<bool>& stopRequested) {
-    BlendInspection inspection;
-    if (!fs::is_regular_file(source) || source.extension() != L".blend") {
-        inspection.summary = L"只能读取存在的 .blend 工程。";
-        return inspection;
-    }
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        inspection.summary = L"未找到 Blender，无法读取工程帧范围。";
-        return inspection;
-    }
-    if (!EnsureBlenderReady(blender, dataDir, &stopRequested, inspection.summary))
-        return inspection;
-
-    fs::path work = dataDir / L"inspection" / Utf8ToWide(NewRandomHex(6));
-    std::error_code ignored;
-    fs::create_directories(work, ignored);
-    fs::path script = work / L"inspect-blend.py";
-    fs::path reportPath = work / L"inspect-blend.json";
-    fs::path log = work / L"inspect-blend.log";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kInspectBlendScript;
-        if (!output) {
-            inspection.summary = L"无法写入工程读取脚本。";
-            return inspection;
-        }
-    }
-    ProcessResult process = RunProcess(
-        blender,
-        {L"--background", L"--disable-autoexec", source.wstring(),
-         L"--python-exit-code", L"95", L"--python", script.wstring(), L"--",
-         reportPath.wstring()},
-        log, &stopRequested);
-    if (stopRequested.load()) {
-        inspection.summary = L"工程读取已取消。";
-        return inspection;
-    }
-    if (!process.started || process.exitCode != 0 || !fs::is_regular_file(reportPath)) {
-        inspection.summary = L"Blender 无法读取工程帧范围与合成器输出。日志：" + log.wstring();
-        if (!process.error.empty()) inspection.summary += L"\n" + process.error;
-        return inspection;
-    }
-    try {
-        json data = json::parse(ReadText(reportPath));
-        inspection.sceneName = data.value("scene_name", std::string{});
-        inspection.frameStart = data.value("frame_start", 0);
-        inspection.frameEnd = data.value("frame_end", 0);
-        inspection.frameStep = data.value("frame_step", 0);
-        if (inspection.frameStart < kBlenderFrameMin ||
-            inspection.frameEnd < inspection.frameStart ||
-            inspection.frameEnd > kBlenderFrameMax || inspection.frameStep < 1 ||
-            inspection.frameStep > 1000000)
-            throw std::runtime_error("invalid scene frame range");
-        size_t outputItemCount = 0;
-        for (const auto& row : data.value("compositor_outputs", json::array())) {
-            OutputTarget target;
-            if (!ParseOutputTargetMetadata(row, target))
-                throw std::runtime_error("invalid compositor output metadata");
-            target.directory = Utf8ToWide(row.value("directory", ""));
-            if (!target.directory.is_absolute())
-                throw std::runtime_error("relative compositor output destination");
-            outputItemCount += target.outputs.size();
-            inspection.compositorOutputs.push_back(std::move(target));
-        }
-        inspection.passed = data.value("pass", false);
-        inspection.summary = L"已读取工程：帧 " + std::to_wstring(inspection.frameStart) +
-            L"–" + std::to_wstring(inspection.frameEnd) + L"，步长 " +
-            std::to_wstring(inspection.frameStep) + L"；File Output 节点 " +
-            std::to_wstring(inspection.compositorOutputs.size()) + L" 个，输出项 " +
-            std::to_wstring(outputItemCount) + L" 个。";
-    } catch (const std::exception& exception) {
-        inspection.summary = L"工程元数据无效：" + Utf8ToWide(exception.what());
-    }
-    return inspection;
-}
-
-bool GeneratePreviewImage(
-    const Config& config,
-    const fs::path& dataDir,
-    const fs::path& source,
-    const fs::path& destination,
-    std::atomic<bool>& stopRequested,
-    std::wstring& error) {
-    if (!fs::is_regular_file(source)) {
-        error = L"预览源文件不存在";
-        return false;
-    }
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        error = L"未找到 Blender，无法生成该格式的预览";
-        return false;
-    }
-    if (!EnsureBlenderReady(blender, dataDir, &stopRequested, error)) return false;
-    std::error_code ignored;
-    fs::create_directories(destination.parent_path(), ignored);
-    fs::remove(destination, ignored);
-    fs::path work = dataDir / L"previews";
-    fs::create_directories(work, ignored);
-    fs::path script = work / L"generate-preview.py";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kPreviewScript;
-        if (!output) {
-            error = L"无法写入预览转换脚本";
-            return false;
-        }
-    }
-    ProcessResult process = RunProcess(
-        blender,
-        {L"--background", L"--factory-startup", L"--disable-autoexec", L"--python",
-         script.wstring(), L"--", source.wstring(), destination.wstring()},
-        work / L"generate-preview.log", &stopRequested);
-    if (stopRequested.load()) {
-        error = L"预览生成已取消";
-        return false;
-    }
-    if (!process.started || process.exitCode != 0 || !fs::is_regular_file(destination)) {
-        error = process.error.empty() ? L"Blender 无法生成该图片格式的预览" : process.error;
-        return false;
-    }
-    return true;
-}
-
-PreflightReport PreflightBlend(
-    const Config& config,
-    const fs::path& dataDir,
-    const fs::path& source,
-    const fs::path& prepared,
-    int validationFrameStart,
-    int validationFrameEnd,
-    int validationFrameStep,
-    std::atomic<bool>* stopRequested) {
-    PreflightReport report;
-    report.sourceBlend = source;
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        report.summary = L"未找到 Blender。请先安装 Blender，或在设置中选择 blender.exe。";
-        return report;
-    }
-    if (!EnsureBlenderReady(blender, dataDir, stopRequested, report.summary)) return report;
-    if (source.extension() != L".blend") {
-        report.summary = L"只能提交 .blend 工程文件。";
-        return report;
-    }
-    fs::path tools = dataDir / L"tools";
-    fs::create_directories(tools);
-    fs::path script = tools / L"preflight.py";
-    fs::path reportPath = prepared.parent_path() / L"preflight.json";
-    fs::path log = prepared.parent_path() / L"preflight.log";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kPreflightScript;
-    }
-    ProcessResult process = RunProcess(
-        blender,
-         {L"--background", L"--disable-autoexec", source.wstring(), L"--python", script.wstring(), L"--",
-         prepared.wstring(), reportPath.wstring(), std::to_wstring(validationFrameStart),
-         std::to_wstring(validationFrameEnd), std::to_wstring(validationFrameStep)},
-        log, stopRequested);
-    if (!process.started || process.exitCode != 0 || !fs::exists(reportPath)) {
-        report.summary = L"Blender 预检失败。请查看：" + log.wstring();
-        if (!process.error.empty()) report.summary += L"\n" + process.error;
-        return report;
-    }
-    try {
-        json data = json::parse(ReadText(reportPath));
-        report.passed = data.value("pass", false);
-        report.sceneName = data.value("scene_name", std::string{});
-        report.blenderVersion = data.value("version", std::string{});
-        report.renderEngine = data.value("render_engine", std::string{});
-        report.outputFormat = data.value("render_format", std::string{});
-        report.outputExtension = data.value("use_file_extension", true)
-            ? data.value("file_extension", std::string{}) : std::string{};
-        report.warnings = data.value("warnings", std::vector<std::string>{});
-        report.frameStart = data.value("frame_start", 0);
-        report.frameEnd = data.value("frame_end", 0);
-        report.frameStep = data.value("frame_step", 0);
-        if (report.frameStart < kBlenderFrameMin || report.frameEnd < report.frameStart ||
-            report.frameEnd > kBlenderFrameMax || report.frameStep < 1 ||
-            report.frameStep > 1000000) {
-            report.passed = false;
-            report.warnings.push_back("The project frame range is invalid");
-        }
-        if (report.outputFormat.empty() || !IsSafeOutputExtension(report.outputExtension)) {
-            report.passed = false;
-            report.warnings.push_back("The project output format has no safe file extension");
-        }
-        report.requiresGpu = data.value("requires_gpu", false);
-        json primaryOutputRows = data.value("primary_outputs", json::object());
-        for (const auto& [frameText, pathValue] : primaryOutputRows.items()) {
-            try {
-                int frame = std::stoi(frameText);
-                fs::path path = Utf8ToWide(pathValue.get<std::string>());
-                if (frame >= kBlenderFrameMin && frame <= kBlenderFrameMax && path.is_absolute())
-                    report.primaryOutputs[frame] = std::move(path);
-            } catch (...) {
-            }
-        }
-        for (const auto& target : data.value("compositor_outputs", json::array())) {
-            OutputTarget outputTarget;
-            if (!ParseOutputTargetMetadata(target, outputTarget)) {
-                report.passed = false;
-                report.warnings.push_back("Invalid compositor output metadata");
-                continue;
-            }
-            outputTarget.directory = Utf8ToWide(target.value("directory", ""));
-            if (outputTarget.directory.is_absolute())
-                report.compositorOutputs.push_back(std::move(outputTarget));
-            else {
-                report.passed = false;
-                report.warnings.push_back("Compositor output destination is not absolute");
-            }
-        }
-        std::string validationError = data.value("validation_error", std::string{});
-        auto parseDependencies = [](const json& values) {
-            std::vector<DependencyItem> result;
-            for (const auto& item : values) {
-                result.push_back({item.value("kind", "unknown"), item.value("owner", ""),
-                                  item.value("path", "")});
-            }
-            return result;
-        };
-        report.missing = parseDependencies(data.value("missing", json::array()));
-        report.unpacked = parseDependencies(data.value("unpacked", json::array()));
-        report.preparedBlend = prepared;
-        if (report.passed) {
-            size_t outputItemCount = 0;
-            for (const auto& target : report.compositorOutputs)
-                outputItemCount += target.outputs.size();
-            report.summary = L"预检通过：素材已打包，Blender " +
-                Utf8ToWide(report.blenderVersion) + L"，输出格式 " +
-                Utf8ToWide(report.outputFormat) + L"。\n工程帧范围 " +
-                std::to_wstring(report.frameStart) + L"–" +
-                std::to_wstring(report.frameEnd) + L"，File Output 节点 " +
-                std::to_wstring(report.compositorOutputs.size()) + L" 个，输出项 " +
-                std::to_wstring(outputItemCount) + L" 个。";
-        } else {
-            report.summary = L"预检未通过：缺失 " + std::to_wstring(report.missing.size()) +
-                L" 项，无法打包 " + std::to_wstring(report.unpacked.size()) + L" 项。";
-            const auto& rows = report.missing.empty() ? report.unpacked : report.missing;
-            for (size_t i = 0; i < std::min<size_t>(rows.size(), 5); ++i)
-                report.summary += L"\n• " + Utf8ToWide(rows[i].path);
-            if (rows.empty() && !validationError.empty())
-                report.summary += L"\n验证渲染失败；可能是相机、插件、节点或渲染引擎错误。详见：" +
-                    log.wstring();
-        }
-    } catch (const std::exception& exception) {
-        report.summary = L"无法读取预检报告：" + Utf8ToWide(exception.what());
-    }
-    return report;
-}
-
-bool CheckWorkerCompatibility(
-    const Config& config,
-    const fs::path& dataDir,
-    const fs::path& blend,
-    const std::string& expectedVersion,
-    const std::string& expectedEngine,
-    bool requiresGpu,
-    std::atomic<bool>& stopRequested,
-    std::wstring& summary) {
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        summary = L"Worker 未安装 Blender";
-        return false;
-    }
-    if (!EnsureBlenderReady(blender, dataDir, &stopRequested, summary)) return false;
-    fs::path tools = dataDir / L"tools";
-    fs::create_directories(tools);
-    fs::path script = tools / L"compatibility.py";
-    fs::path manifest = blend.parent_path() / L"required-environment.json";
-    fs::path report = blend.parent_path() / L"worker-environment.json";
-    fs::path log = blend.parent_path() / L"compatibility.log";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kCompatibilityScript;
-    }
-    {
-        std::ofstream output(manifest, std::ios::binary | std::ios::trunc);
-        output << json{{"version", expectedVersion}, {"render_engine", expectedEngine},
-                       {"requires_gpu", requiresGpu}}.dump(2);
-    }
-    // Compatibility only depends on the worker's Blender installation, render
-    // engine and GPU devices. Add-on inventories are intentionally ignored because
-    // enabled origin add-ons are not equivalent to project dependencies. Do not
-    // open the submitted project here: an older
-    // Blender may abort before the script can produce the actionable version
-    // mismatch report, and loading the full scene wastes memory before dispatch.
-    ProcessResult process = RunProcess(
-        blender,
-        {L"--background", L"--disable-autoexec", L"--python", script.wstring(), L"--",
-         manifest.wstring(), report.wstring()},
-        log, &stopRequested);
-    if (!process.started || process.exitCode != 0 || !fs::exists(report)) {
-        summary = !process.started
-            ? L"Worker 无法启动 Blender 兼容性检查"
-            : L"Worker 的 Blender 兼容性检查异常退出（代码 " +
-                std::to_wstring(process.exitCode) + L"）";
-        std::string tail = ReadTextTail(log, 4096);
-        if (!tail.empty()) summary += L"\n" + Utf8ToWide(tail);
-        else summary += L"；日志：" + log.wstring();
-        return false;
-    }
-    try {
-        json data = json::parse(ReadText(report));
-        std::string version = data.value("version", std::string{});
-        bool engineAvailable = data.value("engine_available", expectedEngine.empty());
-        auto gpuDevices = data.value("gpu_devices", std::vector<std::string>{});
-        if (version != expectedVersion) {
-            summary = L"Blender 版本不一致：需要 " + Utf8ToWide(expectedVersion) + L"，本机 " +
-                Utf8ToWide(version);
-            return false;
-        }
-        if (!engineAvailable) {
-            summary = L"缺少渲染引擎：" + Utf8ToWide(expectedEngine);
-            return false;
-        }
-        if (requiresGpu && expectedEngine == "CYCLES" && gpuDevices.empty()) {
-            summary = L"Worker 没有已启用的 Cycles GPU 渲染设备";
-            return false;
-        }
-        if (requiresGpu && expectedEngine.starts_with("BLENDER_EEVEE") &&
-            gpuDevices.empty()) {
-            summary = L"Worker 没有可供 Eevee 使用的 GPU 图形设备";
-            std::string gpuError = data.value("gpu_error", std::string{});
-            if (!gpuError.empty()) summary += L"：" + Utf8ToWide(gpuError);
-            return false;
-        }
-        summary = L"Worker 环境兼容";
-        return data.value("pass", false);
-    } catch (const std::exception& exception) {
-        summary = L"Worker 环境报告无效：" + Utf8ToWide(exception.what());
-        return false;
-    }
-}
-
-bool RenderBlenderFrame(
-    const Config& config,
-    const fs::path& blend,
-    const fs::path& outputDir,
-    int frame,
-    const std::string& outputFormat,
-    const std::string& outputExtension,
-    std::atomic<bool>& stopRequested,
-    fs::path& output,
-    std::wstring& error) {
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        error = L"未找到 Blender";
-        return false;
-    }
-    if (!EnsureBlenderReady(blender, outputDir, &stopRequested, error)) return false;
-    fs::create_directories(outputDir);
-    fs::path prefix = outputDir / L"frame_######";
-    fs::path log = outputDir / (L"frame_" + std::to_wstring(frame) + L".log");
-    if (outputFormat.empty() || !IsSafeOutputExtension(outputExtension)) {
-        error = L"工程输出格式信息无效";
-        return false;
-    }
-    std::wstring extension = Utf8ToWide(outputExtension);
-    std::wstring frameText = std::to_wstring(frame);
-    output = outputDir / (L"frame_" +
-        std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText + extension);
-    std::error_code removeError;
-    fs::remove(output, removeError);
-    ProcessResult process = RunProcess(
-        blender,
-        {L"--background", L"--disable-autoexec", blend.wstring(), L"--render-output",
-         prefix.wstring(), L"--render-frame", std::to_wstring(frame)},
-        log, &stopRequested);
-    if (!process.started || process.exitCode != 0) {
-        error = process.error.empty()
-            ? L"Blender 渲染失败，退出码 " + std::to_wstring(process.exitCode) + L"。日志：" +
-                  log.wstring()
-            : process.error;
-        return false;
-    }
-    if (!fs::exists(output)) {
-        error = L"Blender 已退出，但没有生成帧文件。日志：" + log.wstring();
-        return false;
-    }
-    return true;
-}
-
-bool RenderBlenderPackage(
-    const Config& config,
-    const fs::path& blend,
-    const fs::path& outputDir,
-    const std::vector<int>& frames,
-    const std::string& outputFormat,
-    const std::string& outputExtension,
-    bool stopAfterCurrentOnActivity,
-    std::atomic<bool>& stopRequested,
-    std::atomic<bool>& finishCurrentThenStop,
-    const std::vector<OutputTarget>& compositorOutputs,
-    const FrameCompletedCallback& frameCompleted,
-    const FrameLogCallback& frameLogUpdated,
-    std::map<int, std::vector<RenderArtifact>>& completed,
-    std::map<int, fs::path>& frameLogs,
-    std::wstring& error) {
-    completed.clear();
-    frameLogs.clear();
-    if (frames.empty() || frames.size() > 5 ||
-        !std::all_of(frames.begin(), frames.end(), [](int frame) {
-            return frame >= kBlenderFrameMin && frame <= kBlenderFrameMax;
-        }) || outputFormat.empty() ||
-        !IsSafeOutputExtension(outputExtension)) {
-        error = L"渲染任务包参数无效";
-        return false;
-    }
-    fs::path blender = FindBlender(config);
-    if (blender.empty()) {
-        error = L"未找到 Blender";
-        return false;
-    }
-    if (!EnsureBlenderReady(blender, outputDir, &stopRequested, error)) return false;
-    fs::create_directories(outputDir);
-    fs::path script = outputDir / L"render-package.py";
-    fs::path manifest = outputDir / L"render-package.json";
-    fs::path stopMarker = outputDir / L"stop-after-current";
-    fs::path log = outputDir / L"render-package.log";
-    {
-        std::ofstream output(script, std::ios::binary | std::ios::trunc);
-        output << kBatchRenderScript;
-        if (!output) {
-            error = L"无法写入批量渲染脚本";
-            return false;
-        }
-    }
-    std::error_code ignored;
-    fs::remove(manifest, ignored);
-    for (int frame : frames) {
-        std::wstring frameText = std::to_wstring(frame);
-        fs::path expected = outputDir / (L"frame_" +
-            std::wstring(6 - std::min<size_t>(6, frameText.size()), L'0') + frameText +
-            Utf8ToWide(outputExtension));
-        fs::remove(expected, ignored);
-    }
-
-    std::atomic<bool> processFinished = false;
-    std::thread stopMarkerThread([&] {
-        while (!processFinished.load() && !stopRequested.load()) {
-            if (fs::is_regular_file(stopMarker)) {
-                finishCurrentThenStop = true;
-                return;
-            }
-            if (stopAfterCurrentOnActivity &&
-                !IsComputerIdleForSharedWork(IdleSeconds(), config.idleAfterSeconds)) {
-                finishCurrentThenStop = true;
-                // Detection and marker publication deliberately happen in the
-                // same thread, so no second polling interval can start another
-                // Blender frame after activity has already been observed.
-                std::ofstream(stopMarker, std::ios::binary | std::ios::trunc) << "stop";
-                return;
-            }
-            Sleep(50);
-        }
-    });
-    json outputTargets = json::array();
-    for (const auto& target : compositorOutputs)
-        outputTargets.push_back(OutputTargetLocatorMetadata(target));
-    auto collectProgress = [&](bool reportErrors) {
-        try {
-            for (int frame : frames) {
-                fs::path frameLog = outputDir /
-                    (L"frame-" + std::to_wstring(frame) + L".log");
-                bool logComplete = false;
-                if (UpdateFrameLogSnapshot(log, frameLog, frame, logComplete)) {
-                    frameLogs[frame] = frameLog;
-                    if (frameLogUpdated) frameLogUpdated(frame, frameLog, logComplete);
-                } else if (fs::is_regular_file(frameLog)) {
-                    frameLogs[frame] = frameLog;
-                }
-            }
-            if (!fs::is_regular_file(manifest)) return;
-            json progress = json::parse(ReadText(manifest));
-            json artifactRows = progress.value("artifacts", json::object());
-            for (int frame : progress.value("completed", std::vector<int>{})) {
-                if (completed.contains(frame) ||
-                    std::find(frames.begin(), frames.end(), frame) == frames.end())
-                    continue;
-                std::vector<RenderArtifact> values;
-                for (const auto& artifact : artifactRows.value(
-                         std::to_string(frame), json::array())) {
-                    std::string logical = artifact.value("logical", "");
-                    fs::path relative = Utf8ToWide(artifact.value("source", ""));
-                    fs::path source = outputDir / relative;
-                    bool safeRelative = relative.is_relative() && !relative.has_root_name() &&
-                        !relative.has_root_directory();
-                    for (const auto& component : relative)
-                        safeRelative = safeRelative && component != L".." && component != L".";
-                    if (!logical.empty() && safeRelative && fs::is_regular_file(source))
-                        values.push_back({logical, source});
-                }
-                if (values.empty()) continue;
-                auto [inserted, isNew] = completed.emplace(frame, std::move(values));
-                if (isNew && frameCompleted) frameCompleted(frame, inserted->second);
-            }
-            std::string scriptError = progress.value("error", "");
-            if (!scriptError.empty()) error = Utf8ToWide(scriptError);
-        } catch (const std::exception& exception) {
-            if (reportErrors)
-                error = L"Invalid Blender package progress file: " +
-                    Utf8ToWide(exception.what());
-        }
-    };
-    ProcessResult process = RunProcess(
-        blender,
-        {L"--background", L"--disable-autoexec", blend.wstring(), L"--python",
-         script.wstring(), L"--", outputDir.wstring(), manifest.wstring(),
-         stopMarker.wstring(), Utf8ToWide(json(frames).dump()),
-         Utf8ToWide(outputTargets.dump())},
-        log, &stopRequested, std::chrono::milliseconds::zero(),
-        [&] { collectProgress(false); });
-    processFinished = true;
-    if (stopMarkerThread.joinable()) stopMarkerThread.join();
-    collectProgress(true);
-    if (frameLogs.empty() && !frames.empty() && fs::is_regular_file(log)) {
-        std::ifstream input(log, std::ios::binary);
-        std::string contents((std::istreambuf_iterator<char>(input)), {});
-        contents = "RenderMesh Blender log - frame " + std::to_string(frames.front()) +
-            " - process output\n\n" + SanitizeBlenderLog(contents);
-        fs::path fallback = outputDir /
-            (L"frame-" + std::to_wstring(frames.front()) + L".log");
-        if (WriteFrameLogFile(fallback, contents)) {
-            frameLogs[frames.front()] = fallback;
-            if (frameLogUpdated) frameLogUpdated(frames.front(), fallback, true);
-        }
-    }
-
-    try {
-        if (fs::is_regular_file(manifest)) {
-            json progress = json::parse(ReadText(manifest));
-            json artifactRows = progress.value("artifacts", json::object());
-            for (int frame : progress.value("completed", std::vector<int>{})) {
-                if (std::find(frames.begin(), frames.end(), frame) == frames.end()) continue;
-                std::vector<RenderArtifact> values;
-                for (const auto& artifact : artifactRows.value(
-                         std::to_string(frame), json::array())) {
-                    std::string logical = artifact.value("logical", "");
-                    fs::path relative = Utf8ToWide(artifact.value("source", ""));
-                    fs::path source = outputDir / relative;
-                    bool safeRelative = relative.is_relative() && !relative.has_root_name() &&
-                        !relative.has_root_directory();
-                    for (const auto& component : relative)
-                        safeRelative = safeRelative && component != L".." && component != L".";
-                    if (!logical.empty() && safeRelative &&
-                        fs::is_regular_file(source))
-                        values.push_back({logical, source});
-                }
-                if (!values.empty()) completed[frame] = std::move(values);
-            }
-            std::string scriptError = progress.value("error", "");
-            if (!scriptError.empty()) error = Utf8ToWide(scriptError);
-        }
-    } catch (const std::exception& exception) {
-        error = L"批量渲染进度文件无效：" + Utf8ToWide(exception.what());
-    }
-    if (!process.started || process.exitCode != 0) {
-        if (error.empty()) {
-            error = process.error.empty()
-                ? L"Blender 批量渲染失败，退出码 " + std::to_wstring(process.exitCode) +
-                      L"。日志：" + log.wstring()
-                : process.error;
-        }
-        return false;
-    }
-    if (!ValidateFramePackageCompletion(
-            frames.size(), completed.size(), finishCurrentThenStop.load(), error)) {
-        std::string tail = ReadTextTail(log, 4096);
-        if (!tail.empty()) error += L"\n" + Utf8ToWide(tail);
-        else error += L"；日志：" + log.wstring();
-        return false;
-    }
-    return true;
+    return WriteFileAtomic(configPath_, data.dump(2), error);
 }
 
 bool ValidateFramePackageCompletion(
@@ -2122,76 +1148,9 @@ bool ValidateFramePackageCompletion(
     return true;
 }
 
-bool RunBlenderReadinessSelfTest(std::wstring& report) {
-    fs::path script = L"C:\\RenderMesh Test\\initialize-blender.py";
-    fs::path marker = L"C:\\RenderMesh Test\\initialize-blender.ready";
-    const auto arguments = BlenderBootstrapArguments(script, marker);
-    const std::vector<std::wstring> expected = {
-        L"--background", L"--factory-startup", L"--disable-autoexec", L"-noaudio",
-        L"--python-exit-code", L"95", L"--python", script.wstring(), L"--",
-        marker.wstring()};
-    std::string bootstrap = kBlenderBootstrapScript;
-    auto strictGpuSelection = [](const std::string& value) {
-        return value.find("device.type == backend") != std::string::npos &&
-            value.find("device.use = device.type == backend") != std::string::npos;
-    };
-    if (arguments != expected ||
-        bootstrap.find("userpref.blend") == std::string::npos ||
-        bootstrap.find("os.path.isfile(preferences)") == std::string::npos ||
-        bootstrap.find("bpy.ops.wm.save_userpref()") == std::string::npos ||
-        bootstrap.find("os.replace(temporary, ready_path)") == std::string::npos ||
-        bootstrap.find("RENDERMESH_BLENDER_READY") == std::string::npos ||
-        kInspectBlendScript.find("discover_compositor_outputs(scene)") == std::string::npos ||
-        kInspectBlendScript.find("'scene_name': scene.name") == std::string::npos ||
-        kPreflightScript.find("'frame_start': int(original_scene.frame_start)") ==
-            std::string::npos ||
-        kPreflightScript.find("'scene_name': original_scene.name") == std::string::npos ||
-        std::string(kBatchRenderScript).find("node_at_path") == std::string::npos ||
-        std::string(kBatchRenderScript).find("produced no file") == std::string::npos ||
-        std::string(kBatchRenderScript).find("RENDERMESH_FRAME_BEGIN") == std::string::npos ||
-        std::string(kBatchRenderScript).find("RENDERMESH_FRAME_END") == std::string::npos ||
-        !strictGpuSelection(kPreflightScript) ||
-        !strictGpuSelection(kCompatibilityScript) ||
-        !strictGpuSelection(kBatchRenderScript)) {
-        report = L"Blender first-run readiness launch contract self-test failed";
-        return false;
-    }
-    fs::path frameLogRoot = fs::temp_directory_path() /
-        Utf8ToWide("RenderMesh-frame-log-self-test-" + NewRandomHex(8));
-    fs::create_directories(frameLogRoot);
-    fs::path packageLog = frameLogRoot / L"render-package.log";
-    {
-        std::ofstream output(packageLog, std::ios::binary | std::ios::trunc);
-        output << "Blender 5.0 startup\nRENDERMESH_FRAME_BEGIN 1\n"
-               << "Fra:1 | Rendering 1 / 64\n\x1b[31mwarning\x1b[0m\n"
-               << "RENDERMESH_FRAME_END 1 completed\n"
-               << "RENDERMESH_FRAME_BEGIN 2\nFra:2 | Rendering 64 / 64\n"
-               << "RENDERMESH_FRAME_END 2 completed\n";
-    }
-    bool firstComplete = false;
-    bool secondComplete = false;
-    fs::path firstLog = frameLogRoot / L"frame-1.log";
-    fs::path secondLog = frameLogRoot / L"frame-2.log";
-    bool firstChanged = UpdateFrameLogSnapshot(packageLog, firstLog, 1, firstComplete);
-    bool secondChanged = UpdateFrameLogSnapshot(packageLog, secondLog, 2, secondComplete);
-    std::ifstream firstInput(firstLog, std::ios::binary);
-    std::string firstText((std::istreambuf_iterator<char>(firstInput)), {});
-    std::ifstream secondInput(secondLog, std::ios::binary);
-    std::string secondText((std::istreambuf_iterator<char>(secondInput)), {});
-    bool unchanged = !UpdateFrameLogSnapshot(packageLog, firstLog, 1, firstComplete);
-    std::error_code ignored;
-    fs::remove_all(frameLogRoot, ignored);
-    if (!firstChanged || !secondChanged || !firstComplete || !secondComplete || !unchanged ||
-        firstText.find("Blender 5.0 startup") == std::string::npos ||
-        firstText.find("Fra:1") == std::string::npos || firstText.find("\x1b") != std::string::npos ||
-        secondText.find("Fra:2") == std::string::npos ||
-        secondText.find("Blender 5.0 startup") != std::string::npos) {
-        report = L"Per-frame Blender log extraction self-test failed";
-        return false;
-    }
-    return true;
-}
 
+// RMBNDL1 result bundle: magic, entry count, then per entry the path length,
+// file size, UTF-8 logical path and the file bytes.
 bool WriteResultBundle(
     const fs::path& destination,
     const std::vector<RenderArtifact>& artifacts,
@@ -2201,13 +1160,17 @@ bool WriteResultBundle(
         error = L"结果文件包条目数量无效";
         return false;
     }
-    fs::create_directories(destination.parent_path());
+    std::error_code ec;
+    fs::create_directories(destination.parent_path(), ec);
     uint64_t requiredBytes = 512ull * 1024 * 1024;
+    std::set<std::string> logicalPaths;
     for (const auto& artifact : artifacts) {
-        std::error_code ec;
-        uint64_t size = fs::file_size(artifact.source, ec);
-        if (ec || size > UINT64_MAX - requiredBytes) {
-            error = L"无法计算结果文件包所需空间";
+        const uint64_t size = fs::file_size(artifact.source, ec);
+        if (ec || size > UINT64_MAX - requiredBytes || artifact.logicalPath.empty() ||
+            artifact.logicalPath.size() > 4096 ||
+            artifact.logicalPath.find('\0') != std::string::npos ||
+            !logicalPaths.insert(artifact.logicalPath).second) {
+            error = L"结果文件包包含无效或重复条目";
             return false;
         }
         requiredBytes += size;
@@ -2220,59 +1183,36 @@ bool WriteResultBundle(
     }
     fs::path temporary = destination;
     temporary += L".tmp";
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        error = L"无法创建结果文件包";
+    File output = File::Create(temporary);
+    auto fail = [&](const wchar_t* message) {
+        error = message;
+        output.Close();
+        DeleteFileW(temporary.c_str());
         return false;
-    }
+    };
+    if (!output) return fail(L"无法创建结果文件包");
     const char magic[8] = {'R', 'M', 'B', 'N', 'D', 'L', '1', '\0'};
-    output.write(magic, sizeof(magic));
-    uint32_t count = static_cast<uint32_t>(artifacts.size());
-    output.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    std::set<std::string> logicalPaths;
+    const uint32_t count = static_cast<uint32_t>(artifacts.size());
+    if (!output.Write(magic, sizeof(magic)) || !output.Write(&count, sizeof(count)))
+        return fail(L"结果文件包写入不完整");
     std::vector<char> buffer(1024 * 1024);
     for (const auto& artifact : artifacts) {
-        if (stopRequested && stopRequested->load()) {
-            error = L"结果文件包已取消";
-            output.close();
-            std::error_code ignored;
-            fs::remove(temporary, ignored);
-            return false;
-        }
-        std::error_code ec;
-        uint64_t size = fs::file_size(artifact.source, ec);
-        if (ec || artifact.logicalPath.empty() || artifact.logicalPath.size() > 4096 ||
-            artifact.logicalPath.find('\0') != std::string::npos ||
-            !logicalPaths.insert(artifact.logicalPath).second) {
-            error = L"结果文件包包含无效或重复条目";
-            output.close();
-            fs::remove(temporary, ec);
-            return false;
-        }
-        uint32_t pathSize = static_cast<uint32_t>(artifact.logicalPath.size());
-        output.write(reinterpret_cast<const char*>(&pathSize), sizeof(pathSize));
-        output.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        output.write(artifact.logicalPath.data(), pathSize);
-        std::ifstream input(artifact.source, std::ios::binary);
-        uint64_t remaining = size;
-        while (input && remaining) {
-            if (stopRequested && stopRequested->load()) break;
-            size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
-            input.read(buffer.data(), static_cast<std::streamsize>(wanted));
-            size_t read = static_cast<size_t>(input.gcount());
-            if (!read) break;
-            output.write(buffer.data(), static_cast<std::streamsize>(read));
-            remaining -= read;
-        }
-        if (remaining || !output) {
-            error = L"结果文件包写入不完整";
-            output.close();
-            fs::remove(temporary, ec);
-            return false;
+        if (stopRequested && stopRequested->load()) return fail(L"结果文件包已取消");
+        File input = File::OpenRead(artifact.source);
+        const uint64_t size = input ? input.Size() : 0;
+        const uint32_t pathSize = static_cast<uint32_t>(artifact.logicalPath.size());
+        if (!input || !output.Write(&pathSize, sizeof(pathSize)) ||
+            !output.Write(&size, sizeof(size)) || !output.Write(artifact.logicalPath))
+            return fail(L"结果文件包写入不完整");
+        for (uint64_t remaining = size; remaining;) {
+            if (stopRequested && stopRequested->load()) return fail(L"结果文件包已取消");
+            const size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
+            if (!input.ReadExact(buffer.data(), wanted) || !output.Write(buffer.data(), wanted))
+                return fail(L"结果文件包写入不完整");
+            remaining -= wanted;
         }
     }
-    output.flush();
-    output.close();
+    output.Close();
     if (!MoveFileExW(temporary.c_str(), destination.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         error = LastErrorMessage();
@@ -2289,12 +1229,12 @@ bool ExtractResultBundle(
     std::wstring& error,
     std::atomic<bool>* stopRequested) {
     artifacts.clear();
-    std::ifstream input(bundle, std::ios::binary);
+    File input = File::OpenRead(bundle);
     char magic[8]{};
     uint32_t count = 0;
-    input.read(magic, sizeof(magic));
-    input.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!input || std::memcmp(magic, "RMBNDL1\0", 8) != 0 || !count || count > 4096) {
+    if (!input || !input.ReadExact(magic, sizeof(magic)) ||
+        !input.ReadExact(&count, sizeof(count)) ||
+        std::memcmp(magic, "RMBNDL1\0", 8) != 0 || !count || count > 4096) {
         error = L"结果文件包头无效";
         return false;
     }
@@ -2305,67 +1245,50 @@ bool ExtractResultBundle(
         error = L"无法创建结果暂存目录";
         return false;
     }
+    auto fail = [&](const wchar_t* message) {
+        error = message;
+        artifacts.clear();
+        std::error_code ignored;
+        fs::remove_all(stagingDirectory, ignored);
+        return false;
+    };
     uint64_t total = 0;
     std::vector<char> buffer(1024 * 1024);
     for (uint32_t index = 0; index < count; ++index) {
-        if (stopRequested && stopRequested->load()) {
-            error = L"结果文件包解包已取消";
-            fs::remove_all(stagingDirectory, ec);
-            return false;
-        }
+        if (stopRequested && stopRequested->load()) return fail(L"结果文件包解包已取消");
         uint32_t pathSize = 0;
         uint64_t fileSize = 0;
-        input.read(reinterpret_cast<char*>(&pathSize), sizeof(pathSize));
-        input.read(reinterpret_cast<char*>(&fileSize), sizeof(fileSize));
-        if (!input || !pathSize || pathSize > 4096 ||
+        if (!input.ReadExact(&pathSize, sizeof(pathSize)) ||
+            !input.ReadExact(&fileSize, sizeof(fileSize)) || !pathSize || pathSize > 4096 ||
             fileSize > 100ull * 1024 * 1024 * 1024 ||
-            total > 100ull * 1024 * 1024 * 1024 - fileSize) {
-            error = L"结果文件包条目大小无效";
-            fs::remove_all(stagingDirectory, ec);
-            return false;
-        }
+            total > 100ull * 1024 * 1024 * 1024 - fileSize)
+            return fail(L"结果文件包条目大小无效");
         std::string logical(pathSize, '\0');
-        input.read(logical.data(), static_cast<std::streamsize>(pathSize));
-        fs::path relative = Utf8ToWide(logical);
-        bool safe = !logical.empty() && logical.find('\0') == std::string::npos &&
+        if (!input.ReadExact(logical.data(), pathSize)) return fail(L"结果文件包条目大小无效");
+        const fs::path relative = Utf8ToWide(logical);
+        bool safe = logical.find('\0') == std::string::npos &&
             logical.find('\\') == std::string::npos && relative.is_relative() &&
             !relative.has_root_name() && !relative.has_root_directory();
         for (const auto& component : relative)
             safe = safe && component != L".." && component != L".";
-        if (!input || !safe || artifacts.contains(logical)) {
-            error = L"结果文件包包含不安全路径";
-            fs::remove_all(stagingDirectory, ec);
-            return false;
-        }
-        fs::path destination = stagingDirectory / relative;
+        if (!safe || artifacts.contains(logical)) return fail(L"结果文件包包含不安全路径");
+        const fs::path destination = stagingDirectory / relative;
         fs::create_directories(destination.parent_path(), ec);
-        std::ofstream output(destination, std::ios::binary | std::ios::trunc);
-        uint64_t remaining = fileSize;
-        while (input && output && remaining) {
-            if (stopRequested && stopRequested->load()) break;
-            size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
-            input.read(buffer.data(), static_cast<std::streamsize>(wanted));
-            size_t read = static_cast<size_t>(input.gcount());
-            if (!read) break;
-            output.write(buffer.data(), static_cast<std::streamsize>(read));
-            remaining -= read;
-        }
-        if (remaining || !output) {
-            error = L"结果文件包内容不完整";
-            output.close();
-            fs::remove_all(stagingDirectory, ec);
-            return false;
+        File output = File::Create(destination);
+        if (!output) return fail(L"结果文件包内容不完整");
+        for (uint64_t remaining = fileSize; remaining;) {
+            if (stopRequested && stopRequested->load()) return fail(L"结果文件包解包已取消");
+            const size_t wanted = static_cast<size_t>(std::min<uint64_t>(buffer.size(), remaining));
+            if (!input.ReadExact(buffer.data(), wanted) || !output.Write(buffer.data(), wanted))
+                return fail(L"结果文件包内容不完整");
+            remaining -= wanted;
         }
         total += fileSize;
-        artifacts.emplace(std::move(logical), std::move(destination));
+        artifacts.emplace(std::move(logical), destination);
     }
     char trailing = 0;
-    if (input.read(&trailing, 1)) {
-        error = L"结果文件包含有多余数据";
-        fs::remove_all(stagingDirectory, ec);
-        artifacts.clear();
-        return false;
-    }
+    size_t extra = 0;
+    if (input.Read(&trailing, 1, extra) && extra) return fail(L"结果文件包含有多余数据");
     return true;
 }
 
@@ -2373,11 +1296,27 @@ std::wstring TaskStateLabel(TaskState state) {
     switch (state) {
         case TaskState::Pending: return L"待提交";
         case TaskState::Dispatching: return L"发送中";
-        case TaskState::Assigned: return L"渲染中";
+        case TaskState::Assigned: return L"排队中";
         case TaskState::Rendering: return L"渲染中";
         case TaskState::Completed: return L"已完成";
         case TaskState::Failed: return L"失败";
         case TaskState::Stopped: return L"已停止";
+    }
+    return L"未知";
+}
+
+std::wstring JobStageLabel(JobStage stage) {
+    switch (stage) {
+        case JobStage::Rendering: return L"渲染中";
+        case JobStage::Uploading: return L"上传中";
+        case JobStage::UploadFailed: return L"上传失败";
+        case JobStage::ReadyToConfigure: return L"上传完成";
+        case JobStage::Testing: return L"测试渲染中";
+        case JobStage::TestCompleted: return L"测试完成";
+        case JobStage::TestFailed: return L"测试失败";
+        case JobStage::Completed: return L"已完成";
+        case JobStage::Failed: return L"有错误";
+        case JobStage::Stopped: return L"已停止";
     }
     return L"未知";
 }
