@@ -1,14 +1,20 @@
-# RenderMesh v0.1 product specification
+# RenderMesh 产品范围
 
-Source: user requirements in the originating Codex task.
+当前范围：0.3.0。面向可信局域网中的 Windows 10/11 x64 工作站。
 
-1. Build an internal distributed render farm for many Windows office computers.
-2. Every computer running the app can submit render work and use other opted-in computers' compute.
-3. Compute sharing has an explicit on/off setting and defaults off.
-4. Shared rendering is accepted only after a configurable no-input interval, default 3 minutes; active computers reject all remote rendering work.
-5. If keyboard/mouse activity resumes during a shared package, finish the current frame, then stop and requeue the remaining frames. Do not apply CPU percentage limits.
-6. Provide a server list showing online computers and assigned render counts.
-7. Initially support Blender cluster rendering.
-8. Deliver a lightweight C++ or C# Windows desktop EXE; recipients should only need to unzip and run it, with no runtime/dependency installation.
-9. Check whether Blender is installed before use.
-10. Before distributing a project, inspect and pack linked/relative-path assets, then run a real low-resolution validation render. Do not block workers by comparing installed, enabled, or versioned add-on inventories; they create false incompatibilities and are not a reliable project-dependency manifest.
+1. 每台电脑可以提交 Blender 动画任务，也可以提供算力。
+2. 共享默认关闭；开启后仅在本机达到空闲阈值时接收远端任务。
+3. 用户恢复键鼠操作时，完成当前帧，停止包内后续帧并交回队列。
+4. 节点直接发现、认证和通信，无需中心服务器。
+5. 导入只读取、检查和按需打包工程，不渲染提交范围。
+6. 工程同步后先执行测试帧，用户检查后启动完整范围。
+7. 按帧分工，每个任务包 1–20 帧，默认 5；每台工作电脑同时运行一个 Blender。
+8. 每帧独立记录状态、开始与结束时间、日志及结果。
+9. 支持主输出与合成器 File Output 多文件回传。
+10. 支持停止、恢复、失败重试及动态调整参与电脑。
+11. 配置、任务记录和工程缓存保存在本地；工程存储位置可更改。
+12. 提供原生桌面程序、JSON 命令行和无窗口节点模式。
+
+当前不提供跨平台节点、互联网身份认证、传输加密、单帧跨机拆分或 Blender 之外的渲染适配器。第三方插件与不可打包外部文件由使用者准备。
+
+操作见 [使用指南](USER_GUIDE.md)，实现见 [架构](ARCHITECTURE.md)。

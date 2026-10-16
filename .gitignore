@@ -13,3 +13,33 @@ native/build/
 runtime-cache/
 .rendermesh/
 .rendermesh-test/
+
+# Local node data and credentials
+.env
+.env.*
+!.env.example
+config.json
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# Render projects and generated binaries
+*.blend
+*.blend[0-9]*
+*.rmp
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.zip
+
+# Local editor settings
+.vs/
+.idea/
+*.user
